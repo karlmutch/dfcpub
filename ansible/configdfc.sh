@@ -13,6 +13,7 @@ export CONFFILE_COLLECTD=$HOME/collectd.json
 export GRAPHITE_SERVER=`cat ./inventory/graphana.txt`
 export TESTFSPATHCOUNT=0
 export c=0
+export AUTHENABLED=false
 export FSPATHS=export FSPATHS='"/dfc/xvdl": " ", "/dfc/xvdm": " ", "/dfc/xvdn": " ", "/dfc/xvdo": " ", "/dfc/xvdp": " ", "/dfc/xvdq": " ", "/dfc/xvdr": " ", "/dfc/xvds": " ", "/dfc/xvdt": " ", "/dfc/xvdu": " ", "/dfc/xvdv": " ", "/dfc/xvdw": " "'
 export IPV4LIST=$(awk -vORS=, '{ print $1 }' ./inventory/cluster.txt | sed 's/,$//')
 sudo rm -rf dfcproxy.json || true
