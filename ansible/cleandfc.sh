@@ -1,4 +1,4 @@
-
+#!/bin/bash
 set -o
 
 echo "Cleaning up targets"
