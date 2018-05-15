@@ -1,4 +1,3 @@
-#!/bin/bash
 set -o
 echo "Cleaning up targets"
 parallel-ssh -h inventory/targets.txt -i './cleandfcstate.sh'
