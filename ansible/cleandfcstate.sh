@@ -1,5 +1,4 @@
 #!/bin/bash
-set -o
 ls /dfc
 sudo rm -rf /var/log/dfc*
 sudo rm -rf /dfc/localbuckets
