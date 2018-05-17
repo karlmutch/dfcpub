@@ -27,12 +27,14 @@ while [ $clients_running -gt 0 ]; do
 		echo Count = $count
 		if [ $count -eq 2 ]; then
 			new_target=`head -n 1 $FILE`
-			tail -n +2 "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE" || true
-			echo Adding target $new_target
-			echo $new_target >> 'inventory/targets.txt'
-			ssh $new_target 'cat dfc.json'
-			ssh $new_target './starttarget.sh'
-			count=0
+			if [ -z "$new_target" ]; then
+				tail -n +2 "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE" || true
+				echo Adding target $new_target
+				echo $new_target >> 'inventory/targets.txt'
+				ssh $new_target 'cat dfc.json'
+				ssh $new_target './starttarget.sh'
+				count=0
+			fi
 		fi
 	fi
 done
