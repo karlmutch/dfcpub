@@ -241,7 +241,6 @@ if __name__ == '__main__':
     parser.add_argument("--cluster", dest='cluster', required=True, help="Name of the cluster to operate on")
     parser.add_argument("--command", dest="command", required=True, help="Supported commands - create, terminate, restart, shutdown, update, cleanup")
     parser.add_argument("--clients", dest="clients", required=False, help="Number of clients to use, default 4", default=4)
-    parser.add_argument("--cleanup", action='store_true', help="Run pre cleanup on DFC cluster to remove exisiting cluster data and state")
 
     args = parser.parse_args()
 
