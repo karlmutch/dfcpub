@@ -22,7 +22,9 @@ while [ $clients_running -gt 0 ]; do
 	parallel-ssh -h inventory/targets.txt -i "netstat -s | grep transmit" || true
 	sleep 30
 	count=$((count+1))
-	if [ $WORKLOAD == '0' ]; then
+	if [ "$WORKLOAD" == "0" ]; then
+		echo GET workload detected
+		echo Count = $count
 		if [ $count eq 2 ]; then
 			new_target=`$(head -n 1 $FILE)`
 			tail -n +2 "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE" || true
