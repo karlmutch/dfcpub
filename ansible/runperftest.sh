@@ -3,7 +3,7 @@ set -o xtrace
 set -e
 
 FILE='inventory/new_targets.txt'
-WORKLOAD=$3
+WORKLOAD=$4
 echo Third argument: "$WORKLOAD"
 echo Remaining arguments: "$@"
 
@@ -22,7 +22,7 @@ while [ $clients_running -gt 0 ]; do
 	parallel-ssh -h inventory/targets.txt -i "netstat -s | grep transmit" || true
 	sleep 30
 	count=$((count+1))
-	if [ $WORKLOAD == '-p 0' ]; then
+	if [ $WORKLOAD == '0' ]; then
 		if [ $count eq 5 ]; then
 			new_target=`$(head -n 1 $FILE)`
 			tail -n +2 "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE" || true
