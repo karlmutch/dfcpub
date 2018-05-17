@@ -25,7 +25,7 @@ while [ $clients_running -gt 0 ]; do
 	if [ "$WORKLOAD" == "0" ]; then
 		echo GET workload detected
 		echo Count = $count
-		if [ $count -eq 60 ]; then
+		if [ $count -eq 2 ]; then
 			new_target=`head -n 1 $FILE`
 			if [ ! -z "$new_target" ]; then
 				tail -n +2 "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE" || true
