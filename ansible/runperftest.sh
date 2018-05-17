@@ -32,7 +32,7 @@ while [ $clients_running -gt 0 ]; do
 				echo Adding target $new_target
 				echo $new_target >> 'inventory/targets.txt'
 				ssh $new_target 'cat dfc.json'
-				ssh $new_target './starttarget.sh'
+				ssh $new_target 'nohup /home/ubuntu/starttarget.sh >/dev/null 2>&1'
 				count=0
 			fi
 		fi
