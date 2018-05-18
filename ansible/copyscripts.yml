@@ -16,3 +16,5 @@
         - startprimaryproxy.sh
         - enablestats.sh
         - cleandfcstate.sh
+        - configdfc.sh
+        - inventory
