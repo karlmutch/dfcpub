@@ -1,11 +1,12 @@
 #!/bin/bash
 set -o xtrace
 set -e
-./stopandcleandfc.sh
+./stopandcleandfc.sh 2>&1>/dev/null
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory/cluster.ini copyscripts.yml
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory/cluster.ini getdfc.yml
 parallel-ssh -h inventory/cluster.txt -i "./configdfc.sh "$@
-ansible targets -m shell -a "/home/ubuntu/mountdfc.sh > mountdfc.log" -i inventory/cluster.ini --become
+parallel-ssh -h inventory/targets.txt -i "./mountdfc.sh "$@
+parallel-ssh -h inventory/targets.txt -i "mount | grep dfc"
 ansible targets -m shell -a "mount | grep dfc" -i inventory/cluster.ini --become
 ansible new_targets -m shell -a "/home/ubuntu/mountdfc.sh > mountdfc.log" -i inventory/cluster.ini --become
 ansible new_targets -m shell -a "mount | grep dfc" -i inventory/cluster.ini --become
