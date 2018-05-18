@@ -4,7 +4,7 @@ set -e
 ./stopandcleandfc.sh
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory/cluster.ini copyscripts.yml
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory/cluster.ini getdfc.yml
-ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory/cluster.ini configdfc.yml
+parallel-ssh -h inventory/cluster.txt -i "./configdfc.sh "$@
 ansible targets -m shell -a "/home/ubuntu/mountdfc.sh > mountdfc.log" -i inventory/cluster.ini --become
 ansible targets -m shell -a "mount | grep dfc" -i inventory/cluster.ini --become
 ansible new_targets -m shell -a "/home/ubuntu/mountdfc.sh > mountdfc.log" -i inventory/cluster.ini --become
