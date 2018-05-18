@@ -17,7 +17,7 @@ export c=0
 export AUTHENABLED=false
 FSP=
 for disk in "$@"; do
-    if [ -z $FSP ]; then
+    if [ -z "$FSP" ]; then
 	FSP='"/dfc/'$disk'": " "'
     else
         FSP=$FSP', "/dfc/'$disk'": " "'
