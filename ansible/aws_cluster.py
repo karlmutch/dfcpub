@@ -43,11 +43,6 @@ def load_dfc_cluster(cluster, clients):
         dfc['clients'] = dfc['clients'][:clients]
         logger.info("Considering reduced number of clients {}".format(len(dfc['clients'])))
     
-    for key in dfc:
-        if not dfc[key] and key != 'new_targets':    
-            logger.error("Failed to fetch cluster {0}, make sure AWS instances are tagged with format Cluster_Type(Target/Clients/Proxy)".format(key))
-            raise Exception("Failed to fetch cluster")
-
     cluster_inventory = os.path.join(os.path.dirname(__file__), 'inventory', 'cluster.ini')
     cluster_txt = os.path.join(os.path.dirname(__file__), 'inventory', 'cluster.txt')
     with open(cluster_inventory, 'w') as c, open(cluster_txt, 'w') as ct:

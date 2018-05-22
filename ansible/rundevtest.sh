@@ -1,10 +1,16 @@
 #!/bin/bash
 set -o xtrace
-source /etc/profiled/dfcpaths.sh
+source /etc/profile.d/dfcpaths.sh
 sudo rm -rf /home/ubuntu/.dfc*
 rm -rf /tmp/dfc*
 cd $DFCSRC
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
+
+if [ ! -z $1 ]; then
+    echo Git checkout branch $1
+    git checkout $1
+fi
+
 git pull
 git status
 git log | head -5
