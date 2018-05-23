@@ -2,8 +2,6 @@
 set -o xtrace
 source /etc/profile.d/dfcpaths.sh
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
-echo sleep for 10 seconds after stopping previsously running DFC processes
-sleep 10
 sudo rm -rf /home/ubuntu/.dfc*
 rm -rf /tmp/dfc*
 cd $DFCSRC
@@ -38,3 +36,4 @@ BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 20m ./...
 echo delete DFC local bucket
 curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
 
+for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
