@@ -1,11 +1,12 @@
 #!/bin/bash
 set -o xtrace
 source /etc/profile.d/dfcpaths.sh
+for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
+echo sleep for 10 seconds after stopping previsously running DFC processes
+sleep 10
 sudo rm -rf /home/ubuntu/.dfc*
 rm -rf /tmp/dfc*
 cd $DFCSRC
-for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
-
 if [ ! -z $1 ]; then
     echo Git checkout branch $1
     git checkout $1
@@ -16,8 +17,15 @@ git status
 git log | head -5
 
 setup/deploy.sh -loglevel=3 -statstime=10s <<< $'4\n3\n2\n1'
-ps -C dfc
 
+echo sleep 10 seconds before checking DFC process
+sleep 10
+dfcprocs=$(ps -C dfc -o pid= | wc -l)
+echo number of dfcprocs $dfcprocs
+if [ $dfcprocs -lt 7 ]; then
+    echo dfc did not start properly
+    exit 1
+fi
 echo create DFC local bucket
 curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
 
@@ -29,3 +37,4 @@ BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 20m ./...
 
 echo delete DFC local bucket
 curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
+
