@@ -30,10 +30,26 @@ curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' 
 echo run DFC tests with local bucket
 BUCKET=devTestLocal go test -v -p 1 -count 1 -timeout 20m ./...
 
+localExitStatus=$?
+echo local bucket devtest exit status $localExitStatus
+
 echo run DFC tests with cloud bucket
 BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 20m ./...
+cloudExitStatus=$?
+echo cloud bucket devtest exit status $cloudExitStatus
 
 echo delete DFC local bucket
 curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
 
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
+result=0
+if [ $localExitStatus -ne 0 ]; then
+    echo DevTests for local bucket failed
+    result=$((result + 1))
+fi
+if [ $cloudExitStatus -ne 0 ]; then
+    echo DevTests for cloud bucket failed
+    result=$((result + 1))
+fi
+
+exit $result
