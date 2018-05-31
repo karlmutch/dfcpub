@@ -24,6 +24,11 @@ if [ $dfcprocs -lt 7 ]; then
     echo dfc did not start properly
     exit 1
 fi
+
+cd ../
+echo Run local bucket test from 
+pwd
+
 echo create DFC local bucket
 curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
 
