@@ -29,17 +29,11 @@ cd ../
 echo Run local bucket test from 
 pwd
 
-echo create DFC local bucket
-curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
-
 echo run DFC tests with local bucket
-BUCKET=devTestLocal go test -v -p 1 -count 1 -timeout 20m ./...
+BUCKET=devTestCloud go test -v -p 1 -count 1 -timeout 20m ./...
 
-localExitStatus=$?
-echo local bucket devtest exit status $localExitStatus
-
-echo delete DFC local bucket
-curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://127.0.0.1:8080/v1/buckets/devTestLocal
+cloudExitStatus=$?
+echo devtest exit status $localExitStatus
 
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
 result=0
