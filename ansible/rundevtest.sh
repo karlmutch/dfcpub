@@ -1,6 +1,7 @@
 #!/bin/bash
 set -o xtrace
 source /etc/profile.d/dfcpaths.sh
+source aws.env
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
 sudo rm -rf /home/ubuntu/.dfc*
 rm -rf /tmp/dfc*
@@ -37,8 +38,8 @@ echo devtest exit status $localExitStatus
 
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
 result=0
-if [ $localExitStatus -ne 0 ]; then
-    echo DevTests for local bucket failed
+if [ $cloudExitStatus -ne 0 ]; then
+    echo DevTests failed
     result=$((result + 1))
 fi
 
