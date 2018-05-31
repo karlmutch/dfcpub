@@ -31,7 +31,7 @@ echo Run local bucket test from
 pwd
 
 echo run DFC tests with local bucket
-BUCKET=devTestCloud go test -v -p 1 -count 1 -timeout 20m ./...
+BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 20m ./...
 
 cloudExitStatus=$?
 echo devtest exit status $localExitStatus
