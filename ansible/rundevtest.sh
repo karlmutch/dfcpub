@@ -34,7 +34,7 @@ echo run DFC tests with local bucket
 BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 20m ./...
 
 cloudExitStatus=$?
-echo devtest exit status $localExitStatus
+echo devtest exit status $cloudExitStatus
 
 for dfcpid in `ps -C dfc -o pid=`; do echo Stopping DFC $dfcpid; sudo kill $dfcpid; done
 result=0
