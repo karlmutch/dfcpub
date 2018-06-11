@@ -15,6 +15,7 @@ export GRAPHITE_SERVER=`cat ./inventory/graphana.txt`
 export TESTFSPATHCOUNT=0
 export c=0
 export AUTHENABLED=false
+export USE_HTTPS=false
 FSP=
 for disk in "$@"; do
     if [ -z "$FSP" ]; then
