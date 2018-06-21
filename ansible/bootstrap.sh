@@ -2,7 +2,8 @@
 set -e
 echo Creating disks total of $#
 
-sh ./createdfcvolumes.sh $#
+chmod 744 createdfcvolumes.sh
+./createdfcvolumes.sh $#
 
 for disk in "$@"; do
     sudo mkdir -p /dfc/$disk || true
