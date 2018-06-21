@@ -26,6 +26,9 @@ if [ $dfcprocs -lt 7 ]; then
     exit 1
 fi
 
+echo Working with DFC build
+grep -r Build /tmp/dfc | head -1
+
 cd ../
 echo Run local bucket test from 
 pwd
