@@ -30,10 +30,10 @@ echo Working with DFC build
 grep -r Build /tmp/dfc | head -1
 
 cd ../
-echo Run local bucket test from 
-pwd
+cdir=$(pwd)
+echo Run go tests from $cdir
 
-echo run DFC tests with local bucket
+echo run DFC tests with cloud bucket devtestcloud
 BUCKET=devtestcloud go test -v -p 1 -count 1 -timeout 60m ./...
 
 cloudExitStatus=$?
