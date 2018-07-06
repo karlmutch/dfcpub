@@ -1,4 +1,4 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
@@ -6,6 +6,7 @@
 package dfc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,12 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/golang/glog"
 )
 
 const (
@@ -36,8 +38,57 @@ const (
 // implements cloudif
 //
 //======
-type awsimpl struct {
-	t *targetrunner
+type (
+	awsCreds struct {
+		region string
+		key    string
+		secret string
+	}
+	awsimpl struct {
+		t *targetrunner
+	}
+)
+
+// If extractAWSCreds returns no error and awsCreds is nil then the default
+//   AWS client is used (that loads credentials from ~/.aws/credentials)
+func extractAWSCreds(credsList map[string]string) *awsCreds {
+	if len(credsList) == 0 {
+		return nil
+	}
+	raw, ok := credsList[ProviderAmazon]
+	if raw == "" || !ok {
+		return nil
+	}
+
+	// TODO: maybe authn should make JSON from INI before creating a token
+	// Now just parse AWS file in original INI-format
+	parts := strings.Split(raw, "\n")
+	creds := &awsCreds{}
+
+	for _, s := range parts {
+		if strings.HasPrefix(s, "region") {
+			values := strings.SplitN(s, "=", 2)
+			if len(values) == 2 {
+				creds.region = strings.TrimSpace(values[1])
+			}
+		} else if strings.HasPrefix(s, "aws_access_key_id") {
+			values := strings.SplitN(s, "=", 2)
+			if len(values) == 2 {
+				creds.key = strings.TrimSpace(values[1])
+			}
+		} else if strings.HasPrefix(s, "aws_secret_access_key") {
+			values := strings.SplitN(s, "=", 2)
+			if len(values) == 2 {
+				creds.secret = strings.TrimSpace(values[1])
+			}
+		}
+		if creds.region != "" && creds.key != "" && creds.secret != "" {
+			return creds
+		}
+	}
+
+	glog.Errorf("Invalid credentials: %#v\nUsing default AWS session", creds)
+	return nil
 }
 
 //======
@@ -45,11 +96,47 @@ type awsimpl struct {
 // session FIXME: optimize
 //
 //======
-func createsession() *session.Session {
+// A new session is created in two ways:
+// 1. Authn is disabled or directory with credentials is not defined
+//    In this case a session is created using default credentials from
+//    configuration file in ~/.aws/credentials and environment variables
+// 2. Authn is enabled and directory with credential files is set
+//    The function looks for 'credentials' file in the directory.
+//    A userID is retrieved from token. The userID section must exist
+//    in credential file located in the given directory.
+//    A userID section should look like this:
+//    [userID]
+//    region = us-east-1
+//    aws_access_key_id = USERKEY
+//    aws_secret_access_key = USERSECRET
+// If creation of a session with provided directory and userID fails, it
+// tries to create a session with default parameters
+func createSession(ct context.Context) *session.Session {
 	// TODO: avoid creating sessions for each request
-	return session.Must(session.NewSessionWithOptions(session.Options{
-		SharedConfigState: session.SharedConfigEnable}))
+	userID := getStringFromContext(ct, ctxUserID)
+	userCreds := userCredsFromContext(ct)
+	if userID == "" || userCreds == nil {
+		if glog.V(5) {
+			glog.Info("No user ID or empty credentials: opening default session")
+		}
+		// default session
+		return session.Must(session.NewSessionWithOptions(session.Options{
+			SharedConfigState: session.SharedConfigEnable}))
+	}
 
+	creds := extractAWSCreds(userCreds)
+	if creds == nil {
+		glog.Errorf("Failed to retrieve %s credentials %s", ProviderAmazon, userID)
+		return session.Must(session.NewSessionWithOptions(session.Options{
+			SharedConfigState: session.SharedConfigEnable}))
+	}
+
+	awsCreds := credentials.NewStaticCredentials(creds.key, creds.secret, "")
+	conf := aws.Config{
+		Region:      aws.String(creds.region),
+		Credentials: awsCreds,
+	}
+	return session.Must(session.NewSessionWithOptions(session.Options{Config: conf}))
 }
 
 func awsErrorToHTTP(awsError error) int {
@@ -69,11 +156,11 @@ func awsIsVersionSet(version *string) bool {
 // bucket operations
 //
 //==================
-func (awsimpl *awsimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
+func (awsimpl *awsimpl) listbucket(ct context.Context, bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("listbucket %s", bucket)
 	}
-	sess := createsession()
+	sess := createSession(ct)
 	svc := s3.New(sess)
 
 	params := &s3.ListObjectsInput{Bucket: aws.String(bucket)}
@@ -167,13 +254,13 @@ func (awsimpl *awsimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, 
 	return
 }
 
-func (awsimpl *awsimpl) headbucket(bucket string) (bucketprops map[string]string, errstr string, errcode int) {
+func (awsimpl *awsimpl) headbucket(ct context.Context, bucket string) (bucketprops simplekvs, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("headbucket %s", bucket)
 	}
-	bucketprops = make(map[string]string)
+	bucketprops = make(simplekvs)
 
-	sess := createsession()
+	sess := createSession(ct)
 	svc := s3.New(sess)
 	input := &s3.HeadBucketInput{Bucket: aws.String(bucket)}
 
@@ -200,8 +287,8 @@ func (awsimpl *awsimpl) headbucket(bucket string) (bucketprops map[string]string
 	return
 }
 
-func (awsimpl *awsimpl) getbucketnames() (buckets []string, errstr string, errcode int) {
-	sess := createsession()
+func (awsimpl *awsimpl) getbucketnames(ct context.Context) (buckets []string, errstr string, errcode int) {
+	sess := createSession(ct)
 	svc := s3.New(sess)
 	result, err := svc.ListBuckets(&s3.ListBucketsInput{})
 	if err != nil {
@@ -224,13 +311,13 @@ func (awsimpl *awsimpl) getbucketnames() (buckets []string, errstr string, errco
 // object meta
 //
 //============
-func (awsimpl *awsimpl) headobject(bucket string, objname string) (objmeta map[string]string, errstr string, errcode int) {
+func (awsimpl *awsimpl) headobject(ct context.Context, bucket string, objname string) (objmeta simplekvs, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("headobject %s/%s", bucket, objname)
 	}
-	objmeta = make(map[string]string)
+	objmeta = make(simplekvs)
 
-	sess := createsession()
+	sess := createSession(ct)
 	svc := s3.New(sess)
 	input := &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(objname)}
 
@@ -252,9 +339,9 @@ func (awsimpl *awsimpl) headobject(bucket string, objname string) (objmeta map[s
 // object data operations
 //
 //=======================
-func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (props *objectProps, errstr string, errcode int) {
+func (awsimpl *awsimpl) getobj(ct context.Context, fqn, bucket, objname string) (props *objectProps, errstr string, errcode int) {
 	var v cksumvalue
-	sess := createsession()
+	sess := createSession(ct)
 	svc := s3.New(sess)
 	obj, err := svc.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -265,7 +352,6 @@ func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (props *objectProps,
 		errstr = fmt.Sprintf("Failed to GET %s/%s, err: %v", bucket, objname, err)
 		return
 	}
-	defer obj.Body.Close()
 	// may not have dfc metadata
 	if htype, ok := obj.Metadata[awsGetDfcHashType]; ok {
 		if hval, ok := obj.Metadata[awsGetDfcHashVal]; ok {
@@ -284,16 +370,18 @@ func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (props *objectProps,
 	if obj.VersionId != nil {
 		props.version = *obj.VersionId
 	}
-	if _, props.nhobj, props.size, errstr = awsimpl.t.receive(fqn, false, objname, md5, v, obj.Body); errstr != "" {
+	if _, props.nhobj, props.size, errstr = awsimpl.t.receive(fqn, objname, md5, v, obj.Body); errstr != "" {
+		obj.Body.Close()
 		return
 	}
 	if glog.V(4) {
 		glog.Infof("GET %s/%s", bucket, objname)
 	}
+	obj.Body.Close()
 	return
 }
 
-func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
+func (awsimpl *awsimpl) putobj(ct context.Context, file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
 	var (
 		err          error
 		htype, hval  string
@@ -306,7 +394,7 @@ func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 		md[awsPutDfcHashType] = aws.String(htype)
 		md[awsPutDfcHashVal] = aws.String(hval)
 	}
-	sess := createsession()
+	sess := createSession(ct)
 	uploader := s3manager.NewUploader(sess)
 	uploadoutput, err = uploader.Upload(&s3manager.UploadInput{
 		Bucket:   aws.String(bucket),
@@ -330,8 +418,8 @@ func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 	return
 }
 
-func (awsimpl *awsimpl) deleteobj(bucket, objname string) (errstr string, errcode int) {
-	sess := createsession()
+func (awsimpl *awsimpl) deleteobj(ct context.Context, bucket, objname string) (errstr string, errcode int) {
+	sess := createSession(ct)
 	svc := s3.New(sess)
 	_, err := svc.DeleteObject(&s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(objname)})
 	if err != nil {

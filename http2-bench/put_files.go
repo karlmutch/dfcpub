@@ -4,38 +4,36 @@ import (
 	"flag"
 	"fmt"
 	"sync"
-
-	"github.com/NVIDIA/dfcpub/pkg/client/readers"
+	"testing"
 
 	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/pkg/client/readers"
 )
 
 const (
-	blocksize = 1048576
-	baseseed  = 1062984096
-	megabytes = uint64(1024 * 1024)
+	kilobytes = uint64(1024)
 	smokeDir  = "/tmp/dfc/smoke"        // smoke test dir
 	ProxyURL  = "http://localhost:8080" // assuming local proxy is listening on 8080
 )
 
 var (
-	numfiles   int
-	numworkers int
-	filesize   uint64
-	clibucket  string
-	proxyurl   string
+	files    int
+	workers  int
+	filesize uint64
+	bucket   string
+	url      string
 )
 
 func init() {
-	flag.StringVar(&proxyurl, "proxyurl", ProxyURL, "Proxy URL")
-	flag.StringVar(&clibucket, "bucket", "localbkt", "AWS or GCP bucket")
-	flag.IntVar(&numfiles, "files", 10, "Number of files to put")
-	flag.IntVar(&numworkers, "workers", 10, "Number of workers")
-	flag.Uint64Var(&filesize, "filesize", 1, "Size of files to put in MB")
+	flag.StringVar(&url, "url", ProxyURL, "Proxy URL")
+	flag.StringVar(&bucket, "bucket", "local_benchmark_bucket", "AWS or GCP bucket")
+	flag.IntVar(&files, "files", 10, "Number of files to put")
+	flag.IntVar(&workers, "workers", 10, "Number of workers")
+	flag.Uint64Var(&filesize, "filesize", 1, "Size of files to put in KB")
 }
 
-func worker(id int, jobs <-chan func()) {
+func worker(jobs <-chan func()) {
 	for j := range jobs {
 		j()
 	}
@@ -43,22 +41,22 @@ func worker(id int, jobs <-chan func()) {
 
 func main() {
 	flag.Parse()
-	jobs := make(chan func(), numfiles)
+	jobs := make(chan func(), files)
 
-	for w := 0; w < numworkers; w++ {
-		go worker(w, jobs)
+	for w := 0; w < workers; w++ {
+		go worker(jobs)
 	}
 
-	err := putSpecificFiles(0, int64(baseseed), filesize*megabytes, numfiles, clibucket, jobs)
+	err := putSpecificFiles(filesize*kilobytes, files, bucket, jobs)
 	if err != nil {
 		fmt.Printf("%v\n", err)
 		return
 	}
 }
 
-func putSpecificFiles(id int, seed int64, fileSize uint64, numPuts int, bucket string, pool chan func()) error {
+func putSpecificFiles(fileSize uint64, numPuts int, bucket string, pool chan func()) error {
 	var (
-		errch = make(chan error, numfiles)
+		errch = make(chan error, files)
 		wg    = &sync.WaitGroup{}
 	)
 
@@ -73,7 +71,7 @@ func putSpecificFiles(id int, seed int64, fileSize uint64, numPuts int, bucket s
 		fname := fmt.Sprintf("l%d", i)
 		wg.Add(1)
 		pool <- func() {
-			client.PutAsync(wg, proxyurl, r, bucket, "__bench/"+fname, errch, false)
+			client.PutAsync(wg, url, r, bucket, "__bench/"+fname, errch, !testing.Verbose())
 		}
 	}
 	close(pool)

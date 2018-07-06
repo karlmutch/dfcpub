@@ -1,4 +1,4 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
@@ -19,7 +19,7 @@ import (
 
 	"github.com/NVIDIA/dfcpub/dfc/statsd"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 const logsTotalSizeCheckTime = time.Hour * 3
@@ -60,10 +60,10 @@ type proxyCoreStats struct {
 	Listlatency int64 `json:"listlatency"` // ---/---
 	Numerr      int64 `json:"numerr"`
 	// omitempty
-	ngets  int64 `json:"-"`
-	nputs  int64 `json:"-"`
-	nlists int64 `json:"-"`
-	logged bool  `json:"-"`
+	ngets  int64
+	nputs  int64
+	nlists int64
+	logged bool
 }
 
 type targetCoreStats struct {
@@ -96,24 +96,27 @@ type proxystatsrunner struct {
 	Core        proxyCoreStats `json:"core"`
 }
 
-type deviometrics map[string]string
-
 type storstatsrunner struct {
 	statsrunner `json:"-"`
 	Core        targetCoreStats        `json:"core"`
 	Capacity    map[string]*fscapacity `json:"capacity"`
 	// iostat
-	CPUidle string                  `json:"cpuidle"`
-	Disk    map[string]deviometrics `json:"disk"`
+	CPUidle string               `json:"cpuidle"`
+	Disk    map[string]simplekvs `json:"disk"`
 	// omitempty
-	timeUpdatedCapacity time.Time               `json:"-"`
-	timeCheckedLogSizes time.Time               `json:"-"`
-	fsmap               map[syscall.Fsid]string `json:"-"`
+	timeUpdatedCapacity time.Time
+	timeCheckedLogSizes time.Time
+	fsmap               map[syscall.Fsid]string
 }
 
 type ClusterStats struct {
 	Proxy  *proxyCoreStats             `json:"proxy"`
 	Target map[string]*storstatsrunner `json:"target"`
+}
+
+type ClusterStatsRaw struct {
+	Proxy  *proxyCoreStats            `json:"proxy"`
+	Target map[string]json.RawMessage `json:"target"`
 }
 
 type iostatrunner struct {
@@ -122,22 +125,51 @@ type iostatrunner struct {
 	chsts       chan struct{}
 	CPUidle     string
 	metricnames []string
-	Disk        map[string]deviometrics
+	Disk        map[string]simplekvs
 	cmd         *exec.Cmd
 }
 
-//==============================================================
-//
-// c-tor and methods
-//
-//==============================================================
-func (p *proxyrunner) newClusterStats() *ClusterStats {
-	targets := make(map[string]*storstatsrunner, p.smap.count())
-	for _, si := range p.smap.Smap {
-		targets[si.DaemonID] = &storstatsrunner{Capacity: make(map[string]*fscapacity)}
+type (
+	XactionStatsRetriever interface {
+		getStats([]XactionDetails) ([]byte, error)
 	}
-	return &ClusterStats{Target: targets}
-}
+
+	XactionStats struct {
+		Kind        string                     `json:"kind"`
+		TargetStats map[string]json.RawMessage `json:"target"`
+	}
+
+	XactionDetails struct {
+		Id        int64     `json:"id"`
+		StartTime time.Time `json:"startTime"`
+		EndTime   time.Time `json:"endTime"`
+		Status    string    `json:"status"`
+	}
+
+	RebalanceTargetStats struct {
+		Xactions     []XactionDetails `json:"xactionDetails"`
+		NumSentFiles int64            `json:"numSentFiles"`
+		NumSentBytes int64            `json:"numSentBytes"`
+		NumRecvFiles int64            `json:"numRecvFiles"`
+		NumRecvBytes int64            `json:"numRecvBytes"`
+	}
+
+	RebalanceStats struct {
+		Kind        string                          `json:"kind"`
+		TargetStats map[string]RebalanceTargetStats `json:"target"`
+	}
+
+	PrefetchTargetStats struct {
+		Xactions           []XactionDetails `json:"xactionDetails"`
+		NumFilesPrefetched int64            `json:"numFilesPrefetched"`
+		NumBytesPrefetched int64            `json:"numBytesPrefetched"`
+	}
+
+	PrefetchStats struct {
+		Kind        string                   `json:"kind"`
+		TargetStats map[string]PrefetchStats `json:"target"`
+	}
+)
 
 //==================
 //
@@ -216,13 +248,12 @@ func (r *proxystatsrunner) log() (runlru bool) {
 
 func (r *proxystatsrunner) add(name string, val int64) {
 	r.Lock()
-	r.addLocked(name, val)
+	r.addL(name, val)
 	r.Unlock()
 }
 
 func (r *proxystatsrunner) addMany(nameval ...interface{}) {
 	r.Lock()
-	defer r.Unlock()
 	i := 0
 	for i < len(nameval) {
 		statsname, ok := nameval[i].(string)
@@ -231,11 +262,12 @@ func (r *proxystatsrunner) addMany(nameval ...interface{}) {
 		statsval, ok := nameval[i].(int64)
 		assert(ok, fmt.Sprintf("Invalid stats type: %v, %T", nameval[i], nameval[i]))
 		i++
-		r.addLocked(statsname, statsval)
+		r.addL(statsname, statsval)
 	}
+	r.Unlock()
 }
 
-func (r *proxystatsrunner) addLocked(name string, val int64) {
+func (r *proxystatsrunner) addL(name string, val int64) {
 	var v *int64
 	s := &r.Core
 	switch name {
@@ -266,6 +298,7 @@ func (r *proxystatsrunner) addLocked(name string, val int64) {
 		assert(false, "Invalid stats name "+name)
 	}
 	*v += val
+	// FIXME: This causes a race between this line and the 'logged = true' line in log().
 	s.logged = false
 }
 
@@ -275,14 +308,11 @@ func (r *proxystatsrunner) addLocked(name string, val int64) {
 //
 //================
 func (r *storstatsrunner) run() error {
+	r.init()
 	return r.runcommon(r)
 }
 
 func (r *storstatsrunner) log() (runlru bool) {
-	if r.Disk == nil {
-		glog.Errorf("not initialized yet - targetrunner is taking more than %v to start", ctx.config.Periodic.StatsTime)
-		return
-	}
 	r.Lock()
 	if r.Core.logged {
 		r.Unlock()
@@ -325,7 +355,9 @@ func (r *storstatsrunner) log() (runlru bool) {
 		riostat.Lock()
 		r.CPUidle = riostat.CPUidle
 		for dev, iometrics := range riostat.Disk {
-			r.Disk[dev] = iometrics // copy
+			// FIXME (benign) storstatsrunner and iostatrunner share the same 'metrics'
+			// e.g. when responding to http get stats, we do not currently take riostat.Lock
+			r.Disk[dev] = iometrics
 			if riostat.isZeroUtil(dev) {
 				continue // skip zeros
 			}
@@ -462,7 +494,7 @@ func (r *storstatsrunner) fillfscap(fscapacity *fscapacity, statfs *syscall.Stat
 }
 
 func (r *storstatsrunner) init() {
-	r.Disk = make(map[string]deviometrics, 8)
+	r.Disk = make(map[string]simplekvs, 8)
 	// local filesystems and their cap-s
 	r.Capacity = make(map[string]*fscapacity)
 	r.fsmap = make(map[syscall.Fsid]string)
@@ -487,14 +519,13 @@ func (r *storstatsrunner) init() {
 
 func (r *storstatsrunner) add(name string, val int64) {
 	r.Lock()
-	r.addLocked(name, val)
+	r.addL(name, val)
 	r.Unlock()
 }
 
 // FIXME: copy paste
 func (r *storstatsrunner) addMany(nameval ...interface{}) {
 	r.Lock()
-	defer r.Unlock()
 	i := 0
 	for i < len(nameval) {
 		statsname, ok := nameval[i].(string)
@@ -503,11 +534,12 @@ func (r *storstatsrunner) addMany(nameval ...interface{}) {
 		statsval, ok := nameval[i].(int64)
 		assert(ok, fmt.Sprintf("Invalid stats type: %v, %T", nameval[i], nameval[i]))
 		i++
-		r.addLocked(statsname, statsval)
+		r.addL(statsname, statsval)
 	}
+	r.Unlock()
 }
 
-func (r *storstatsrunner) addLocked(name string, val int64) {
+func (r *storstatsrunner) addL(name string, val int64) {
 	var v *int64
 	s := &r.Core
 	switch name {
@@ -569,4 +601,48 @@ func (r *storstatsrunner) addLocked(name string, val int64) {
 	}
 	*v += val
 	s.logged = false
+}
+
+func (p PrefetchTargetStats) getStats(allXactionDetails []XactionDetails) (
+	[]byte, error) {
+	storageStatsRunner := getstorstatsrunner()
+	storageStatsRunner.Lock()
+	prefetchXactionStats := PrefetchTargetStats{
+		Xactions:           allXactionDetails,
+		NumBytesPrefetched: storageStatsRunner.Core.Numprefetch,
+		NumFilesPrefetched: storageStatsRunner.Core.Bytesprefetched,
+	}
+	storageStatsRunner.Unlock()
+	jsonBytes, err := json.Marshal(prefetchXactionStats)
+	if err != nil {
+		err = fmt.Errorf(
+			"Unable to marshal prefetchXactionStats. Error: %v",
+			err)
+		return []byte{}, err
+	}
+
+	return jsonBytes, nil
+}
+
+func (r RebalanceTargetStats) getStats(allXactionDetails []XactionDetails) (
+	[]byte, error) {
+	storageStatsRunner := getstorstatsrunner()
+	storageStatsRunner.Lock()
+	rebalanceXactionStats := RebalanceTargetStats{
+		Xactions:     allXactionDetails,
+		NumRecvBytes: storageStatsRunner.Core.Numrecvbytes,
+		NumRecvFiles: storageStatsRunner.Core.Numrecvfiles,
+		NumSentBytes: storageStatsRunner.Core.Numsentbytes,
+		NumSentFiles: storageStatsRunner.Core.Numsentfiles,
+	}
+	storageStatsRunner.Unlock()
+	jsonBytes, err := json.Marshal(rebalanceXactionStats)
+	if err != nil {
+		err = fmt.Errorf(
+			"Unable to marshal rebalanceXactionStats. Error: %v",
+			err)
+		return []byte{}, err
+	}
+
+	return jsonBytes, nil
 }

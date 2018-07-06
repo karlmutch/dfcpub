@@ -35,17 +35,24 @@ var (
 // and checks if the number of items equals the number of files with
 // the names starting with the prefix;
 // otherwise, the test creates (PUT) random files and executes 'a*' through 'z*' listings.
-func Test_prefix(t *testing.T) {
+func TestPrefix(t *testing.T) {
 	if err := client.Tcping(proxyurl); err != nil {
 		tlogf("%s: %v\n", proxyurl, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Looking for files with prefix [%s]\n", prefix)
+	tlogf("Looking for files with prefix [%s]\n", prefix)
+	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
 	prefixFileNumber = numfiles
 	prefixCreateFiles(t)
 	prefixLookup(t)
 	prefixCleanup(t)
+
+	if created {
+		if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
+			t.Errorf("Failed to delete local bucket: %v", err)
+		}
+	}
 }
 
 func numberOfFilesWithPrefix(fileNames []string, namePrefix string, commonDir string) int {
@@ -79,7 +86,7 @@ func prefixCreateFiles(t *testing.T) {
 		}
 
 		wg.Add(1)
-		go client.PutAsync(wg, proxyurl, r, clibucket, keyName, errch, false /* silent */)
+		go client.PutAsync(wg, proxyurl, r, clibucket, keyName, errch, !testing.Verbose())
 		fileNames = append(fileNames, fileName)
 	}
 
@@ -94,7 +101,7 @@ func prefixCreateFiles(t *testing.T) {
 		}
 
 		wg.Add(1)
-		go client.PutAsync(wg, proxyurl, r, clibucket, keyName, errch, false /* silent */)
+		go client.PutAsync(wg, proxyurl, r, clibucket, keyName, errch, !testing.Verbose())
 		fileNames = append(fileNames, fName)
 	}
 
@@ -109,11 +116,12 @@ func prefixCreateFiles(t *testing.T) {
 }
 
 func prefixLookupOne(t *testing.T) {
-	fmt.Printf("Looking up for files than names start with %s\n", prefix)
+	tlogf("Looking up for files than names start with %s\n", prefix)
 	var msg = &dfc.GetMsg{GetPrefix: prefix}
 	numFiles := 0
 	objList, err := client.ListBucket(proxyurl, clibucket, msg, 0)
-	if testfail(err, "List files with prefix failed", nil, nil, t) {
+	if err != nil {
+		t.Errorf("List files with prefix failed, err = %v", err)
 		return
 	}
 
@@ -124,14 +132,14 @@ func prefixLookupOne(t *testing.T) {
 
 	realNumFiles := numberOfFilesWithPrefix(fileNames, prefix, prefixDir)
 	if realNumFiles == numFiles {
-		fmt.Printf("Total files with prefix found: %v\n", numFiles)
+		tlogf("Total files with prefix found: %v\n", numFiles)
 	} else {
 		t.Errorf("Expected number of files with prefix '%s' is %v but found %v files", prefix, realNumFiles, numFiles)
 	}
 }
 
 func prefixLookupDefault(t *testing.T) {
-	fmt.Printf("Looking up for files in alphabetic order\n")
+	tlogf("Looking up for files in alphabetic order\n")
 
 	letters := "abcdefghijklmnopqrstuvwxyz"
 	for i := 0; i < len(letters); i++ {
@@ -139,7 +147,8 @@ func prefixLookupDefault(t *testing.T) {
 		lookFor := fmt.Sprintf("%s/%s", prefixDir, key)
 		var msg = &dfc.GetMsg{GetPrefix: lookFor}
 		objList, err := client.ListBucket(proxyurl, clibucket, msg, 0)
-		if testfail(err, "List files with prefix failed", nil, nil, t) {
+		if err != nil {
+			t.Errorf("List files with prefix failed, err = %v", err)
 			return
 		}
 
@@ -148,7 +157,7 @@ func prefixLookupDefault(t *testing.T) {
 
 		if numFiles == realNumFiles {
 			if numFiles != 0 {
-				fmt.Printf("Found %v files starting with '%s'\n", numFiles, key)
+				tlogf("Found %v files starting with '%s'\n", numFiles, key)
 			}
 		} else {
 			t.Errorf("Expected number of files with prefix '%s' is %v but found %v files", key, realNumFiles, numFiles)
@@ -161,7 +170,7 @@ func prefixLookupDefault(t *testing.T) {
 }
 
 func prefixLookupCornerCases(t *testing.T) {
-	fmt.Printf("Testing corner cases\n")
+	tlogf("Testing corner cases\n")
 
 	type testProps struct {
 		title    string
@@ -180,7 +189,8 @@ func prefixLookupCornerCases(t *testing.T) {
 		tlogf("%d. Prefix: %s [%s]\n", idx, test.title, p)
 		var msg = &dfc.GetMsg{GetPrefix: p}
 		objList, err := client.ListBucket(proxyurl, clibucket, msg, 0)
-		if testfail(err, "List files with prefix failed", nil, nil, t) {
+		if err != nil {
+			t.Errorf("List files with prefix failed, err = %v", err)
 			return
 		}
 
@@ -217,7 +227,7 @@ func prefixCleanup(t *testing.T) {
 
 	select {
 	case e := <-errch:
-		fmt.Printf("Failed to DEL: %s\n", e)
+		tlogf("Failed to DEL: %s\n", e)
 		t.Fail()
 	default:
 	}

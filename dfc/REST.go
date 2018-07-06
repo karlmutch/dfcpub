@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -16,19 +16,25 @@ type ActionMsg struct {
 
 // ActionMsg.Action enum
 const (
-	ActShutdown  = "shutdown"
-	ActSyncSmap  = "syncsmap"  // synchronize cluster map aka Smap across all targets
-	ActRebalance = "rebalance" // rebalance local caches upon target(s) joining and/or leaving the cluster
-	ActLRU       = "lru"
-	ActSyncLB    = "synclb"
-	ActCreateLB  = "createlb"
-	ActDestroyLB = "destroylb"
-	ActRenameLB  = "renamelb"
-	ActSetConfig = "setconfig"
-	ActRename    = "rename"
-	ActEvict     = "evict"
-	ActDelete    = "delete"
-	ActPrefetch  = "prefetch"
+	ActShutdown    = "shutdown"
+	ActRebalance   = "rebalance"
+	ActLRU         = "lru"
+	ActSyncLB      = "synclb"
+	ActCreateLB    = "createlb"
+	ActDestroyLB   = "destroylb"
+	ActRenameLB    = "renamelb"
+	ActSetConfig   = "setconfig"
+	ActSetProps    = "setprops"
+	ActListObjects = "listobjects"
+	ActRename      = "rename"
+	ActEvict       = "evict"
+	ActDelete      = "delete"
+	ActPrefetch    = "prefetch"
+	ActRegTarget   = "regtarget"
+	ActRegProxy    = "regproxy"
+	ActUnregTarget = "unregtarget"
+	ActUnregProxy  = "unregproxy"
+	ActNewPrimary  = "newprimary"
 )
 
 // Cloud Provider enum
@@ -42,32 +48,41 @@ const (
 const (
 	CloudProvider         = "CloudProvider"         // from Cloud Provider enum
 	Versioning            = "Versioning"            // Versioning state for a bucket: "enabled"/"disabled"
+	NextTierURL           = "NextTierURL"           // URL of the next tier in a DFC multi-tier environment
+	ReadPolicy            = "ReadPolicy"            // Policy used for reading in a DFC multi-tier environment
+	WritePolicy           = "WritePolicy"           // Policy used for writing in a DFC multi-tier environment
 	HeaderDfcChecksumType = "HeaderDfcChecksumType" // Checksum Type (xxhash, md5, none)
 	HeaderDfcChecksumVal  = "HeaderDfcChecksumVal"  // Checksum Value
 	HeaderDfcObjVersion   = "HeaderDfcObjVersion"   // Object version/generation
 	HeaderPrimaryProxyURL = "PrimaryProxyURL"       // URL of Primary Proxy
 	HeaderPrimaryProxyID  = "PrimaryProxyID"        // ID of Primary Proxy
+	Size                  = "Size"                  // Size of object in bytes
+	Version               = "Version"               // Object version number
 )
 
 // URL Query Parameter enum
 const (
-	URLParamLocal            = "local"       // true: bucket is expected to be local
-	URLParamFromID           = "from_id"     // from_id=string - ID to copy from
-	URLParamToID             = "to_id"       // to_id=string - ID to copy to
-	URLParamFromName         = "from_name"   // rename from
-	URLParamToName           = "to_name"     // rename to
-	URLParamCached           = "cachedonly"  // true: return cached objects (names, metadata) instead of requesting the list from the cloud
-	URLParamNewTargetID      = "newtargetid" // ID of the new target joining the cluster
-	URLParamSuspectedTarget  = "suspect"     // suspect=string - ID of the target suspected of failure
-	URLParamPrimaryCandidate = "candidate"   // candidate=string - ID of the candidate for primary proxy
-	URLParamForce            = "force"       // true: shutdown the primary proxy
-	URLParamPrepare          = "prepare"     // true: request is the prepare phase for primary proxy change
+	URLParamLocal            = "local"        // true: bucket is expected to be local
+	URLParamFromID           = "from_id"      // from_id=string - ID to copy from
+	URLParamToID             = "to_id"        // to_id=string - ID to copy to
+	URLParamFromName         = "from_name"    // rename from
+	URLParamToName           = "to_name"      // rename to
+	URLParamCached           = "cachedonly"   // true: return cached objects (names, metadata) instead of requesting the list from the cloud
+	URLParamSuspectedTarget  = "suspect"      // suspect=string - ID of the target suspected of failure
+	URLParamPrimaryCandidate = "candidate"    // candidate=string - ID of the candidate for primary proxy
+	URLParamForce            = "force"        // true: shutdown the primary proxy
+	URLParamPrepare          = "prepare"      // true: request is the prepare phase for primary proxy change
+	URLParamDaemonID         = "daemon_id"    // daemon ID
+	URLParamCheckCached      = "check_cached" // true: check if object is cached in DFC
+	URLParamOffset           = "offset"       // Offset from where the object should be read
+	URLParamLength           = "length"       // Length, the total number of bytes that need to be read from the offset
+	URLParamWhat             = "what"         // "config" | "stats" | "xaction" ...
+	URLParamProps            = "props"        // e.g. "checksum, size" | "atime, size" | "ctime, iscached" | "bucket, size" | xaction type
 )
 
 // TODO: sort and some props are TBD
-// GetMsg represents properties and options for get requests
+// GetMsg represents properties and options for requests which fetch entities
 type GetMsg struct {
-	GetWhat       string `json:"what"`        // "config" | "stats" ...
 	GetSort       string `json:"sort"`        // "ascending, atime" | "descending, name"
 	GetProps      string `json:"props"`       // e.g. "checksum, size" | "atime, size" | "ctime, iscached" | "bucket, size"
 	GetTimeFormat string `json:"time_format"` // "RFC822" default - see the enum below
@@ -98,8 +113,9 @@ type RangeMsg struct {
 
 // SmapVoteMsg contains the cluster map and a bool representing whether or not a vote is currently happening.
 type SmapVoteMsg struct {
-	VoteInProgress bool  `json:"vote_in_progress"`
-	Smap           *Smap `json:"smap"`
+	VoteInProgress bool      `json:"vote_in_progress"`
+	Smap           *Smap     `json:"smap"`
+	BucketMD       *bucketMD `json:"bucketmd"`
 }
 
 //===================
@@ -108,12 +124,13 @@ type SmapVoteMsg struct {
 //
 //===================
 
-// GetMsg.GetWhat enum
+// URLParamWhat enum
 const (
 	GetWhatFile     = "file" // { "what": "file" } is implied by default and can be omitted
 	GetWhatConfig   = "config"
 	GetWhatSmap     = "smap"
 	GetWhatStats    = "stats"
+	GetWhatXaction  = "xaction"
 	GetWhatSmapVote = "smapvote"
 )
 
@@ -143,6 +160,7 @@ const (
 	GetPropsIsCached = "iscached"
 	GetPropsBucket   = "bucket"
 	GetPropsVersion  = "version"
+	GetTargetURL     = "targetURL"
 )
 
 //===================
@@ -154,18 +172,19 @@ const (
 // BucketEntry corresponds to a single entry in the BucketList and
 // contains file and directory metadata as per the GetMsg
 type BucketEntry struct {
-	Name     string `json:"name"`     // name of the object - note: does not include the bucket name
-	Size     int64  `json:"size"`     // size in bytes
-	Ctime    string `json:"ctime"`    // formatted as per GetMsg.GetTimeFormat
-	Checksum string `json:"checksum"` // checksum
-	Type     string `json:"type"`     // "file" OR "directory"
-	Atime    string `json:"atime"`    // formatted as per GetMsg.GetTimeFormat
-	Bucket   string `json:"bucket"`   // parent bucket name
-	Version  string `json:"version"`  // version/generation ID. In GCP it is int64, in AWS it is a string
-	IsCached bool   `json:"iscached"` // if the file is cached on one of targets
+	Name      string `json:"name"`                // name of the object - note: does not include the bucket name
+	Size      int64  `json:"size"`                // size in bytes
+	Ctime     string `json:"ctime"`               // formatted as per GetMsg.GetTimeFormat
+	Checksum  string `json:"checksum"`            // checksum
+	Type      string `json:"type"`                // "file" OR "directory"
+	Atime     string `json:"atime"`               // formatted as per GetMsg.GetTimeFormat
+	Bucket    string `json:"bucket"`              // parent bucket name
+	Version   string `json:"version"`             // version/generation ID. In GCP it is int64, in AWS it is a string
+	IsCached  bool   `json:"iscached"`            // if the file is cached on one of targets
+	TargetURL string `json:"targetURL,omitempty"` // URL of target which has the entry
 }
 
-// BucketList represents the contents of a given bucket - somewhat analagous to the 'ls <bucket-name>'
+// BucketList represents the contents of a given bucket - somewhat analogous to the 'ls <bucket-name>'
 type BucketList struct {
 	Entries    []*BucketEntry `json:"entries"`
 	PageMarker string         `json:"pagemarker"`
@@ -184,16 +203,25 @@ const (
 	Robjects   = "objects"
 	Rcluster   = "cluster"
 	Rdaemon    = "daemon"
-	Rsyncsmap  = ActSyncSmap
-	Rebalance  = ActRebalance
-	Rsynclb    = ActSyncLB
+	Rsyncsmap  = "syncsmap"
 	Rpush      = "push"
 	Rkeepalive = "keepalive"
+	Rregister  = "register"
 	Rhealth    = "health"
 	Rvote      = "vote"
-	Rtarget    = "target"
 	Rproxy     = "proxy"
 	Rvoteres   = "result"
 	Rvoteinit  = "init"
 	Rtokens    = "tokens"
+	Rmetasync  = "metasync"
+)
+
+const (
+	// Used by various Xaction APIs
+	XactionRebalance = ActRebalance
+	XactionPrefetch  = ActPrefetch
+
+	// Denote the status of an Xaction
+	XactionStatusInProgress = "InProgress"
+	XactionStatusCompleted  = "Completed"
 )

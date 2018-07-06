@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 //
@@ -12,16 +12,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 type xactInterface interface {
 	getid() int64
 	getkind() string
+	getStartTime() time.Time
+	getEndTime() time.Time
 	tostring() string
 	abort()
 	finished() bool
@@ -75,6 +76,14 @@ func (xact *xactBase) getkind() string {
 	return xact.kind
 }
 
+func (xact *xactBase) getStartTime() time.Time {
+	return xact.stime
+}
+
+func (xact *xactBase) getEndTime() time.Time {
+	return xact.etime
+}
+
 func (xact *xactBase) tostring() string { assert(false, "must be implemented"); return "" }
 
 func (xact *xactBase) abort() {
@@ -104,7 +113,7 @@ func newxactinp() *xactInProgress {
 func (q *xactInProgress) uniqueid() int64 {
 	id := time.Now().UTC().UnixNano() & 0xffff
 	for i := 0; i < 10; i++ {
-		if _, x := q.findUnlocked(id); x == nil {
+		if _, x := q.findU(id); x == nil {
 			return id
 		}
 		id = (time.Now().UTC().UnixNano() + id) & 0xffff
@@ -114,12 +123,10 @@ func (q *xactInProgress) uniqueid() int64 {
 }
 
 func (q *xactInProgress) add(xact xactInterface) {
-	l := len(q.xactinp)
-	q.xactinp = append(q.xactinp, nil)
-	q.xactinp[l] = xact
+	q.xactinp = append(q.xactinp, xact)
 }
 
-func (q *xactInProgress) findUnlocked(by interface{}) (idx int, xact xactInterface) {
+func (q *xactInProgress) findU(by interface{}) (idx int, xact xactInterface) {
 	var id int64
 	var kind string
 	switch by.(type) {
@@ -141,18 +148,19 @@ func (q *xactInProgress) findUnlocked(by interface{}) (idx int, xact xactInterfa
 	return -1, nil
 }
 
-func (q *xactInProgress) findLocked(by interface{}) (idx int, xact xactInterface) {
+func (q *xactInProgress) findL(by interface{}) (idx int, xact xactInterface) {
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	return q.findUnlocked(by)
+	idx, xact = q.findU(by)
+	q.lock.Unlock()
+	return
 }
 
 func (q *xactInProgress) del(by interface{}) {
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	k, xact := q.findUnlocked(by)
+	k, xact := q.findU(by)
 	if xact == nil {
 		glog.Errorf("Failed to find xact by %#v", by)
+		q.lock.Unlock()
 		return
 	}
 	l := len(q.xactinp)
@@ -161,18 +169,23 @@ func (q *xactInProgress) del(by interface{}) {
 	}
 	q.xactinp[l-1] = nil
 	q.xactinp = q.xactinp[:l-1]
+	q.lock.Unlock()
 }
 
 func (q *xactInProgress) renewRebalance(curversion int64, t *targetrunner) *xactRebalance {
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	_, xx := q.findUnlocked(ActRebalance)
+	_, xx := q.findU(ActRebalance)
 	if xx != nil {
 		xreb := xx.(*xactRebalance)
 		if !xreb.finished() {
-			assert(!(xreb.curversion > curversion))
+			if xreb.curversion > curversion {
+				glog.Errorf("%s version is greater than curversion %d", xreb.tostring(), curversion)
+				q.lock.Unlock()
+				return nil
+			}
 			if xreb.curversion == curversion {
 				glog.Infof("%s already running, nothing to do", xreb.tostring())
+				q.lock.Unlock()
 				return nil
 			}
 			xreb.abort()
@@ -182,16 +195,13 @@ func (q *xactInProgress) renewRebalance(curversion int64, t *targetrunner) *xact
 	xreb := &xactRebalance{xactBase: *newxactBase(id, ActRebalance), curversion: curversion}
 	xreb.targetrunner = t
 	q.add(xreb)
+	q.lock.Unlock()
 	return xreb
 }
 
 // persistent mark indicating rebalancing in progress
 func (q *xactInProgress) rebalanceInProgress() (pmarker string) {
 	pmarker = filepath.Join(ctx.config.Confdir, rebinpname)
-	if ctx.config.TestFSP.Instance > 0 {
-		instancedir := filepath.Join(ctx.config.Confdir, strconv.Itoa(ctx.config.TestFSP.Instance))
-		pmarker = filepath.Join(instancedir, mpname)
-	}
 	return
 }
 
@@ -203,40 +213,41 @@ func (q *xactInProgress) isAbortedOrRunningRebalance() (aborted, running bool) {
 	}
 
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	_, xx := q.findUnlocked(ActRebalance)
+	_, xx := q.findU(ActRebalance)
 	if xx != nil {
 		xreb := xx.(*xactRebalance)
 		if !xreb.finished() {
 			running = true
 		}
 	}
+	q.lock.Unlock()
 	return
 }
 
 func (q *xactInProgress) renewLRU(t *targetrunner) *xactLRU {
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	_, xx := q.findUnlocked(ActLRU)
+	_, xx := q.findU(ActLRU)
 	if xx != nil {
 		xlru := xx.(*xactLRU)
 		glog.Infof("%s already running, nothing to do", xlru.tostring())
+		q.lock.Unlock()
 		return nil
 	}
 	id := q.uniqueid()
 	xlru := &xactLRU{xactBase: *newxactBase(id, ActLRU)}
 	xlru.targetrunner = t
 	q.add(xlru)
+	q.lock.Unlock()
 	return xlru
 }
 
 func (q *xactInProgress) renewElection(p *proxyrunner, vr *VoteRecord) *xactElection {
 	q.lock.Lock()
-	defer q.lock.Unlock()
-	_, xx := q.findUnlocked(ActElection)
+	_, xx := q.findU(ActElection)
 	if xx != nil {
 		xele := xx.(*xactElection)
 		glog.Infof("%s already running, nothing to do", xele.tostring())
+		q.lock.Unlock()
 		return nil
 	}
 	id := q.uniqueid()
@@ -246,18 +257,19 @@ func (q *xactInProgress) renewElection(p *proxyrunner, vr *VoteRecord) *xactElec
 		vr:          vr,
 	}
 	q.add(xele)
+	q.lock.Unlock()
 	return xele
 }
 
 func (q *xactInProgress) abortAll() (sleep bool) {
 	q.lock.Lock()
-	defer q.lock.Unlock()
 	for _, xact := range q.xactinp {
 		if !xact.finished() {
 			xact.abort()
 			sleep = true
 		}
 	}
+	q.lock.Unlock()
 	return
 }
 
@@ -267,12 +279,12 @@ func (q *xactInProgress) abortAll() (sleep bool) {
 //
 //===================
 func (xact *xactLRU) tostring() string {
-	start := xact.stime.Sub(xact.targetrunner.starttime())
 	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, start)
+		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, xact.stime.Format("15:04:05.000000"))
 	}
-	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d %v finished %v", xact.kind, xact.id, start, fin)
+	d := xact.etime.Sub(xact.stime)
+	return fmt.Sprintf("xaction %s:%d %v finished %v (duration %v)", xact.kind, xact.id,
+		xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
 }
 
 //===================
@@ -281,12 +293,12 @@ func (xact *xactLRU) tostring() string {
 //
 //===================
 func (xact *xactRebalance) tostring() string {
-	start := xact.stime.Sub(xact.targetrunner.starttime())
 	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d v%d started %v", xact.kind, xact.id, xact.curversion, start)
+		return fmt.Sprintf("xaction %s:%d v%d started %v", xact.kind, xact.id, xact.curversion, xact.stime.Format("15:04:05.000000"))
 	}
-	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d v%d started %v finished %v", xact.kind, xact.id, xact.curversion, start, fin)
+	d := xact.etime.Sub(xact.stime)
+	return fmt.Sprintf("xaction %s:%d v%d started %v finished %v (duration %v)",
+		xact.kind, xact.id, xact.curversion, xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
 }
 
 func (xact *xactRebalance) abort() {
@@ -300,12 +312,12 @@ func (xact *xactRebalance) abort() {
 //
 //==============
 func (xact *xactElection) tostring() string {
-	start := xact.stime.Sub(xact.proxyrunner.starttime)
 	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, start)
+		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, xact.stime.Format("15:04:05.000000"))
 	}
-	fin := time.Since(xact.proxyrunner.starttime)
-	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.kind, xact.id, start, fin)
+	d := xact.etime.Sub(xact.stime)
+	return fmt.Sprintf("xaction %s:%d started %v finished %v (duration %v)", xact.kind, xact.id,
+		xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
 }
 
 func (xact *xactElection) abort() {

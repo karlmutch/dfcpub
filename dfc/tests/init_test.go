@@ -12,23 +12,28 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/dfc"
+	"github.com/NVIDIA/dfcpub/pkg/client"
 	"github.com/NVIDIA/dfcpub/pkg/client/readers"
 )
 
 const (
-	baseDir         = "/tmp/dfc"
-	LocalDestDir    = "/tmp/dfc/dest" // client-side download destination
-	LocalSrcDir     = "/tmp/dfc/src"  // client-side src directory for upload
-	ColdValidStr    = "coldmd5"
-	ChksumValidStr  = "chksum"
-	ColdMD5str      = "coldmd5"
-	DeleteDir       = "/tmp/dfc/delete"
-	DeleteStr       = "delete"
-	SmokeDir        = "/tmp/dfc/smoke" // smoke test dir
-	SmokeStr        = "smoke"
-	largefilesize   = 4                // in MB
-	PhysMemSizeWarn = uint64(7 * 1024) // MBs
-	ProxyURL        = "http://localhost:8080"
+	baseDir                 = "/tmp/dfc"
+	LocalDestDir            = "/tmp/dfc/dest" // client-side download destination
+	LocalSrcDir             = "/tmp/dfc/src"  // client-side src directory for upload
+	ColdValidStr            = "coldmd5"
+	ChksumValidStr          = "chksum"
+	ColdMD5str              = "coldmd5"
+	DeleteDir               = "/tmp/dfc/delete"
+	ChecksumWarmValidateDir = "/tmp/dfc/checksumWarmValidate"
+	ChecksumWarmValidateStr = "checksumWarmValidate"
+	RangeGetDir             = "/tmp/dfc/rangeGet"
+	RangeGetStr             = "rangeGet"
+	DeleteStr               = "delete"
+	SmokeDir                = "/tmp/dfc/smoke" // smoke test dir
+	SmokeStr                = "smoke"
+	largefilesize           = 4                // in MB
+	PhysMemSizeWarn         = uint64(7 * 1024) // MBs
+	ProxyURL                = "http://localhost:8080"
 )
 
 var (
@@ -49,6 +54,7 @@ var (
 	skipdel                bool
 	baseseed               = int64(1062984096)
 	keepaliveSeconds       int64
+	proxyChangeLatency     time.Duration // time for a cluster to stabilize after proxy changes
 	startupGetSmapDelay    int64
 	multiProxyTestDuration time.Duration
 	clichecksum            string
@@ -85,10 +91,12 @@ func init() {
 	flag.Int64Var(&baseseed, "seed", baseseed, "Seed to use for random number generators")
 	flag.Int64Var(&keepaliveSeconds, "keepaliveseconds", 15, "The keepalive poll time for the cluster")
 	flag.Int64Var(&startupGetSmapDelay, "startupgetsmapdelay", 10, "The Startup Get Smap Delay time for proxies")
-	flag.DurationVar(&multiProxyTestDuration, "duration", 10*time.Minute,
+	flag.DurationVar(&multiProxyTestDuration, "duration", 3*time.Minute,
 		"The length to run the Multiple Proxy Stress Test for")
 	flag.StringVar(&clichecksum, "checksum", "all", "all | xxhash | coldmd5")
 	flag.IntVar(&cycles, "cycles", 15, "Number of PUT cycles")
+	flag.DurationVar(&proxyChangeLatency, "proxychangelatency", time.Second*30,
+		"Time for cluster to stablize after a proxy change")
 
 	flag.Parse()
 
@@ -113,5 +121,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// primary proxy can change if proxy tests are run and no new cluster is re-deployed before each test
+	// find out who is the current primary proxy
+	url, err := client.GetPrimaryProxy(proxyurl)
+	if err != nil {
+		fmt.Printf("Failed to get primary proxy, err = %v", err)
+		os.Exit(1)
+	}
+
+	proxyurl = url
 	os.Exit(m.Run())
 }

@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -24,7 +24,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 const (
@@ -355,7 +355,7 @@ func (v *cksumvalmd5) get() (string, string) { return v.tag, v.val }
 
 //===========================================================================
 //
-// local (config) save and restore
+// local (config) save and restore - NOTE: caller is responsible to serialize
 //
 //===========================================================================
 func LocalSave(pathname string, v interface{}) error {

@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 const (
@@ -35,10 +35,6 @@ type atimerunner struct {
 
 func (r *atimerunner) run() error {
 	glog.Infof("Starting %s", r.name)
-	r.chstop = make(chan struct{}, 4)
-	r.chfqn = make(chan string, chfqnSize)
-	r.atimemap = &atimemap{m: make(map[string]time.Time, atimeCacheIni)}
-
 	ticker := time.NewTicker(atimeSyncTime)
 loop:
 	for {
@@ -77,8 +73,8 @@ func (r *atimerunner) atime(fqn string) (atime time.Time, ok bool) {
 		return
 	}
 	r.atimemap.Lock()
-	defer r.atimemap.Unlock()
 	atime, ok = r.atimemap.m[fqn]
+	r.atimemap.Unlock()
 	return
 }
 
@@ -116,12 +112,11 @@ func (r *atimerunner) heuristics() (n int) {
 }
 
 func (r *atimerunner) flush(n int) {
-	r.atimemap.Lock()
-	defer r.atimemap.Unlock()
 	var (
 		i     int
 		mtime time.Time
 	)
+	r.atimemap.Lock()
 	for fqn, atime := range r.atimemap.m {
 		finfo, err := os.Stat(fqn)
 		if err != nil {
@@ -153,4 +148,5 @@ func (r *atimerunner) flush(n int) {
 			break
 		}
 	}
+	r.atimemap.Unlock()
 }

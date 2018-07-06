@@ -1,0 +1,1207 @@
+openapi: "3.0.0"
+info:
+  version: "1.1.0"
+  title: DFC
+  description: "DFC is a scalable object-storage based caching system with Amazon and Google Cloud backends."
+  termsOfService: ""
+  contact:
+    name: "NVIDIA-DFC"
+    email: "dfcdev@exchange.nvidia.com"
+    url: "https://github.com/NVIDIA/dfcpub"
+  license:
+    name: MIT
+    url: https://github.com/NVIDIA/dfcpub/blob/master/LICENSE
+tags:
+  - name: Object
+    description: All APIs to interact with DFC objects
+    externalDocs:
+      url: https://github.com/NVIDIA/dfcpub
+  - name: Bucket
+    description: All APIs to interact with DFC buckets
+    externalDocs:
+      url: https://github.com/NVIDIA/dfcpub
+  - name: Cluster
+    description: All APIs to perform operations on the DFC cluster
+    externalDocs:
+      url: https://github.com/NVIDIA/dfcpub
+  - name: Daemon
+    description: All APIs to perform operations on individual DFC daemons
+    externalDocs:
+      url: https://github.com/NVIDIA/dfcpub
+servers:
+  - url: http://localhost:8080/v1
+paths:
+  /objects/{bucket-name}/{object-name}:
+    get:
+      summary: Get object
+      operationId: get
+      tags:
+        - Object
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: object-name
+          in: path
+          description: Object name
+          required: true
+          schema:
+            type: string
+        - name: offset
+          in: query
+          description: Starting byte from where the read needs to be performed
+          schema:
+            type: integer
+            format: int64
+        - name: length
+          in: query
+          description: Number of bytes that need to be returned starting from the offset
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Object at the location bucket-name/object-name
+          headers:
+            HeaderDfcChecksumType:
+              schema:
+                type: string
+            HeaderDfcChecksumVal:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: byte
+        '301':
+          description: "Permanent HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      summary: Put object
+      operationId: put
+      tags:
+        - Object
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: object-name
+          in: path
+          description: Object name
+          required: true
+          schema:
+            type: string
+        - name: from_id
+          in: query
+          description: Source target ID
+          schema:
+            type: string
+        - name: to_id
+          in: query
+          description: Destination target ID
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Object at the location bucket-name/object-name put successfully
+        '307':
+          description: "Temporary HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    delete:
+      summary: Delete object
+      operationId: delete
+      tags:
+        - Object
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: object-name
+          in: path
+          description: Object name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Object at the location bucket-name/object-name deleted successfully
+        '307':
+          description: "Temporary HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      summary: Perform operations on object such as rename
+      operationId: performOperation
+      tags:
+        - Object
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: object-name
+          in: path
+          description: Object name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Operation on bucket-name/object-name succeeded
+        '307':
+          description: "Temporary HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    head:
+      summary: Query object properties
+      operationId: getProperties
+      tags:
+        - Object
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: object-name
+          in: path
+          description: Object name
+          required: true
+          schema:
+            type: string
+        - name: check_cached
+          in: query
+          description: Check if the object is cached
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Properties of the object at the location bucket-name/object-name
+          headers:
+            CloudProvider:
+              schema:
+                type: string
+            Size:
+              schema:
+                type: integer
+                format: int32
+            Version:
+              schema:
+                type: string
+        '307':
+          description: "Temporary HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /buckets/*:
+    get:
+      summary: Get bucket names
+      operationId: listNames
+      tags:
+        - Bucket
+      parameters:
+        - name: local
+          in: query
+          description: Get only local bucket names
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Cloud and local bucket names
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BucketNames'
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /buckets/{bucket-name}:
+    put:
+      summary: Set bucket properties
+      operationId: setProperties
+      tags:
+        - Bucket
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+        - name: cloud_provider
+          in: query
+          description: Bucket's cloud provider
+          schema:
+            type: string
+        - name: next_tier_url
+          in: query
+          description: URL for the next tier
+          schema:
+            type: string
+        - name: read_policy
+          in: query
+          description: Policy which defines how to perform reads in case of more tiers
+          schema:
+            $ref: '#/components/schemas/RWPolicy'
+        - name: write_policy
+          in: query
+          description: Policy which defines how to perform writes in case of more tiers
+          schema:
+            $ref: '#/components/schemas/RWPolicy'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Bucket properties set successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      summary: Perform operations on bucket such as create
+      operationId: performOperation
+      tags:
+        - Bucket
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Operation on bucket-name succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectPropertyList'
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    delete:
+      summary: Delete operations on bucket and its contained objects
+      operationId: delete
+      tags:
+        - Bucket
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Bucket-name deleted successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    head:
+      summary: Query bucket properties
+      operationId: getProperties
+      tags:
+        - Bucket
+      parameters:
+        - name: bucket-name
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Properties of bucket-name
+          headers:
+            CloudProvider:
+              schema:
+                type: string
+            Versioning:
+              schema:
+                type: string
+            NextTierURL:
+              schema:
+                type: string
+            ReadPolicy:
+              schema:
+                type: string
+            WritePolicy:
+              schema:
+                type: string
+        '307':
+          description: "Temporary HTTP redirect"
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /cluster/:
+    get:
+      summary: Get cluster related details
+      operationId: get
+      tags:
+        - Cluster
+      parameters:
+        - name: what
+          in: query
+          description: Cluster details which need to be fetched
+          required: true
+          schema:
+            $ref: '#/components/schemas/GetWhat'
+        - name: props
+          in: query
+          description: Additional properties describing the cluster details
+          schema:
+            $ref: '#/components/schemas/GetProps'
+      responses:
+        '200':
+          description: Requested cluster details
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/RebalanceClusterStatistics'
+                  - $ref: '#/components/schemas/PrefetchClusterStatistics'
+                  - $ref: '#/components/schemas/ClusterStatistics'
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      summary: Perform cluster wide operations such as setting config value, shutting down proxy/target etc.
+      operationId: performOperation
+      tags:
+        - Cluster
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Cluster operation triggered successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /cluster/register/:
+    post:
+      summary: Register storage target
+      operationId: registerTarget
+      tags:
+        - Cluster
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DaemonInfo'
+      responses:
+        '200':
+          description: Target registered successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /cluster/daemon/{daemonId}:
+    delete:
+      summary: Unregister the storage target
+      operationId: unregisterTarget
+      tags:
+        - Cluster
+      parameters:
+        - name: daemonId
+          in: path
+          description: ID of the target daemon
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Storage target unregistered successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /cluster/proxy/{primary-proxy-id}:
+    put:
+      summary: Set primary proxy
+      operationId: setPrimaryProxy
+      tags:
+        - Cluster
+      parameters:
+        - name: primary-proxy-id
+          in: path
+          description: Bucket name
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Primary proxy set successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+  /daemon/:
+    get:
+      summary: Get daemon related details
+      operationId: get
+      tags:
+        - Daemon
+      parameters:
+        - name: what
+          in: query
+          description: Daemon details which needs to be fetched
+          required: true
+          schema:
+            $ref: '#/components/schemas/GetWhat'
+      responses:
+        '200':
+          description: Requested daemon details
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ClusterMap'
+                  - $ref: '#/components/schemas/TargetStatistics'
+                  - $ref: '#/components/schemas/DaemonConfiguration'
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      summary: Perform operations such as setting config value, shutting down proxy/target etc. on a DFC daemon
+      operationId: performOperation
+      tags:
+        - Daemon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputParameters'
+      responses:
+        '200':
+          description: Operation on DFC daemon triggered successfully
+        default:
+          description: An unexpected error was encountered
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    InputParameters:
+      type: object
+      properties:
+        action:
+          $ref: '#/components/schemas/Actions'
+        name:
+          type: string
+        value:
+          oneOf:
+            - $ref: '#/components/schemas/ListParameters'
+            - $ref: '#/components/schemas/RangeParameters'
+            - $ref: '#/components/schemas/BucketProps'
+            - $ref: '#/components/schemas/ObjectPropertiesRequestParams'
+    Actions:
+      type: string
+      enum:
+        - evict
+        - rename
+        - createlb
+        - destroylb
+        - renamelb
+        - setprops
+        - prefetch
+        - delete
+        - setconfig
+        - shutdown
+        - rebalance
+        - listobjects
+    ListParameters:
+      properties:
+        deadline:
+          type: string
+        wait:
+          type: boolean
+        objnames:
+          type: array
+          items:
+            type: string
+      required:
+          - objnames
+    RangeParameters:
+      properties:
+        deadline:
+          type: string
+        wait:
+          type: boolean
+        prefix:
+          type: string
+        regex:
+          type: string
+        range:
+          type: string
+      required:
+        - regex
+        - prefix
+        - range
+    BucketProps:
+      properties:
+        cloud_provider:
+          type: string
+        next_tier_url:
+          type: string
+        read_policy:
+          type: string
+        write_policy:
+          type: string
+    BucketNames:
+      type: object
+      properties:
+        cloud:
+          type: array
+          items:
+            type: string
+        local:
+          type: array
+          items:
+            type: string
+    ObjectPropertiesRequestParams:
+      type: object
+      properties:
+        props:
+          type: string
+        time_format:
+          $ref: '#/components/schemas/TimeFormat'
+        prefix:
+          type: string
+        pagemarker:
+          type: string
+        pagesize:
+          type: string
+    ObjectProperties:
+      type: object
+      properties:
+        name:
+          type: string
+        size:
+          type: integer
+          format: int64
+        ctime:
+          type: string
+        checksum:
+          type: string
+        type:
+          type: string
+        atime:
+          type: string
+        bucket:
+          type: string
+        version:
+          type: string
+        iscached:
+          type: string
+        targetURL:
+          type: string
+    ObjectPropertyList:
+      type: object
+      properties:
+        pagemarker:
+          type: string
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObjectProperties'
+    ObjectPropertyTypes:
+      type: string
+      enum:
+        - size
+        - ctime
+        - checksum
+        - atime
+        - bucket
+        - version
+        - iscached
+        - targetURL
+    TimeFormat:
+      type: string
+      enum:
+       - ANSIC
+       - UnixDate
+       - RubyDate
+       - RFC822
+       - RFC822Z
+       - RFC850
+       - RFC1123
+       - RFC1123Z
+       - RFC3339
+       - RFC3339Nano
+       - Kitchen
+       - Stamp
+       - StampMilli
+       - StampMicro
+       - StampNano
+    CloudProvider:
+      type: string
+      enum:
+        - dfc
+        - aws
+        - gcp
+    Headers:
+      type: string
+      enum:
+        - CloudProvider
+        - Versioning
+        - NextTierURL
+        - ReadPolicy
+        - WritePolicy
+        - Version
+        - Size
+        - HeaderDfcChecksumType
+        - HeaderDfcChecksumVal
+    RWPolicy:
+      type: string
+      enum:
+        - cloud
+        - next_tier
+    Version:
+      type: string
+      enum:
+        - all
+        - cloud
+        - local
+        - none
+    DaemonInfo:
+      type: object
+      properties:
+        node_ip_addr:
+          type: string
+        daemon_port:
+          type: string
+        daemon_id:
+          type: string
+        direct_url:
+          type: string
+    GetWhat:
+      type: string
+      enum:
+        - smap
+        - config
+        - stats
+        - xaction
+    GetProps:
+      type: string
+      enum:
+        - rebalance
+        - prefetch
+    ClusterMap:
+      type: object
+      properties:
+        tmap:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/DaemonInfo'
+        pmap:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/DaemonInfo'
+        proxy_si:
+          $ref: '#/components/schemas/DaemonInfo'
+        version:
+          type: integer
+          format: int64
+    DaemonCoreStatistics:
+      type: object
+      properties:
+        numget:
+          type: integer
+          format: int64
+        numput:
+          type: integer
+          format: int64
+        numpost:
+          type: integer
+          format: int64
+        numdelete:
+          type: integer
+          format: int64
+        numrename:
+          type: integer
+          format: int64
+        numlist:
+          type: integer
+          format: int64
+        getlatency:
+          type: integer
+          format: int64
+        putlatency:
+          type: integer
+          format: int64
+        listlatency:
+          type: integer
+          format: int64
+        numerr:
+          type: integer
+          format: int64
+    TargetCoreStatistics:
+      allOf:
+        - $ref: '#/components/schemas/DaemonCoreStatistics'
+        - type: object
+          properties:
+            numcoldget:
+              type: integer
+              format: int64
+            bytesloaded:
+              type: integer
+              format: int64
+            bytesevicted:
+              type: integer
+              format: int64
+            filesevicted:
+              type: integer
+              format: int64
+            numsentfiles:
+              type: integer
+              format: int64
+            numsentbytes:
+              type: integer
+              format: int64
+            numrecvfiles:
+              type: integer
+              format: int64
+            numrecvbytes:
+              type: integer
+              format: int64
+            numprefetch:
+              type: integer
+              format: int64
+            bytesprefetched:
+              type: integer
+              format: int64
+            numvchanged:
+              type: integer
+              format: int64
+            bytesvchanged:
+              type: integer
+              format: int64
+            numbadchecksum:
+              type: integer
+              format: int64
+            bytesbadchecksum:
+              type: integer
+              format: int64
+    FileSystemCapacity:
+      type: object
+      properties:
+        used:
+          type: integer
+          format: int64
+        avail:
+          type: integer
+          format: int64
+        usedpct:
+          type: integer
+          format: int32
+    TargetStatistics:
+      type: object
+      properties:
+        core:
+          $ref: '#/components/schemas/TargetCoreStatistics'
+        capacity:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/FileSystemCapacity'
+        cpuidle:
+          type: string
+        disk:
+          type: object
+          additionalProperties:
+            type: string
+    ClusterStatistics:
+      type: object
+      properties:
+        proxy:
+          $ref: '#/components/schemas/DaemonCoreStatistics'
+        target:
+          $ref: '#/components/schemas/TargetStatistics'
+    ProxyConfiguration:
+      type: object
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+        passthru:
+          type: boolean
+    KeepAliveTrackerConfiguration:
+      type: object
+      properties:
+        interval:
+          type: string
+        name:
+          type: string
+        max:
+          type: string
+        factor:
+          type: integer
+          format: int32
+    DaemonConfiguration:
+      type: object
+      properties:
+        confdir:
+          type: string
+        cloudprovider:
+          type: string
+        cloud_buckets:
+          type: string
+        local_buckets:
+          type: string
+        log:
+          type: object
+          properties:
+            logdir:
+              type: string
+            loglevel:
+              type: string
+            logmaxsize:
+              type: integer
+              format: int64
+            logmaxtotal:
+              type: integer
+              format: int64
+        periodic:
+          type: object
+          properties:
+            stats_time:
+              type: string
+            retry_sync_time:
+              type: string
+        timeout:
+          type: object
+          properties:
+            default_timeout:
+              type: string
+            default_long_timeout:
+              type: string
+            max_keepalive:
+              type: string
+            proxy_ping:
+              type: string
+            cplane_operation:
+              type: string
+            send_file_time:
+              type: string
+            startup_time:
+              type: string
+        proxyconfig:
+          type: object
+          properties:
+            primary:
+              $ref: '#/components/schemas/ProxyConfiguration'
+            original:
+              $ref: '#/components/schemas/ProxyConfiguration'
+        lru_config:
+          type: object
+          properties:
+            lowwm:
+              type: integer
+              format: int32
+            highwm:
+              type: integer
+              format: int32
+            atime_cache_max:
+              type: integer
+              format: int64
+            dont_evict_time:
+              type: string
+            capacity_upd_time:
+              type: string
+            lru_enabled:
+              type: boolean
+        rebalance_conf:
+          type: object
+          properties:
+            startup_delay_time:
+              type: string
+            dest_retry_time:
+              type: string
+            rebalancing_enabled:
+              type: boolean
+        cksum_config:
+          type: object
+          properties:
+            checksum:
+              type: string
+            validate_checksum_cold_get:
+              type: boolean
+            validate_checksum_warm_get:
+              type: boolean
+            enable_read_range_checksum:
+              type: boolean
+        version_config:
+          type: object
+          properties:
+            validate_version_warm_get:
+              type: boolean
+            versioning:
+              type: string
+        fspaths:
+          type: object
+          additionalProperties:
+            type: string
+        test_fspaths:
+          type: object
+          properties:
+            root:
+              type: string
+            count:
+              type: integer
+              format: int32
+            instance:
+              type: integer
+              format: int32
+        netconfig:
+          type: object
+          properties:
+            ipv4:
+              type: string
+            l4:
+              type: object
+              properties:
+                proto:
+                  type: string
+                port:
+                    type: string
+            http:
+              type: object
+              properties:
+                max_num_targets:
+                  type: integer
+                  format: int32
+                use_http2:
+                  type: boolean
+                use_https:
+                  type: boolean
+                use_as_proxy:
+                  type: boolean
+                server_certificate:
+                  type: string
+                server_key:
+                  type: string
+        fskeeper:
+          type: object
+          properties:
+            fs_check_time:
+              type: string
+            offline_fs_check_time:
+              type: string
+            fskeeper_enabled:
+              type: boolean
+        auth:
+          type: object
+          properties:
+            secret:
+              type: string
+            enabled:
+              type: boolean
+            creddir:
+              type: string
+        keepalivetracker:
+          type: object
+          properties:
+            proxy:
+              $ref: '#/components/schemas/KeepAliveTrackerConfiguration'
+            target:
+              $ref: '#/components/schemas/KeepAliveTrackerConfiguration'
+        callstats:
+          type: object
+          properties:
+            request_included:
+              type: array
+              items:
+                type: string
+            factor:
+              type: number
+              format: float
+    XactionDetails:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        startTime:
+          type: string
+        endTime:
+          type: string
+        status:
+          type: string
+    RebalanceTargetStatistics:
+      type: object
+      properties:
+        xactionDetails:
+          type: array
+          items:
+            $ref: '#/components/schemas/XactionDetails'
+        numSentFiles:
+          type: integer
+          format: int64
+        numSentBytes:
+          type: integer
+          format: int64
+        numRecvFiles:
+          type: integer
+          format: int64
+        numRecvBytes:
+          type: integer
+          format: int64
+
+    PrefetchTargetStatistics:
+      type: object
+      properties:
+        xactionDetails:
+          type: array
+          items:
+            $ref: '#/components/schemas/XactionDetails'
+        numFilesPrefetched:
+          type: integer
+          format: int64
+        numBytesPrefetched:
+          type: integer
+          format: int64
+    RebalanceClusterStatistics:
+      type: object
+      properties:
+        kind:
+          type: string
+        target:
+          type: object
+          additionalProperties:
+              $ref: '#/components/schemas/RebalanceTargetStatistics'
+    PrefetchClusterStatistics:
+      type: object
+      properties:
+        kind:
+          type: string
+        target:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/PrefetchTargetStatistics'

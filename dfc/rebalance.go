@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 var runRebalanceOnce = &sync.Once{}
@@ -34,8 +34,9 @@ func (t *targetrunner) runRebalance(newsmap *Smap, newtargetid string) {
 	//
 	// first, check whether all the Smap-ed targets are up and running
 	//
+	glog.Infof("rebalance: Smap ver %d, newtargetid=%s", newsmap.version(), newtargetid)
 	from := "?" + URLParamFromID + "=" + t.si.DaemonID
-	for sid, si := range newsmap.Smap {
+	for sid, si := range newsmap.Tmap {
 		if sid == t.si.DaemonID {
 			continue
 		}
@@ -44,15 +45,16 @@ func (t *targetrunner) runRebalance(newsmap *Smap, newtargetid string) {
 		pollstarted, ok := time.Now(), false
 		timeout := kalivetimeout
 		for {
-			_, err, _, status := t.call(si, url, http.MethodGet, nil, timeout)
-			if err == nil {
+			res := t.call(nil, si, url, http.MethodGet, nil, timeout)
+			if res.err == nil {
 				ok = true
 				break
 			}
-			if status > 0 {
-				glog.Infof("%s is offline with status %d, err: %v", sid, status, err)
+
+			if res.status > 0 {
+				glog.Infof("%s is offline with status %d, err: %v", sid, res.status, res.err)
 			} else {
-				glog.Infof("%s is offlline, err: %v", sid, err)
+				glog.Infof("%s is offline, err: %v", sid, res.err)
 			}
 			timeout = time.Duration(float64(timeout)*1.5 + 0.5)
 			if timeout > ctx.config.Timeout.MaxKeepalive {
@@ -114,6 +116,7 @@ func (t *targetrunner) runRebalance(newsmap *Smap, newtargetid string) {
 		}
 	}
 	if newtargetid == t.si.DaemonID {
+		glog.Infof("rebalance: %s <= self", newtargetid)
 		t.pollRebalancingDone(newsmap) // until the cluster is fully rebalanced - see t.httpobjget
 	}
 	xreb.etime = time.Now()
@@ -123,30 +126,34 @@ func (t *targetrunner) runRebalance(newsmap *Smap, newtargetid string) {
 
 func (t *targetrunner) pollRebalancingDone(newsmap *Smap) {
 	for {
+		time.Sleep(time.Minute) // FIXME: must be smarter
 		count := 0
-		for sid, si := range newsmap.Smap {
+		for sid, si := range newsmap.Tmap {
 			if sid == t.si.DaemonID {
 				continue
 			}
 			url := si.DirectURL + "/" + Rversion + "/" + Rhealth
-			outjson, err, _, _ := t.call(si, url, http.MethodGet, nil, kalivetimeout)
+			res := t.call(nil, si, url, http.MethodGet, nil)
 			// retry once
-			if err == context.DeadlineExceeded {
-				outjson, err, _, _ = t.call(si, url, http.MethodGet, nil, kalivetimeout*2)
+			if res.err == context.DeadlineExceeded {
+				res = t.call(nil, si, url, http.MethodGet, nil, kalivetimeout*2)
 			}
-			if err != nil {
-				glog.Errorf("Failed to call %s, err: %v - assuming down/unavailable", sid, err)
+
+			if res.err != nil {
+				glog.Errorf("Failed to call %s, err: %v - assuming down/unavailable", sid, res.err)
 				continue
 			}
+
 			status := &thealthstatus{}
-			err = json.Unmarshal(outjson, status)
+			err := json.Unmarshal(res.outjson, status)
 			if err == nil {
 				if status.IsRebalancing {
 					time.Sleep(proxypollival * 2)
 					count++
 				}
 			} else {
-				glog.Errorf("Unexpected: failed to unmarshal %s response, err: %v [%v]", url, err, string(outjson))
+				glog.Errorf("Unexpected: failed to unmarshal %s response, err: %v [%v]",
+					url, err, string(res.outjson))
 			}
 		}
 		if glog.V(4) {
@@ -165,9 +172,6 @@ func (t *targetrunner) pollRebalancingDone(newsmap *Smap) {
 //=========================
 
 func (rcl *xrebpathrunner) oneRebalance() {
-	if rcl.wg != nil {
-		defer rcl.wg.Done()
-	}
 	if err := filepath.Walk(rcl.mpathplus, rcl.rebwalkf); err != nil {
 		s := err.Error()
 		if strings.Contains(s, "xaction") {
@@ -176,6 +180,7 @@ func (rcl *xrebpathrunner) oneRebalance() {
 			glog.Errorf("Failed to traverse %s, err: %v", rcl.mpathplus, err)
 		}
 	}
+	rcl.wg.Done()
 }
 
 // the walking callback is execited by the LRU xaction
@@ -208,7 +213,7 @@ func (rcl *xrebpathrunner) rebwalkf(fqn string, osfi os.FileInfo, err error) err
 		glog.Warningf("%s - skipping...", errstr)
 		return nil
 	}
-	si, errstr := hrwTarget(bucket+"/"+objname, rcl.newsmap)
+	si, errstr := HrwTarget(bucket, objname, rcl.newsmap)
 	if errstr != "" {
 		return fmt.Errorf(errstr)
 	}
@@ -218,7 +223,7 @@ func (rcl *xrebpathrunner) rebwalkf(fqn string, osfi os.FileInfo, err error) err
 
 	// do rebalance
 	glog.Infof("%s/%s %s => %s", bucket, objname, rcl.t.si.DaemonID, si.DaemonID)
-	if errstr = rcl.t.sendfile(http.MethodPut, bucket, objname, si, osfi.Size(), ""); errstr != "" {
+	if errstr = rcl.t.sendfile(http.MethodPut, bucket, objname, si, osfi.Size(), "", ""); errstr != "" {
 		glog.Infof("Failed to rebalance %s/%s: %s", bucket, objname, errstr)
 	} else {
 		// FIXME: TODO: delay the removal or (even) rely on the LRU

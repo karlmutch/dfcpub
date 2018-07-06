@@ -17,8 +17,12 @@
 ############################################
 
 export GOOGLE_CLOUD_PROJECT="involuted-forge-189016"
-PROXYURL="http://localhost:8080"
-PORT=8079
+USE_HTTPS=false
+PORT=${PORT:-8080}
+PROXYURL="http://localhost:$PORT"
+if $USE_HTTPS; then
+	PROXYURL="https://localhost:$PORT"
+fi
 LOGLEVEL="3" # Verbosity: 0 (minimal) to 4 (max)
 LOGROOT="/tmp/dfc"
 #### Authentication setup #########
@@ -35,9 +39,8 @@ AUTH_SU_PASS="${AUTH_SU_PASS:-admin}"
 CONFDIR="$HOME/.dfc"
 TESTFSPATHCOUNT=1
 
-PROXYPORT=$(expr $PORT + 1)
-if lsof -Pi :$PROXYPORT -sTCP:LISTEN -t >/dev/null; then
-	echo "Error: TCP port $PROXYPORT is not open (check if DFC is already running)"
+if lsof -Pi :$PORT -sTCP:LISTEN -t >/dev/null; then
+	echo "Error: TCP port $PORT is not open (check if DFC is already running)"
 	exit 1
 fi
 TMPF=$(mktemp /tmp/dfc.XXXXXXXXX)
@@ -113,12 +116,16 @@ CONFFILE_STATSD=$CONFDIR/statsd.conf
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 for (( c=$START; c<=$END; c++ ))
 do
-	PORT=$(expr $PORT + 1)
-	CONFFILE="$CONFDIR/dfc$c.json"
+	CONFDIR="$HOME/.dfc$c"
+	mkdir -p $CONFDIR
+	CONFFILE="$CONFDIR/dfc.json"
 	LOGDIR="$LOGROOT/$c/log"
 	source $DIR/config.sh
+	((PORT++))
 done
+
 # conf file for authn
+CONFDIR="$HOME/.dfc"
 CONFFILE="$CONFDIR/authn.json"
 LOGDIR="$LOGROOT/authn/log"
 source $DIR/authn.sh
@@ -150,7 +157,8 @@ fi
 # run proxy and storage targets
 for (( c=$START; c<=$END; c++ ))
 do
-	CONFFILE="$CONFDIR/dfc$c.json"
+	CONFDIR="$HOME/.dfc$c"
+	CONFFILE="$CONFDIR/dfc.json"
 
 	PROXY_PARAM="-config=$CONFFILE -role=proxy -ntargets=$servcount $1 $2"
 	TARGET_PARAM="-config=$CONFFILE -role=target $1 $2"
@@ -183,11 +191,11 @@ do
 done
 
 if [[ $AUTHENABLED = "true" ]]; then
+	CONFDIR="$HOME/.dfc"
 	CONFFILE="$CONFDIR/authn.json"
 	set -x
 	$GOPATH/bin/authn -config=$CONFFILE &
 	{ set +x; } 2>/dev/null
 fi
-
-sleep 2
+sleep 0.1
 echo done

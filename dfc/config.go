@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
 const (
@@ -23,8 +23,8 @@ const (
 
 // checksums: xattr, http header, and config
 const (
-	xattrXXHashVal  = "user.obj.dfchash"
-	xattrObjVersion = "user.obj.version"
+	XattrXXHashVal  = "user.obj.dfchash"
+	XattrObjVersion = "user.obj.version"
 
 	ChecksumNone   = "none"
 	ChecksumXXHash = "xxhash"
@@ -36,17 +36,12 @@ const (
 	VersionNone  = "none"
 )
 
-const (
-	AckWhenInMem  = "memory"
-	AckWhenOnDisk = "disk" // the default
-)
-
 // $CONFDIR/*
 const (
-	lbname     = "localbuckets" // base name of the lbconfig file; not to confuse with config.Localbuckets mpath sub-directory
-	mpname     = "mpaths"       // base name to persist ctx.mountpaths
-	smapname   = "smap.json"
-	rebinpname = ".rebalancing"
+	bucketmdbase = "bucket-metadata" // base name of the config file; not to confuse with config.Localbuckets mpath
+	mpname       = "mpaths"          // base name to persist ctx.mountpaths
+	smapname     = "smap.json"
+	rebinpname   = ".rebalancing"
 )
 
 //==============================
@@ -55,26 +50,25 @@ const (
 //
 //==============================
 type dfconfig struct {
-	Confdir       string `json:"confdir"`
-	CloudProvider string `json:"cloudprovider"`
-	CloudBuckets  string `json:"cloud_buckets"`
-	LocalBuckets  string `json:"local_buckets"`
-	// structs
-	Log          logconfig         `json:"log"`
-	Periodic     periodic          `json:"periodic"`
-	Timeout      timeoutconfig     `json:"timeout"`
-	Proxy        proxyconfig       `json:"proxyconfig"`
-	LRU          lruconfig         `json:"lru_config"`
-	Rebalance    rebalanceconf     `json:"rebalance_conf"`
-	Cksum        cksumconfig       `json:"cksum_config"`
-	Ver          versionconfig     `json:"version_config"`
-	FSpaths      map[string]string `json:"fspaths"`
-	TestFSP      testfspathconf    `json:"test_fspaths"`
-	Net          netconfig         `json:"netconfig"`
-	FSKeeper     fskeeperconf      `json:"fskeeper"`
-	Experimental experimental      `json:"experimental"`
-	Auth         authconf          `json:"auth"`
-	H2c          bool              `json:"h2c"`
+	Confdir          string            `json:"confdir"`
+	CloudProvider    string            `json:"cloudprovider"`
+	CloudBuckets     string            `json:"cloud_buckets"`
+	LocalBuckets     string            `json:"local_buckets"`
+	Log              logconfig         `json:"log"`
+	Periodic         periodic          `json:"periodic"`
+	Timeout          timeoutconfig     `json:"timeout"`
+	Proxy            proxyconfig       `json:"proxyconfig"`
+	LRU              lruconfig         `json:"lru_config"`
+	Rebalance        rebalanceconf     `json:"rebalance_conf"`
+	Cksum            cksumconfig       `json:"cksum_config"`
+	Ver              versionconfig     `json:"version_config"`
+	FSpaths          simplekvs         `json:"fspaths"`
+	TestFSP          testfspathconf    `json:"test_fspaths"`
+	Net              netconfig         `json:"netconfig"`
+	FSKeeper         fskeeperconf      `json:"fskeeper"`
+	Auth             authconf          `json:"auth"`
+	KeepaliveTracker keepaliveTrackers `json:"keepalivetracker"`
+	CallStats        callStats         `json:"callstats"`
 }
 
 type logconfig struct {
@@ -86,33 +80,33 @@ type logconfig struct {
 
 type periodic struct {
 	StatsTimeStr     string `json:"stats_time"`
-	KeepAliveTimeStr string `json:"keep_alive_time"`
+	RetrySyncTimeStr string `json:"retry_sync_time"`
 	// omitempty
 	StatsTime     time.Duration `json:"-"`
-	KeepAliveTime time.Duration `json:"-"`
+	RetrySyncTime time.Duration `json:"-"`
 }
 
 // timeoutconfig contains timeouts used for intra-cluster communication
 type timeoutconfig struct {
-	DefaultStr      string        `json:"default_timeout"`
-	Default         time.Duration `json:"-"` // omitempty
-	DefaultLongStr  string        `json:"default_long_timeout"`
-	DefaultLong     time.Duration `json:"-"` //
-	MaxKeepaliveStr string        `json:"max_keepalive"`
-	MaxKeepalive    time.Duration `json:"-"` //
-	ProxyPingStr    string        `json:"proxy_ping"`
-	ProxyPing       time.Duration `json:"-"` //
-	VoteRequestStr  string        `json:"vote_request"`
-	VoteRequest     time.Duration `json:"-"` //
-	SendFileStr     string        `json:"send_file_time"`
-	SendFile        time.Duration `json:"-"` //
+	DefaultStr         string        `json:"default_timeout"`
+	Default            time.Duration `json:"-"` // omitempty
+	DefaultLongStr     string        `json:"default_long_timeout"`
+	DefaultLong        time.Duration `json:"-"` //
+	MaxKeepaliveStr    string        `json:"max_keepalive"`
+	MaxKeepalive       time.Duration `json:"-"` //
+	ProxyPingStr       string        `json:"proxy_ping"`
+	ProxyPing          time.Duration `json:"-"` //
+	CplaneOperationStr string        `json:"cplane_operation"`
+	CplaneOperation    time.Duration `json:"-"` //
+	SendFileStr        string        `json:"send_file_time"`
+	SendFile           time.Duration `json:"-"` //
+	StartupStr         string        `json:"startup_time"`
+	Startup            time.Duration `json:"-"` //
 }
 
 type proxyconfig struct {
-	Primary                  proxycnf      `json:"primary"`
-	Original                 proxycnf      `json:"original"`
-	StartupGetSmapMaximumStr string        `json:"startup_get_smap_maximum"`
-	StartupGetSmapMaximum    time.Duration `json:"-"` //
+	Primary  proxycnf `json:"primary"`
+	Original proxycnf `json:"original"`
 }
 
 type proxycnf struct {
@@ -159,19 +153,23 @@ type l4cnf struct {
 
 type httpcnf struct {
 	MaxNumTargets int    `json:"max_num_targets"`    // estimated max num targets (to count idle conns)
+	UseHTTP2      bool   `json:"use_http2"`          // use HTTP/2 instead of HTTP/1.1
 	UseHTTPS      bool   `json:"use_https"`          // use HTTPS instead of HTTP
+	UseAsProxy    bool   `json:"use_as_proxy"`       // use DFC as an HTTP proxy
 	Certificate   string `json:"server_certificate"` // HTTPS: openssl certificate
 	Key           string `json:"server_key"`         // HTTPS: openssl key
 }
 
 type cksumconfig struct {
-	Checksum        string `json:"checksum"`          // DFC checksum: xxhash:none
-	ValidateColdGet bool   `json:"validate_cold_get"` // MD5 (ETag) validation upon cold GET
+	Checksum                string `json:"checksum"`                   // DFC checksum: xxhash:none
+	ValidateColdGet         bool   `json:"validate_checksum_cold_get"` // MD5 (ETag) validation upon cold GET
+	ValidateWarmGet         bool   `json:"validate_checksum_warm_get"` // MD5 (ETag) validation upon warm GET
+	EnableReadRangeChecksum bool   `json:"enable_read_range_checksum"` // Return read range checksum otherwise return entire object checksum
 }
 
 type versionconfig struct {
-	ValidateWarmGet bool   `json:"validate_warm_get"` // True: validate object version upon warm GET
-	Versioning      string `json:"versioning"`        // types of objects versioning is enabled for: all, cloud, local, none
+	ValidateWarmGet bool   `json:"validate_version_warm_get"` // True: validate object version upon warm GET
+	Versioning      string `json:"versioning"`                // types of objects versioning is enabled for: all, cloud, local, none
 }
 
 type fskeeperconf struct {
@@ -182,14 +180,31 @@ type fskeeperconf struct {
 	Enabled               bool          `json:"fskeeper_enabled"`
 }
 
-type experimental struct {
-	AckPut   string `json:"ack_put"`
-	MaxMemMB int    `json:"max_mem_mb"` // max memory size for the "memory" option - FIXME: niy
-}
-
 type authconf struct {
 	Secret  string `json:"secret"`
 	Enabled bool   `json:"enabled"`
+	CredDir string `json:"creddir"`
+}
+
+// config for one keepalive tracker
+// all type of trackers share the same struct, not all fields are used by all trackers
+type keepaliveTrackerConf struct {
+	IntervalStr string        `json:"interval"` // keepalives are sent(target)/checked(promary proxy) every interval
+	Interval    time.Duration `json:"-"`
+	Name        string        `json:"name"` // "heartbeat", "average"
+	MaxStr      string        `json:"max"`  // "heartbeat" only
+	Max         time.Duration `json:"-"`
+	Factor      int           `json:"factor"` // "average" only
+}
+
+type keepaliveTrackers struct {
+	Proxy  keepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
+	Target keepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
+}
+
+type callStats struct {
+	RequestIncluded []string `json:"request_included"`
+	Factor          float32  `json:"factor"`
 }
 
 //==============================
@@ -271,14 +286,14 @@ func validateconf() (err error) {
 	if ctx.config.Periodic.StatsTime, err = time.ParseDuration(ctx.config.Periodic.StatsTimeStr); err != nil {
 		return fmt.Errorf("Bad stats-time format %s, err: %v", ctx.config.Periodic.StatsTimeStr, err)
 	}
+	if ctx.config.Periodic.RetrySyncTime, err = time.ParseDuration(ctx.config.Periodic.RetrySyncTimeStr); err != nil {
+		return fmt.Errorf("Bad retry_sync_time format %s, err: %v", ctx.config.Periodic.RetrySyncTimeStr, err)
+	}
 	if ctx.config.Timeout.Default, err = time.ParseDuration(ctx.config.Timeout.DefaultStr); err != nil {
 		return fmt.Errorf("Bad Timeout default format %s, err: %v", ctx.config.Timeout.DefaultStr, err)
 	}
 	if ctx.config.Timeout.DefaultLong, err = time.ParseDuration(ctx.config.Timeout.DefaultLongStr); err != nil {
 		return fmt.Errorf("Bad Timeout default_long format %s, err %v", ctx.config.Timeout.DefaultLongStr, err)
-	}
-	if ctx.config.Periodic.KeepAliveTime, err = time.ParseDuration(ctx.config.Periodic.KeepAliveTimeStr); err != nil {
-		return fmt.Errorf("Bad keep_alive_time format %s, err: %v", ctx.config.Periodic.KeepAliveTimeStr, err)
 	}
 	if ctx.config.LRU.DontEvictTime, err = time.ParseDuration(ctx.config.LRU.DontEvictTimeStr); err != nil {
 		return fmt.Errorf("Bad dont_evict_time format %s, err: %v", ctx.config.LRU.DontEvictTimeStr, err)
@@ -315,15 +330,44 @@ func validateconf() (err error) {
 	if ctx.config.Timeout.ProxyPing, err = time.ParseDuration(ctx.config.Timeout.ProxyPingStr); err != nil {
 		return fmt.Errorf("Bad Timeout proxy_ping format %s, err %v", ctx.config.Timeout.ProxyPingStr, err)
 	}
-	if ctx.config.Timeout.VoteRequest, err = time.ParseDuration(ctx.config.Timeout.VoteRequestStr); err != nil {
-		return fmt.Errorf("Bad Timeout vote_request format %s, err %v", ctx.config.Timeout.VoteRequestStr, err)
+	if ctx.config.Timeout.CplaneOperation, err = time.ParseDuration(ctx.config.Timeout.CplaneOperationStr); err != nil {
+		return fmt.Errorf("Bad Timeout vote_request format %s, err %v", ctx.config.Timeout.CplaneOperationStr, err)
 	}
 	if ctx.config.Timeout.SendFile, err = time.ParseDuration(ctx.config.Timeout.SendFileStr); err != nil {
 		return fmt.Errorf("Bad Timeout send_file_time format %s, err %v", ctx.config.Timeout.SendFileStr, err)
 	}
-	if ctx.config.Proxy.StartupGetSmapMaximum, err = time.ParseDuration(ctx.config.Proxy.StartupGetSmapMaximumStr); err != nil {
-		return fmt.Errorf("Bad Proxy startup_get_smap_maximum format %s, err %v", ctx.config.Proxy.StartupGetSmapMaximumStr, err)
+	if ctx.config.Timeout.Startup, err = time.ParseDuration(ctx.config.Timeout.StartupStr); err != nil {
+		return fmt.Errorf("Bad Proxy startup_time format %s, err %v", ctx.config.Timeout.StartupStr, err)
 	}
+
+	ctx.config.KeepaliveTracker.Proxy.Interval, err = time.ParseDuration(ctx.config.KeepaliveTracker.Proxy.IntervalStr)
+	if err != nil {
+		return fmt.Errorf("bad proxy keep alive interval %s", ctx.config.KeepaliveTracker.Proxy.IntervalStr)
+	}
+
+	ctx.config.KeepaliveTracker.Proxy.Max, err = time.ParseDuration(ctx.config.KeepaliveTracker.Proxy.MaxStr)
+	if err != nil {
+		return fmt.Errorf("bad proxy keep alive max %s", ctx.config.KeepaliveTracker.Proxy.MaxStr)
+	}
+
+	ctx.config.KeepaliveTracker.Target.Interval, err = time.ParseDuration(ctx.config.KeepaliveTracker.Target.IntervalStr)
+	if err != nil {
+		return fmt.Errorf("bad target keep alive interval %s", ctx.config.KeepaliveTracker.Target.IntervalStr)
+	}
+
+	ctx.config.KeepaliveTracker.Target.Max, err = time.ParseDuration(ctx.config.KeepaliveTracker.Target.MaxStr)
+	if err != nil {
+		return fmt.Errorf("bad targetkeep alive max %s", ctx.config.KeepaliveTracker.Target.MaxStr)
+	}
+
+	if !IsKeepaliveTypeSupported(ctx.config.KeepaliveTracker.Proxy.Name) {
+		return fmt.Errorf("bad proxy keepalive tracker type %s", ctx.config.KeepaliveTracker.Proxy.Name)
+	}
+
+	if !IsKeepaliveTypeSupported(ctx.config.KeepaliveTracker.Target.Name) {
+		return fmt.Errorf("bad target keepalive tracker type %s", ctx.config.KeepaliveTracker.Target.Name)
+	}
+
 	return nil
 }
 
@@ -339,6 +383,19 @@ func setloglevel(loglevel string) (err error) {
 	return
 }
 
-func writeConfigFile() error {
-	return LocalSave(clivars.conffile, ctx.config)
+// setGLogVModule sets glog's vmodule flag
+// sets 'v' as is, no verificaton is done here
+// syntax for v: target=5,proxy=1, p*=3, etc
+func setGLogVModule(v string) error {
+	f := flag.Lookup("vmodule")
+	if f == nil {
+		return nil
+	}
+
+	err := f.Value.Set(v)
+	if err == nil {
+		glog.Info("log level vmodule changed to ", v)
+	}
+
+	return err
 }

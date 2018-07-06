@@ -1,6 +1,6 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc
@@ -13,16 +13,18 @@ const mLCG32 = 1103515245
 
 // A variant of consistent hash based on rendezvous algorithm by Thaler and Ravishankar,
 // aka highest random weight (HRW)
+func uniquename(bucket, objname string) string {
+	return bucket + "/" + objname
+}
 
-func hrwTarget(name string, smap *Smap) (si *daemonInfo, errstr string) {
-	// NOTE: commented out on purpose - trading off read access to unlocked map
-	//       smap.Lock(); defer smap.Unlock()
-	if smap.count() == 0 {
+func HrwTarget(bucket, objname string, smap *Smap) (si *daemonInfo, errstr string) {
+	if smap.countTargets() == 0 {
 		errstr = "DFC cluster map is empty: no targets"
 		return
 	}
+	name := uniquename(bucket, objname)
 	var max uint64
-	for id, sinfo := range smap.Smap {
+	for id, sinfo := range smap.Tmap {
 		cs := xxhash.ChecksumString64S(id+":"+name, mLCG32)
 		if cs > max {
 			max = cs
@@ -32,9 +34,7 @@ func hrwTarget(name string, smap *Smap) (si *daemonInfo, errstr string) {
 	return
 }
 
-func hrwProxyWithSkip(smap *Smap, idToSkip string) (pi *proxyInfo, errstr string) {
-	smap.lock()
-	defer smap.unlock()
+func HrwProxy(smap *Smap, idToSkip string) (pi *daemonInfo, errstr string) {
 	if smap.countProxies() == 0 {
 		errstr = "DFC cluster map is empty: no proxies"
 		return
@@ -53,8 +53,9 @@ func hrwProxyWithSkip(smap *Smap, idToSkip string) (pi *proxyInfo, errstr string
 	return
 }
 
-func hrwMpath(name string) (mpath string) {
+func hrwMpath(bucket, objname string) (mpath string) {
 	var max uint64
+	name := uniquename(bucket, objname)
 	for path := range ctx.mountpaths.Available {
 		cs := xxhash.ChecksumString64S(path+":"+name, mLCG32)
 		if cs > max {

@@ -4,14 +4,13 @@ DFC: Distributed File Cache with Amazon and Google Cloud backends
 ## Overview
 
 DFC is a simple distributed caching service written in Go. The service
-consists of any numbers of http proxy servers (with well-known addresses)
-and storage targets (aka targets) utilizing local disks:
+consists of arbitrary number of gateways (realized as http **proxy** servers),
+and any number of storage **targets** utilizing local disks:
 
 <img src="images/dfc-overview-mp.png" alt="DFC overview" width="480">
 
-Users (i.e., http/https clients) connect to the proxies and execute RESTful
-commands. Data then moves directly between storage targets (that cache this data)
-and the requesting user.
+Users connect to the proxies and execute RESTful commands. Data then moves
+directly between storage targets that cache this data and the requesting http(s) clients.
 
 ## Prerequisites
 
@@ -36,20 +35,32 @@ Note that local and Cloud-based buckets support the same API with minor exceptio
 
 ## Getting Started
 
-If you've already installed Go, getting started with DFC takes about 30 seconds
-and consists in the following 4 steps:
+### Quick start with Docker
+
+To get started quickly with a containerized, one-proxy, one-target deployment of DFC, see [Getting started quickly with DFC using Docker](docker/quick_start/README.md).
+
+### Regular installation
+
+If you've already installed Go and [dep](https://github.com/golang/dep), getting started with DFC takes about 30 seconds:
 
 ```
 $ go get -u -v github.com/NVIDIA/dfcpub/dfc
 $ cd $GOPATH/src/github.com/NVIDIA/dfcpub/dfc
+$ dep ensure
 $ make deploy
 $ go test ./tests -v -run=down -numfiles=2 -bucket=<your bucket name>
 ```
 
-The 1st command will install both the DFC source code and all its dependencies
+The 1st and 3rd commands will install the DFC source code and all its versioned dependencies
 under your configured $GOPATH.
 
-The 3rd - deploys DFC daemons locally (for details, please see [the script](dfc/setup/deploy.sh)).
+The 4th - deploys DFC daemons locally (for details, please see [the script](dfc/setup/deploy.sh)). If you want to enable optional DFC authentication server(AuthN) execute instead:
+
+```
+$ CREDDIR=/tmp/creddir AUTHENABLED=true make deploy
+
+```
+For more details about AuthN server please see [AuthN documetation](./authn/README.md)
 
 Finally, for the last 4th command to work, you'll need to have a name - the name of a bucket.
 The bucket could be an AWS or GCP based one, or a DFC-own so-called "local bucket".
@@ -64,7 +75,8 @@ $ go test ./tests -v -run=download -args -numfiles=100 -match='a\d+' -bucket=myS
 downloads up to 100 objects from the bucket called myS3bucket, whereby names of those objects
 will match 'a\d+' regex.
 
-For more testing/running command line options, please refer to [the source](dfc/tests/main_test.go).
+For more testing commands and command line options, please refer to the corresponding
+[README](dfc/tests/README.md) and/or the [test sources](dfc/tests/).
 
 For other useful commands, see the [Makefile](dfc/Makefile).
 
@@ -151,12 +163,12 @@ $ make rmcache
 DFC supports a growing number and variety of RESTful operations. To illustrate common conventions, let's take a look at the example:
 
 ```
-$ curl -X GET -H 'Content-Type: application/json' -d '{"what": "config"}' http://192.168.176.128:8080/v1/daemon
+$ curl -X GET http://localhost:8080/v1/daemon?what=config
 ```
 
 This command queries the DFC configuration; at the time of this writing it'll result in a JSON output that looks as follows:
 
-> {"smap":{"":{"node_ip_addr":"","daemon_port":"","daemon_id":"","direct_url":""},"15205:8081":{"node_ip_addr":"192.168.176.128","daemon_port":"8081","daemon_id":"15205:8081","direct_url":"http://192.168.176.128:8081"},"15205:8082":{"node_ip_addr":"192.168.176.128","daemon_port":"8082","daemon_id":"15205:8082","direct_url":"http://192.168.176.128:8082"},"15205:8083":{"node_ip_addr":"192.168.176.128","daemon_port":"8083","daemon_id":"15205:8083","direct_url":"http://192.168.176.128:8083"}},"version":5}
+> {"smap":{"":{"node_ip_addr":"","daemon_port":"","daemon_id":"","direct_url":""},"15205:8081":{"node_ip_addr":"localhost","daemon_port":"8081","daemon_id":"15205:8081","direct_url":"http://localhost:8081"},"15205:8082":{"node_ip_addr":"localhost","daemon_port":"8082","daemon_id":"15205:8082","direct_url":"http://localhost:8082"},"15205:8083":{"node_ip_addr":"localhost","daemon_port":"8083","daemon_id":"15205:8083","direct_url":"http://localhost:8083"}},"version":5}
 
 Notice the 4 (four) ubiquitous elements in the `curl` command line above:
 
@@ -167,49 +179,57 @@ In the example, it's a GET but it can also be POST, PUT, and DELETE. For a brief
 2. URL path: hostname or IP address of one of the DFC servers.
 
 By convention, a RESTful operation performed on a DFC proxy server usually implies a "clustered" scope. Exceptions include querying
-proxy's own configuration via `{"what": "config"}` message.
+proxy's own configuration via `?what=config` query string parameter.
 
 3. URL path: version of the REST API, resource that is operated upon, and possibly more forward-slash delimited specifiers.
 
 For example: /v1/cluster where 'v1' is the currently supported API version and 'cluster' is the resource.
 
-4. Control message in JSON format, e.g. `{"what": "config"}`.
+4. Control message in the query string parameter, e.g. `?what=config`.
 
-> Combined, all these elements tell the following story. They specify the most generic action (e.g., GET) and designate the target aka "resource" of this action: e.g., an entire cluster or a given daemon. Further, they may also include context-specific and JSON-encoded control message to, for instance, distinguish between getting system statistics (`{"what": "stats"}`) versus system configuration (`{"what": "config"}`).
+> Combined, all these elements tell the following story. They specify the most generic action (e.g., GET) and designate the target aka "resource" of this action: e.g., an entire cluster or a given daemon. Further, they may also include context-specific and query string encoded control message to, for instance, distinguish between getting system statistics (`?what=stats`) versus system configuration (`?what=config`).
+
+Note that 'localhost' in the examples below is mostly intended for developers and first time users that run the entire DFC system on their Linux laptops. It is implied, however, that the gateway's IP address or hostname is used in all other cases/environments/deployment scenarios.
 
 | Operation | HTTP action | Example |
 |--- | --- | ---|
-| Unregister storage target (proxy only) | DELETE /v1/cluster/daemon/daemonID | `curl -i -X DELETE http://192.168.176.128:8080/v1/cluster/daemon/15205:8083` |
-| Register storage target | POST /v1//daemon | `curl -i -X POST http://192.168.176.128:8083/v1/daemon` |
-| Get cluster map | GET {"what": "smap"} /v1/daemon | `curl -X GET -H 'Content-Type: application/json' -d '{"what": "smap"}' http://192.168.176.128:8080/v1/daemon` |
-| Get proxy or target configuration| GET {"what": "config"} /v1/daemon | `curl -X GET -H 'Content-Type: application/json' -d '{"what": "config"}' http://192.168.176.128:8080/v1/daemon` |
-| Update individual DFC daemon (proxy or target) configuration (example: statistics logging interval) | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/daemon | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "stats_time", "value": "1s"}' http://192.168.176.128:8081/v1/daemon` |
-| Update individual DFC daemon (proxy or target) configuration (example: log level) | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/daemon | ` curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setconfig","name":"loglevel","value":"4"}' http://192.168.176.128:8080/v1/daemon` |
-| Set cluster-wide configuration (proxy) | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "stats_time", "value": "1s"}' http://192.168.176.128:8080/v1/cluster` |
-| Shutdown target/proxy | PUT {"action": "shutdown"} /v1/daemon | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "shutdown"}' http://192.168.176.128:8082/v1/daemon` |
-| Shutdown cluster (proxy) | PUT {"action": "shutdown"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "shutdown"}' http://192.168.176.128:8080/v1/cluster` |
-| Rebalance cluster (proxy) | PUT {"action": "rebalance"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "rebalance"}' http://192.168.176.128:8080/v1/cluster` |
-| Get cluster statistics (proxy) | GET {"what": "stats"} /v1/cluster | `curl -X GET -H 'Content-Type: application/json' -d '{"what": "stats"}' http://192.168.176.128:8080/v1/cluster` |
-| Get target statistics | GET {"what": "stats"} /v1/daemon | `curl -X GET -H 'Content-Type: application/json' -d '{"what": "stats"}' http://192.168.176.128:8083/v1/daemon` |
-| Get object (proxy) | GET /v1/objects/bucket-name/object-name | `curl -L -X GET http://192.168.176.128:8080/v1/objects/myS3bucket/myobject -o myobject` <sup id="a1">[1](#ft1)</sup> |
-| Put object (proxy) | PUT /v1/objects/bucket-name/object-name | `curl -L -X PUT http://192.168.176.128:8080/v1/objects/myS3bucket/myobject -T filenameToUpload` |
-| List bucket | GET { properties-and-options... } /v1/buckets/bucket-name | `curl -X GET -L -H 'Content-Type: application/json' -d '{"props": "size"}' http://192.168.176.128:8080/v1/buckets/myS3bucket` <sup id="a2">[2](#ft2)</sup> |
-| Rename/move file (local buckets) | POST {"action": "rename", "name": new-name} /v1/objects/bucket-name/object-name | `curl -i -X POST -L -H 'Content-Type: application/json' -d '{"action": "rename", "name": "dir2/DDDDDD"}' http://192.168.176.128:8080/v1/objects/mylocalbucket/dir1/CCCCCC` <sup id="a3">[3](#ft3)</sup> |
-| Copy file | PUT /v1/objects/bucket-name/object-name?from_id=&to_id= | `curl -i -X PUT http://192.168.176.128:8083/v1/objects/mybucket/myobject?from_id=15205:8083&to_id=15205:8081` <sup id="a4">[4](#ft4)</sup> |
-| Delete file | DELETE /v1/objects/bucket-name/object-name | `curl -i -X DELETE -L http://192.168.176.128:8080/v1/objects/mybucket/mydirectory/myobject` |
-| Evict file from cache | DELETE '{"action": "evict"}' /v1/objects/bucket-name/object-name | `curl -i -X DELETE -L -H 'Content-Type: application/json' -d '{"action": "evict"}' http://192.168.176.128:8080/v1/objects/mybucket/myobject` |
-| Create local bucket (proxy) | POST {"action": "createlb"} /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' http://192.168.176.128:8080/v1/buckets/abc` |
-| Destroy local bucket (proxy) | DELETE {"action": "destroylb"} /v1/buckets/bucket | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://192.168.176.128:8080/v1/buckets/abc` |
-| Rename local bucket (proxy) | POST {"action": "renamelb"} /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "renamelb", "name": "newname"}' http://192.168.176.128:8080/v1/buckets/oldname` |
-| Prefetch a list of objects | POST '{"action":"prefetch", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action":"prefetch", "value":{"objnames":["o1","o2","o3"], "deadline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Prefetch a range of objects| POST '{"action":"prefetch", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action":"prefetch", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Delete a list of objects | DELETE '{"action":"delete", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"delete", "value":{"objnames":["o1","o2","o3"], "deadline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Delete a range of objects| DELETE '{"action":"delete", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"delete", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Evict a list of objects | DELETE '{"action":"evict", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"evict", "value":{"objnames":["o1","o2","o3"], "dea1dline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Evict a range of objects| DELETE '{"action":"evict", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"evict", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://192.168.176.128:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
-| Get bucket props | HEAD /v1/buckets/bucket-name | `curl --head http://192.168.176.128:8080/v1/buckets/abc` |
-| Set primary proxy (primary proxy only)| PUT /v1/cluster/proxy/new primary-proxy-id | `curl -i -X PUT http://192.1168.176.128:8080/v1/cluster/proxy/26869:8080` |
-
+| Unregister storage target | DELETE /v1/cluster/daemon/daemonID | `curl -i -X DELETE http://localhost:8080/v1/cluster/daemon/15205:8083` |
+| Register storage target | POST /v1/cluster/register | `curl -i -X POST -H 'Content-Type: application/json' -d '{"node_ip_addr": "172.16.175.41", "daemon_port": "8083", "daemon_id": "43888:8083", "direct_url": "http://172.16.175.41:8083"}' http://localhost:8083/v1/cluster/register` |
+| Get cluster map | GET /v1/daemon | `curl -X GET http://localhost:8080/v1/daemon?what=smap` |
+| Get proxy or target configuration| GET /v1/daemon | `curl -X GET http://localhost:8080/v1/daemon?what=config` |
+| Update individual DFC daemon (proxy or target) configuration | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/daemon | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "stats_time", "value": "1s"}' http://localhost:8081/v1/daemon` |
+| Update individual DFC daemon (proxy or target) configuration | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/daemon | ` curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setconfig","name":"loglevel","value":"4"}' http://localhost:8080/v1/daemon` |
+| Set cluster-wide configuration (proxy) | PUT {"action": "setconfig", "name": "some-name", "value": "other-value"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "stats_time", "value": "1s"}' http://localhost:8080/v1/cluster` |
+| Shutdown target/proxy | PUT {"action": "shutdown"} /v1/daemon | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "shutdown"}' http://localhost:8082/v1/daemon` |
+| Shutdown cluster (proxy) | PUT {"action": "shutdown"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "shutdown"}' http://localhost:8080/v1/cluster` |
+| Rebalance cluster (proxy) | PUT {"action": "rebalance"} /v1/cluster | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "rebalance"}' http://localhost:8080/v1/cluster` |
+| Get cluster statistics (proxy) | GET /v1/cluster | `curl -X GET http://localhost:8080/v1/cluster?what=stats` |
+| Get rebalance statistics (proxy) | GET /v1/cluster | `curl -X GET 'http://localhost:8080/v1/cluster?what=xaction&props=rebalance'` |
+| Get target statistics | GET /v1/daemon | `curl -X GET http://localhost:8083/v1/daemon?what=stats` |
+| Get object (proxy) | GET /v1/objects/bucket-name/object-name | `curl -L -X GET http://localhost:8080/v1/objects/myS3bucket/myobject -o myobject` <sup id="a1">[1](#ft1)</sup> |
+| Read range (proxy) | GET /v1/objects/bucket-name/object-name?offset=&length= | `curl -L -X GET http://localhost:8080/v1/objects/myS3bucket/myobject?offset=1024&length=512 -o myobject` |
+| Put object (proxy) | PUT /v1/objects/bucket-name/object-name | `curl -L -X PUT http://localhost:8080/v1/objects/myS3bucket/myobject -T filenameToUpload` |
+| Get bucket names | GET /v1/buckets/\* | `curl -X GET http://localhost:8080/v1/buckets/*` <sup>[6](#ft6)</sup> |
+| List objects in bucket | POST {"action": "listobjects", "value":{  properties-and-options... }} /v1/buckets/bucket-name | `curl -X POST -L -H 'Content-Type: application/json' -d '{"action": "listobjects", "value":{"props": "size"}}' http://localhost:8080/v1/buckets/myS3bucket` <sup id="a2">[2](#ft2)</sup> |
+| Rename/move object (local buckets) | POST {"action": "rename", "name": new-name} /v1/objects/bucket-name/object-name | `curl -i -X POST -L -H 'Content-Type: application/json' -d '{"action": "rename", "name": "dir2/DDDDDD"}' http://localhost:8080/v1/objects/mylocalbucket/dir1/CCCCCC` <sup id="a3">[3](#ft3)</sup> |
+| Copy object | PUT /v1/objects/bucket-name/object-name?from_id=&to_id= | `curl -i -X PUT http://localhost:8083/v1/objects/mybucket/myobject?from_id=15205:8083&to_id=15205:8081` <sup id="a4">[4](#ft4)</sup> |
+| Delete object | DELETE /v1/objects/bucket-name/object-name | `curl -i -X DELETE -L http://localhost:8080/v1/objects/mybucket/mydirectory/myobject` |
+| Evict object from cache | DELETE '{"action": "evict"}' /v1/objects/bucket-name/object-name | `curl -i -X DELETE -L -H 'Content-Type: application/json' -d '{"action": "evict"}' http://localhost:8080/v1/objects/mybucket/myobject` |
+| Create local bucket (proxy) | POST {"action": "createlb"} /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "createlb"}' http://localhost:8080/v1/buckets/abc` |
+| Destroy local bucket (proxy) | DELETE {"action": "destroylb"} /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action": "destroylb"}' http://localhost:8080/v1/buckets/abc` |
+| Rename local bucket (proxy) | POST {"action": "renamelb"} /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action": "renamelb", "name": "newname"}' http://localhost:8080/v1/buckets/oldname` |
+| Set bucket props (proxy) | PUT {"action": "setprops"} /v1/buckets/bucket-name | `curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops", "value": {"next_tier_url": "http://localhost:8082", "cloud_provider": "dfc", "read_policy": "cloud", "write_policy": "next_tier"}}' 'http://localhost:8080/v1/buckets/abc'` |
+| Prefetch a list of objects | POST '{"action":"prefetch", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action":"prefetch", "value":{"objnames":["o1","o2","o3"], "deadline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Prefetch a range of objects| POST '{"action":"prefetch", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X POST -H 'Content-Type: application/json' -d '{"action":"prefetch", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Delete a list of objects | DELETE '{"action":"delete", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"delete", "value":{"objnames":["o1","o2","o3"], "deadline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Delete a range of objects| DELETE '{"action":"delete", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"delete", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Evict a list of objects | DELETE '{"action":"evict", "value":{"objnames":"[o1[,o]]"[, deadline: string][, wait: bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"evict", "value":{"objnames":["o1","o2","o3"], "dea1dline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Evict a range of objects| DELETE '{"action":"evict", "value":{"prefix":"your-prefix","regex":"your-regex","range","min:max" [, deadline: string][, wait:bool]}}' /v1/buckets/bucket-name | `curl -i -X DELETE -H 'Content-Type: application/json' -d '{"action":"evict", "value":{"prefix":"__tst/test-", "regex":"\\d22\\d", "range":"1000:2000", "deadline": "10s", "wait":true}}' http://localhost:8080/v1/buckets/abc` <sup>[5](#ft5)</sup> |
+| Get bucket props | HEAD /v1/buckets/bucket-name | `curl -L --head http://localhost:8080/v1/buckets/mybucket` |
+| Get object props | HEAD /v1/objects/bucket-name/object-name | `curl -L --head http://localhost:8080/v1/objects/mybucket/myobject` |
+| Check if an object is cached | HEAD /v1/objects/bucket-name/object-name | `curl -L --head http://localhost:8080/v1/objects/mybucket/myobject?check_cached=true` |
+| Set primary proxy (primary proxy only)| PUT /v1/cluster/proxy/new primary-proxy-id | `curl -i -X PUT http://localhost:8080/v1/cluster/proxy/26869:8080` |
+___
 <a name="ft1">1</a>: This will fetch the object "myS3object" from the bucket "myS3bucket". Notice the -L - this option must be used in all DFC supported commands that read or write data - usually via the URL path /v1/objects/. For more on the -L and other useful options, see [Everything curl: HTTP redirect](https://ec.haxx.se/http-redirects.html).
 
 <a name="ft2">2</a>: See the List Bucket section for details. [↩](#a2)
@@ -220,13 +240,15 @@ For example: /v1/cluster where 'v1' is the currently supported API version and '
 
 <a name="ft5">5</a>: See the List/Range Operations section for details.
 
+<a name="ft6">6</a>: Query string parameter `?local=true` can be used to retrieve just the local buckets.
+
 ### Example: querying runtime statistics
 
 ```
-$ curl -X GET -H 'Content-Type: application/json' -d '{"what": "stats"}' http://192.168.176.128:8080/v1/cluster
+$ curl -X GET http://localhost:8080/v1/cluster?what=stats
 ```
 
-This single command causes execution of multiple `GET {"what": "stats"}` requests within the DFC cluster, and results in a JSON-formatted consolidated output that contains both http proxy and storage targets request counters, as well as per-target used/available capacities. For example:
+This single command causes execution of multiple `GET ?what=stats` requests within the DFC cluster, and results in a JSON-formatted consolidated output that contains both http proxy and storage targets request counters, as well as per-target used/available capacities. For example:
 
 <img src="images/dfc-get-stats.png" alt="DFC statistics" width="440">
 
@@ -234,16 +256,16 @@ More usage examples can be found in the [the source](dfc/tests/regression_test.g
 
 ## List Bucket
 
-the ListBucket API returns a page of object names (and, optionally, their properties including sizes, creation times, checksums, and more), in addition to a token allowing the next page to be retrieved.
+The ListBucket API returns a page of object names (and, optionally, their properties including sizes, creation times, checksums, and more), in addition to a token allowing the next page to be retrieved.
 
 ### properties-and-options
 The properties-and-options specifier must be a JSON-encoded structure, for instance '{"props": "size"}' (see examples). An empty structure '{}' results in getting just the names of the objects (from the specified bucket) with no other metadata.
 
 | Property/Option | Description | Value |
 | --- | --- | --- |
-| props | The properties to return with object names | A comma-separated string containing any combination of: "checksum","size","atime","ctime","iscached","bucket","version". <sup id="a6">[6](#ft6)</sup> |
+| props | The properties to return with object names | A comma-separated string containing any combination of: "checksum","size","atime","ctime","iscached","bucket","version","targetURL". <sup id="a6">[6](#ft6)</sup> |
 | time_format | The standard by which times should be formatted | Any of the following [golang time constants](http://golang.org/pkg/time/#pkg-constants): RFC822, Stamp, StampMilli, RFC822Z, RFC1123, RFC1123Z, RFC3339. The default is RFC822. |
-| prefix | The prefix which all returned objects must have. | For example, "my/directory/structure/" |
+| prefix | The prefix which all returned objects must have | For example, "my/directory/structure/" |
 | pagemarker | The token identifying the next page to retrieve | Returned in the "nextpage" field from a call to ListBucket that does not retrieve all keys. When the last key is retrieved, NextPage will be the empty string |
 | pagesize | The maximum number of object names returned in response | Default value is 1000. GCP and local bucket support greater page sizes. AWS is unable to return more than [1000 objects in one page](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucketGET.html). |\b
 
@@ -254,14 +276,14 @@ The properties-and-options specifier must be a JSON-encoded structure, for insta
 To list objects in the smoke/ subdirectory of a given bucket called 'myBucket', and to include in the listing their respective sizes and checksums, run:
 
 ```
-$ curl -X GET -L -H 'Content-Type: application/json' -d '{"props": "size, checksum", "prefix": "smoke/"}' http://192.168.176.128:8080/v1/buckets/myBucket
+$ curl -X POST -L -H 'Content-Type: application/json' -d '{"action": "listobjects", "value":{"props": "size, checksum", "prefix": "smoke/"}}' http://localhost:8080/v1/buckets/myBucket
 ```
 
 This request will produce an output that (in part) may look as follows:
 
 <img src="images/dfc-ls-subdir.png" alt="DFC list directory" width="440">
 
-For many more examples, please refer to the dfc/tests/*_test.go files in the repository.
+For many more examples, please refer to the [test sources](dfc/tests/) in the repository.
 
 ### Example: Listing All Pages
 
@@ -271,13 +293,13 @@ The following Go code retrieves a list of all of object names from a named bucke
 // e.g. proxyurl: "http://localhost:8080"
 url := proxyurl + "/v1/buckets/" + bucket
 
-msg := &dfc.GetMsg{}
+msg := &dfc.ActionMsg{Action: dfc.ActListObjects}
 fullbucketlist := &dfc.BucketList{Entries: make([]*dfc.BucketEntry, 0)}
 for {
     // 1. First, send the request
     jsbytes, _ := json.Marshal(msg)
-    request, _ := http.NewRequest("GET", url, bytes.NewBuffer(jsbytes))
-    r, _ := http.DefaultClient.Do(request)
+    r, _ := http.DefaultClient.Post(url, "application/json", bytes.NewBuffer(jsbytes))
+
     defer func(r *http.Response){
         r.Body.Close()
     }(r)
@@ -356,9 +378,9 @@ The election process is as follows:
 
 ### Proxy Startup Process
 
-While it is running, a proxy persists the cluster map when it changes, loading it as the hint cluster map on startup. When a proxy starts up as primary, it performs the following process:
+While it is running, a proxy persists the cluster map when it changes, loading it as the discovery cluster map on startup. When a proxy starts up as primary, it performs the following process:
 
-- It requests the cluster map from each proxy and target in the union of the current cluster map and the hint cluster map.
+- It requests the cluster map from each proxy and target in the union of the current cluster map and the discovery cluster map.
 - If any target or proxy signaled that a vote is in progress, it waits a short time, and restarts the process.
 - If not, it picks the cluster map with the maximum version to be the current cluster map.
 - If it is the primary proxy in that cluster map: It continues as primary.
@@ -366,26 +388,59 @@ While it is running, a proxy persists the cluster map when it changes, loading i
 
 This process allows a proxy to be rerun with the same command and environment variables, even if it should no longer be primary.
 
-### Current Limitations
-
-- The current primary proxy is determined at startup, through either the configuration file or the -proxyurl command line variable. This means that if the primary proxy changes, the configuration file of any new targets joining the cluster must change. This limitation does not apply to targets that are a part of the cluster when the primary proxy changes, fail, and rejoin.
-- DFC does not currently handle the case where the primary proxy and the next highest random weight proxy both fail at the same time, so this will result in no new primary proxy being chosen.
-- Currently, only the candidate primary proxy keeps track of the fact that a vote is happening. This means that if the candidate primary proxy is not in the hint cluster map when a proxy starts up, a proxy may start as primary at the same time as an election completes, changing the primary proxy.
-
-### Tests
-
-The suite of tests for multiple proxies may be run by setting the environment variable "MULTIPROXY" to 1 for a test run. Multiple proxy tests can only be run on Linux, where the entire cluster is being run locally.
-
-#### Current Tests
-
-1. Proxy_Failure: Tests that a new proxy is successfully transitioned to after primary proxy failure.
-2. Multiple_Failures: Tests that a new proxy is successfully transitioned to after the primary proxy and a target fail at once.
-3. Rejoin: Tests that, after a primary proxy failure and transition, a target can fail and rejoin the cluster.
-4. Primary_Proxy_Rejoin: Tests the scenario where the primary proxy becomes inactive, and resumes activity during the voting process. The vote should complete and result in the primary proxy changing, with the previous primary proxy still alive, but with a lower Smap version.
-5. Test_votestress: The stress test runs a sequence of put/get/delete calls to a local bucket from multiple worker threads, and simultaneously kills, waits, and restores the primary proxy at random intervals.
-
 ## WebDAV
 
 WebDAV aka "Web Distributed Authoring and Versioning" is the IETF standard that defines HTTP extension for collaborative file management and editing. DFC WebDAV server is a reverse proxy (with interoperable WebDAV on the front and DFC's RESTful interface on the back) that can be used with any of the popular [WebDAV-compliant clients](https://en.wikipedia.org/wiki/Comparison_of_WebDAV_software).
 
 For information on how to run it and details, please refer to the [WebDAV README](webdav/README.md).
+
+## Extended Action (xaction)
+
+Extended actions (xactions) are the operations that may take seconds, sometimes even minutes, to execute, that run asynchronously, have one of the enumerated kinds, start/stop times, and xaction-specific statistics.
+
+Examples of the supported extended actions include:
+
+* Cluster-wide rebalancing
+* LRU-based eviction
+* Prefetch
+* Consensus voting when electing a new leader
+
+At the time of this writing the corresponding RESTful API can query two xaction kinds: "rebalance" and "prefetch". The following command, for instance, will query the cluster for an active/pending rebalancing operation (if presently running), and report associated statistics:
+
+```
+$ curl -X GET http://localhost:8080/v1/cluster?what=xaction&props=rebalance
+```
+
+## Multi-tiering
+
+DFC can be deployed with multiple consecutive DFC clusters aka "tiers" sitting behind a primary tier. This provides the option to use a multi-level cache architecture.
+
+<img src="images/multi-tier.png" alt="DFC multi-tier overview" width="680">
+
+Tiering is configured at the bucket level by setting bucket properties, for example:
+
+```
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops", "value": {"next_tier_url": "http://localhost:8082", "read_policy": "cloud", "write_policy": "next_tier"}}' 'http://localhost:8080/v1/buckets/<bucket-name>'
+```
+
+The following fields are used to configure multi-tiering:
+
+* `next_tier_url`: an absolute URI corresponding to the primary proxy of the next tier configured for the bucket specified
+* `read_policy`: `"next_tier"` or `"cloud"` (defaults to `"next_tier"` if not set)
+* `write_policy`: `"next_tier"` or `"cloud"` (defaults to `"cloud"` if not set)
+
+For the `"next_tier"` policy, a tier will read or write to the next tier specified by the `next_tier_url` field. On failure, it will read or write to the cloud (aka AWS or GCP).
+
+For the `"cloud"` policy, a tier will read or write to the cloud (aka AWS or GCP) directly from that tier.
+
+Currently, the endpoints which support multi-tier policies are the following:
+
+* GET /v1/objects/bucket-name/object-name
+* PUT /v1/objects/bucket-name/object-name
+
+## DFC Limitations
+
+- The current primary proxy is determined at startup, through either the configuration file or the -proxyurl command line variable. This means that if the primary proxy changes, the configuration file of any new targets joining the cluster must change. This limitation does not apply to targets that are a part of the cluster when the primary proxy changes, fails, or rejoins.
+- DFC does not currently handle the case where the primary proxy and the next highest random weight proxy both fail at the same time, so this will result in no new primary proxy being chosen.
+- Currently, only the candidate primary proxy keeps track of the fact that a vote is happening. This means that if the candidate primary proxy is not in the discovery cluster map when a proxy starts up, a proxy may start as primary at the same time as an election completes, changing the primary proxy.
+

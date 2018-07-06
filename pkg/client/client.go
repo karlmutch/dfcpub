@@ -23,8 +23,16 @@ import (
 	"sync"
 	"time"
 
+	"strconv"
+
+	"net/url"
+
 	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/OneOfOne/xxhash"
+)
+
+const (
+	registerTimeout = time.Minute * 2
 )
 
 type (
@@ -49,10 +57,10 @@ type (
 
 	// HTTPLatencies stores latency of a http request
 	HTTPLatencies struct {
-		ProxyConn           time.Duration // from request is created to proxy connection is estabilished
-		Proxy               time.Duration // from proxy connection is estabilished to redirected
-		TargetConn          time.Duration // from request is redirected to target connection is estabilished
-		Target              time.Duration // from target connection is estabilished to request is completed
+		ProxyConn           time.Duration // from request is created to proxy connection is established
+		Proxy               time.Duration // from proxy connection is established to redirected
+		TargetConn          time.Duration // from request is redirected to target connection is established
+		Target              time.Duration // from target connection is established to request is completed
 		PostHTTP            time.Duration // from http ends to after read data from http response and verify hash (if specified)
 		ProxyWroteHeader    time.Duration // from ProxyConn to header is written
 		ProxyWroteRequest   time.Duration // from ProxyWroteHeader to response body is written
@@ -65,9 +73,9 @@ type (
 
 var (
 	transport = &http.Transport{
-		Dial: (&net.Dialer{
+		DialContext: (&net.Dialer{
 			Timeout: 60 * time.Second,
-		}).Dial,
+		}).DialContext,
 		TLSHandshakeTimeout: 600 * time.Second,
 		MaxIdleConnsPerHost: 100, // arbitrary number, to avoid connect: cannot assign requested address
 	}
@@ -95,7 +103,8 @@ func (t *traceableTransport) GotConn(info httptrace.GotConnInfo) {
 	case 1:
 		t.tsTargetConn = time.Now()
 	default:
-		fmt.Println("Unexpected multiple redirection")
+		// ignore
+		// this can happen during proxy stress test when the proxy dies
 	}
 	t.connCnt++
 }
@@ -108,7 +117,7 @@ func (t *traceableTransport) WroteHeaders() {
 	case 2:
 		t.tsTargetWroteHeaders = time.Now()
 	default:
-		fmt.Println("Unexpected")
+		// ignore
 	}
 }
 
@@ -120,7 +129,7 @@ func (t *traceableTransport) WroteRequest(wr httptrace.WroteRequestInfo) {
 	case 2:
 		t.tsTargetWroteRequest = time.Now()
 	default:
-		fmt.Println("Unexpected")
+		// ignore
 	}
 }
 
@@ -132,7 +141,7 @@ func (t *traceableTransport) GotFirstResponseByte() {
 	case 2:
 		t.tsTargetFirstResponse = time.Now()
 	default:
-		fmt.Println("Unexpected")
+		// ignore
 	}
 }
 
@@ -144,6 +153,14 @@ type ReqError struct {
 type BucketProps struct {
 	CloudProvider string
 	Versioning    string
+	NextTierURL   string
+	ReadPolicy    string
+	WritePolicy   string
+}
+
+type ObjectProps struct {
+	Size    int
+	Version string
 }
 
 // Reader is the interface a client works with to read in data and send to a HTTP server
@@ -235,7 +252,7 @@ func emitError(r *http.Response, err error, errch chan error) {
 }
 
 func get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error,
-	silent bool, validate bool, w io.Writer) (int64, HTTPLatencies, error) {
+	silent bool, validate bool, w io.Writer, query url.Values) (int64, HTTPLatencies, error) {
 	var (
 		hash, hdhash, hdhashtype string
 	)
@@ -246,6 +263,7 @@ func get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 
 	url := proxyurl + "/" + dfc.Rversion + "/" + dfc.Robjects + "/" + bucket + "/" + keyname
 	req, _ := http.NewRequest("GET", url, nil)
+	req.URL.RawQuery = query.Encode() // golang handles query == nil
 
 	tr := &traceableTransport{
 		transport: transport,
@@ -277,11 +295,12 @@ func get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 
 	v := hdhashtype == dfc.ChecksumXXHash
 	len, hash, err := readResponse(resp, w, err, fmt.Sprintf("GET (object %s from bucket %s)", keyname, bucket), v)
-	if err != nil && v {
+	if v {
 		if hdhash != hash {
 			s := fmt.Sprintf("Header's hash %s doesn't match the file's %s \n", hdhash, hash)
+			err = errors.New(s)
 			if errch != nil {
-				errch <- errors.New(s)
+				errch <- err
 			}
 		} else {
 			if !silent {
@@ -310,13 +329,25 @@ func get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 // Get sends a get request to proxy and discard the data returned
 func Get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error,
 	silent bool, validate bool) (int64, HTTPLatencies, error) {
-	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, ioutil.Discard)
+	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, ioutil.Discard, nil)
+}
+
+// Get sends a get request to proxy and discard the data returned
+func GetWithQuery(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error,
+	silent bool, validate bool, q url.Values) (int64, HTTPLatencies, error) {
+	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, ioutil.Discard, q)
 }
 
 // GetFile sends a get request to proxy and save the data returned to an io.Writer
 func GetFile(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error,
 	silent bool, validate bool, w io.Writer) (int64, HTTPLatencies, error) {
-	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, w)
+	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, w, nil)
+}
+
+// GetFile sends a get request to proxy and save the data returned to an io.Writer
+func GetFileWithQuery(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error,
+	silent bool, validate bool, w io.Writer, query url.Values) (int64, HTTPLatencies, error) {
+	return get(proxyurl, bucket, keyname, wg, errch, silent, validate, w, query)
 }
 
 func Del(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error, silent bool) (err error) {
@@ -355,8 +386,7 @@ func Del(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 // maximum number of objects returned by ListBucket (0 - return all objects in a bucket)
 func ListBucket(proxyurl, bucket string, msg *dfc.GetMsg, objectCountLimit int) (*dfc.BucketList, error) {
 	var (
-		url     = proxyurl + "/" + dfc.Rversion + "/" + dfc.Rbuckets + "/" + bucket
-		request *http.Request
+		url = proxyurl + dfc.URLPath(dfc.Rversion, dfc.Rbuckets, bucket)
 	)
 
 	reslist := &dfc.BucketList{Entries: make([]*dfc.BucketEntry, 0, 1000)}
@@ -367,7 +397,7 @@ func ListBucket(proxyurl, bucket string, msg *dfc.GetMsg, objectCountLimit int) 
 	// than pageSize, the loop does the final request with reduced pageSize
 	toRead := objectCountLimit
 	for {
-		var r *http.Response
+		var resp *http.Response
 
 		if toRead != 0 {
 			if (msg.GetPageSize == 0 && toRead < dfc.DefaultPageSize) ||
@@ -381,35 +411,39 @@ func ListBucket(proxyurl, bucket string, msg *dfc.GetMsg, objectCountLimit int) 
 			return nil, err
 		}
 		if len(injson) == 0 {
-			r, err = client.Get(url)
+			resp, err = client.Get(url)
 		} else {
-			request, err = http.NewRequest("GET", url, bytes.NewBuffer(injson))
-			if err == nil {
-				request.Header.Set("Content-Type", "application/json")
-				r, err = client.Do(request)
+			injson, err := json.Marshal(dfc.ActionMsg{Action: dfc.ActListObjects, Value: msg})
+			if err != nil {
+				return nil, err
 			}
+			resp, err = client.Post(url, "application/json", bytes.NewBuffer(injson))
 		}
+
 		if err != nil {
 			return nil, err
 		}
-		if r != nil && r.StatusCode >= http.StatusBadRequest {
-			return nil, fmt.Errorf("List bucket %s failed, HTTP status %d", bucket, r.StatusCode)
-		}
 
 		defer func() {
-			r.Body.Close()
-		}()
-		var page = &dfc.BucketList{}
-		page.Entries = make([]*dfc.BucketEntry, 0, 1000)
-		b, err := ioutil.ReadAll(r.Body)
-
-		if err == nil {
-			err = json.Unmarshal(b, page)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to json-unmarshal, err: %v [%s]", err, string(b))
+			if resp != nil {
+				resp.Body.Close()
 			}
-		} else {
-			return nil, fmt.Errorf("Failed to read json, err: %v", err)
+		}()
+
+		page := &dfc.BucketList{}
+		page.Entries = make([]*dfc.BucketEntry, 0, 1000)
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to read http response body, err = %v", err)
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("HTTP error %d, message = %v", resp.StatusCode, string(b))
+		}
+
+		err = json.Unmarshal(b, page)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to json-unmarshal, err: %v [%s]", err, string(b))
 		}
 
 		reslist.Entries = append(reslist.Entries, page.Entries...)
@@ -550,12 +584,38 @@ func FastRandomFilename(src *rand.Rand, fnlen int) string {
 	return string(b)
 }
 
-func HeadBucket(proxyurl, bucket string) (bucketprops *BucketProps, err error) {
+func HeadBucket(proxyURL, bucket string) (*BucketProps, error) {
+	r, err := client.Head(proxyURL + dfc.URLPath(dfc.Rversion, dfc.Rbuckets, bucket))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		r.Body.Close()
+	}()
+	if r.StatusCode >= http.StatusBadRequest {
+		b, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"ioutil.ReadAll falled on response body, err: %v, HTTP status code: %d", err, r.StatusCode)
+		}
+		return nil, fmt.Errorf("head bucket: %s failed, HTTP status code: %d, HTTP response body: %s",
+			bucket, r.StatusCode, string(b))
+	}
+	return &BucketProps{
+		CloudProvider: r.Header.Get(dfc.CloudProvider),
+		Versioning:    r.Header.Get(dfc.Versioning),
+		NextTierURL:   r.Header.Get(dfc.NextTierURL),
+		ReadPolicy:    r.Header.Get(dfc.ReadPolicy),
+		WritePolicy:   r.Header.Get(dfc.WritePolicy),
+	}, nil
+}
+
+func HeadObject(proxyurl, bucket, objname string) (objProps *ObjectProps, err error) {
 	var (
-		url = proxyurl + "/" + dfc.Rversion + "/" + dfc.Rbuckets + "/" + bucket
+		url = proxyurl + "/" + dfc.Rversion + "/" + dfc.Robjects + "/" + bucket + "/" + objname
 		r   *http.Response
 	)
-	bucketprops = &BucketProps{}
+	objProps = &ObjectProps{}
 	r, err = client.Head(url)
 	if err != nil {
 		return
@@ -564,12 +624,83 @@ func HeadBucket(proxyurl, bucket string) (bucketprops *BucketProps, err error) {
 		r.Body.Close()
 	}()
 	if r != nil && r.StatusCode >= http.StatusBadRequest {
-		err = fmt.Errorf("Head bucket %s failed, HTTP status %d", bucket, r.StatusCode)
+		b, ioErr := ioutil.ReadAll(r.Body)
+		if ioErr != nil {
+			err = fmt.Errorf("failed to read response body, err = %s", ioErr)
+			return
+		}
+		err = fmt.Errorf("head bucket/object: %s/%s failed, HTTP status code: %d, HTTP response body: %s",
+			bucket, objname, r.StatusCode, string(b))
 		return
 	}
-	bucketprops.CloudProvider = r.Header.Get(dfc.CloudProvider)
-	bucketprops.Versioning = r.Header.Get(dfc.Versioning)
+	size, err := strconv.Atoi(r.Header.Get(dfc.Size))
+	if err != nil {
+		return
+	}
+
+	objProps.Size = size
+	objProps.Version = r.Header.Get(dfc.Version)
 	return
+}
+
+func SetBucketProps(proxyurl, bucket string, props dfc.BucketProps) error {
+	var url = proxyurl + dfc.URLPath(dfc.Rversion, dfc.Rbuckets, bucket)
+
+	b, err := json.Marshal(dfc.ActionMsg{Action: dfc.ActSetProps, Value: props})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("failed to create new HTTP request, err = %v", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to do PUT request, err = %v", err)
+	}
+	defer func() {
+		resp.Body.Close()
+	}()
+
+	if resp != nil && resp.StatusCode >= http.StatusBadRequest {
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read response body, err = %s", err)
+		}
+		return fmt.Errorf("failed SetBucketProps, HTTP status code: %d, HTTP response body: %s, bucket: %s",
+			resp.StatusCode, string(b), bucket)
+	}
+	return nil
+}
+
+func IsCached(proxyurl, bucket, objname string) (bool, error) {
+	var (
+		url = proxyurl + dfc.URLPath(dfc.Rversion, dfc.Robjects, bucket, objname) + "?" + dfc.URLParamCheckCached + "=true"
+		r   *http.Response
+	)
+	r, err := client.Head(url)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		r.Body.Close()
+	}()
+	if r != nil && r.StatusCode >= http.StatusBadRequest {
+		if r.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		b, ioErr := ioutil.ReadAll(r.Body)
+		if ioErr != nil {
+			err = fmt.Errorf("failed to read response body, err = %s", ioErr)
+			return false, err
+		}
+		err = fmt.Errorf("IsCached failed: bucket/object: %s/%s, HTTP status code: %d, HTTP response body: %s",
+			bucket, objname, r.StatusCode, string(b))
+		return false, err
+	}
+	return true, nil
 }
 
 func checkHTTPStatus(resp *http.Response, op string) error {
@@ -620,17 +751,30 @@ func Put(proxyURL string, reader Reader, bucket string, key string, silent bool)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to send put request, err = %v", err)
 	}
-	defer resp.Body.Close()
 
-	err = checkHTTPStatus(resp, "PUT")
-	discardHTTPResp(resp)
-	return err
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("Failed to read response body, err = %v", err)
+		}
+
+		return fmt.Errorf("HTTP error = %d, message = %s", resp.StatusCode, string(b))
+	}
+
+	return nil
 }
 
 // PutAsync sends a PUT request to the given URL
-func PutAsync(wg *sync.WaitGroup, proxyURL string, reader Reader, bucket string, key string, errch chan error, silent bool) {
+func PutAsync(wg *sync.WaitGroup, proxyURL string, reader Reader, bucket string, key string,
+	errch chan error, silent bool) {
 	defer wg.Done()
 	err := Put(proxyURL, reader, bucket, key, silent)
 	if err != nil {
@@ -649,19 +793,94 @@ func CreateLocalBucket(proxyURL, bucket string) error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rbuckets+"/"+bucket, bytes.NewBuffer(msg))
+	err = HTTPRequest("POST", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rbuckets+"/"+bucket, bytes.NewBuffer(msg))
 	if err != nil {
 		return err
 	}
 
-	r, err := client.Do(req)
-	if r != nil {
-		r.Body.Close()
+	return waitForLocalBucket(proxyURL, bucket)
+}
+
+// waitForLocalBucket wait until all targets have local bucket created or timeout
+func waitForLocalBucket(url, name string) error {
+	smap, err := GetClusterMap(url)
+	if err != nil {
+		return err
 	}
 
-	// FIXME: A few places are doing this already, need to address them
-	time.Sleep(time.Second * 2)
-	return err
+	to := time.Now().Add(time.Minute)
+	for _, s := range smap.Tmap {
+	loop_bucket:
+		for {
+			exists, err := DoesLocalBucketExist(s.DirectURL, name)
+			if err != nil {
+				return err
+			}
+
+			if exists {
+				break loop_bucket
+			}
+
+			if time.Now().After(to) {
+				return fmt.Errorf("wait for local bucket timed out, target = %s", s.DirectURL)
+			}
+
+			time.Sleep(time.Second)
+		}
+	}
+
+	return nil
+}
+
+// waitForNoLocalBucket wait until all targets do not have local bucket anymore or timeout
+func waitForNoLocalBucket(url, name string) error {
+	smap, err := GetClusterMap(url)
+	if err != nil {
+		return err
+	}
+
+	to := time.Now().Add(time.Minute)
+	for _, s := range smap.Tmap {
+	loop_bucket:
+		for {
+			exists, err := DoesLocalBucketExist(s.DirectURL, name)
+			if err != nil {
+				return err
+			}
+
+			if !exists {
+				break loop_bucket
+			}
+
+			if time.Now().After(to) {
+				return fmt.Errorf("timed out waiting for local bucket %s being removed, target %s", name, s.DirectURL)
+			}
+
+			time.Sleep(time.Second)
+		}
+	}
+
+	return nil
+}
+
+// RenameLocalBucket changes the name of a bucket to newBucketName
+func RenameLocalBucket(proxyURL, bucket, newBucketName string) error {
+	msg, err := json.Marshal(dfc.ActionMsg{Action: dfc.ActRenameLB, Name: newBucketName})
+	if err != nil {
+		return err
+	}
+
+	err = HTTPRequest("POST", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rbuckets+"/"+bucket, bytes.NewBuffer(msg))
+	if err != nil {
+		return err
+	}
+
+	err = waitForNoLocalBucket(proxyURL, bucket)
+	if err != nil {
+		return err
+	}
+
+	return waitForLocalBucket(proxyURL, newBucketName)
 }
 
 // DestroyLocalBucket deletes a local bucket
@@ -671,17 +890,12 @@ func DestroyLocalBucket(proxyURL, bucket string) error {
 		return err
 	}
 
-	req, err := http.NewRequest("DELETE", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rbuckets+"/"+bucket, bytes.NewBuffer(msg))
+	err = HTTPRequest("DELETE", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rbuckets+"/"+bucket, bytes.NewBuffer(msg))
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(req)
-	if resp != nil {
-		resp.Body.Close()
-	}
-
-	return err
+	return waitForNoLocalBucket(proxyURL, bucket)
 }
 
 // ListObjects returns a slice of object names of all objects that match the prefix in a bucket
@@ -707,12 +921,9 @@ func ListObjects(proxyURL, bucket, prefix string, objectCountLimit int) ([]strin
 // For testing purpose only
 func GetConfig(server string) (HTTPLatencies, error) {
 	url := server + "/" + dfc.Rversion + "/" + dfc.Rdaemon
-	msg, err := json.Marshal(&dfc.GetMsg{GetWhat: dfc.GetWhatConfig})
-	if err != nil {
-		return HTTPLatencies{}, err
-	}
 
-	req, _ := http.NewRequest("GET", url, bytes.NewBuffer(msg))
+	req, _ := http.NewRequest("GET", url, nil)
+	req.URL.RawQuery = getWhatRawQuery(dfc.GetWhatConfig, "")
 	tr := &traceableTransport{
 		transport: transport,
 		tsBegin:   time.Now(),
@@ -772,8 +983,8 @@ func ReadWriteWithHash(r io.Reader, w io.Writer) (int64, string, error) {
 }
 
 // ListBuckets returns all buckets in DFC (cloud and local)
-func ListBuckets(proxy string, local bool) (*dfc.BucketNames, error) {
-	url := proxy + "/" + dfc.Rversion + "/" + dfc.Rbuckets + "/*"
+func ListBuckets(proxyURL string, local bool) (*dfc.BucketNames, error) {
+	url := proxyURL + "/" + dfc.Rversion + "/" + dfc.Rbuckets + "/*"
 	if local {
 		url += "?local=true"
 	}
@@ -796,6 +1007,271 @@ func ListBuckets(proxy string, local bool) (*dfc.BucketNames, error) {
 	}
 
 	buckets := &dfc.BucketNames{}
-	err = json.Unmarshal(b, buckets)
+	if len(b) != 0 {
+		err = json.Unmarshal(b, buckets)
+	}
 	return buckets, err
+}
+
+// GetClusterMap retrives a DFC's server map
+// Note: this may not be a good idea to expose the map to clients, but this how it is for now.
+func GetClusterMap(url string) (dfc.Smap, error) {
+	q := getWhatRawQuery(dfc.GetWhatSmap, "")
+	requestURL := fmt.Sprintf("%s?%s", url+dfc.URLPath(dfc.Rversion, dfc.Rdaemon), q)
+	r, err := client.Get(requestURL)
+	defer func() {
+		if r != nil {
+			r.Body.Close()
+		}
+	}()
+
+	if err != nil {
+		// Note: might return connection refused if the servet is not ready
+		//       caller can retry in that case
+		return dfc.Smap{}, err
+	}
+
+	if r != nil && r.StatusCode >= http.StatusBadRequest {
+		return dfc.Smap{}, fmt.Errorf("get Smap, http status %d", r.StatusCode)
+	}
+
+	var (
+		b    []byte
+		smap dfc.Smap
+	)
+	b, err = ioutil.ReadAll(r.Body)
+	if err != nil {
+		return dfc.Smap{}, fmt.Errorf("Failed to read response body")
+	}
+
+	err = json.Unmarshal(b, &smap)
+	if err != nil {
+		return dfc.Smap{}, fmt.Errorf("Failed to unmarshal Smap: %v", err)
+	}
+
+	return smap, nil
+}
+
+func GetXactionRebalance(proxyURL string) (dfc.RebalanceStats, error) {
+	var rebalanceStats dfc.RebalanceStats
+	responseBytes, err := getXactionResponse(proxyURL, dfc.XactionRebalance)
+	if err != nil {
+		return rebalanceStats, err
+	}
+
+	err = json.Unmarshal(responseBytes, &rebalanceStats)
+	if err != nil {
+		return rebalanceStats,
+			fmt.Errorf("Failed to unmarshal rebalance stats: %v", err)
+	}
+
+	return rebalanceStats, nil
+}
+
+func getXactionResponse(proxyURL string, kind string) ([]byte, error) {
+	q := getWhatRawQuery(dfc.GetWhatXaction, kind)
+	url := fmt.Sprintf("%s?%s", proxyURL+dfc.URLPath(dfc.Rversion, dfc.Rcluster), q)
+	r, err := client.Get(url)
+	defer func() {
+		if r != nil {
+			r.Body.Close()
+		}
+	}()
+
+	if err != nil {
+		return []byte{}, err
+	}
+
+	if r != nil && r.StatusCode >= http.StatusBadRequest {
+		return []byte{},
+			fmt.Errorf("Get xaction, HTTP Status %d", r.StatusCode)
+	}
+
+	var response []byte
+	response, err = ioutil.ReadAll(r.Body)
+	if err != nil {
+		return []byte{}, fmt.Errorf("Failed to read response body")
+	}
+
+	return response, nil
+}
+
+// GetPrimaryProxy returns the primary proxy's url of a cluster
+func GetPrimaryProxy(url string) (string, error) {
+	smap, err := GetClusterMap(url)
+	if err != nil {
+		return "", err
+	}
+
+	return smap.ProxySI.DirectURL, nil
+}
+
+func UnregisterTarget(proxyURL, sid string) error {
+	smap, err := GetClusterMap(proxyURL)
+	if err != nil {
+		return fmt.Errorf("GetClusterMap() failed, err = %v", err)
+	}
+	err = HTTPRequest("DELETE", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rcluster+"/"+"daemon"+"/"+sid, nil)
+	if err != nil {
+		return err
+	}
+	return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, []string{smap.Tmap[sid].DaemonID})
+}
+
+func RegisterTarget(sid string, smap dfc.Smap) error {
+	si := smap.Tmap[sid]
+	err := HTTPRequest("POST", si.DirectURL+"/"+dfc.Rversion+"/"+dfc.Rdaemon+"/"+dfc.Rregister, nil)
+	if err != nil {
+		return err
+	}
+	return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, []string{})
+}
+
+// HTTPRequest sends one HTTP request and checks result
+func HTTPRequest(method string, url string, msg io.Reader) error {
+	req, err := http.NewRequest(method, url, msg)
+	if err != nil {
+		return fmt.Errorf("Failed to create request, err = %v", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Failed to do request, err = %v", err)
+	}
+
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("Failed to read response body, err = %v", err)
+		}
+
+		return fmt.Errorf("HTTP error = %d, message = %s", resp.StatusCode, string(b))
+	}
+
+	return nil
+}
+
+// GetLocalBucketNames returns list of all local buckets.
+func GetLocalBucketNames(proxyurl string) (*dfc.BucketNames, error) {
+	url := proxyurl + "/" + dfc.Rversion + "/" + dfc.Rbuckets + "/*?local=true"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create request, err = %v", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to do request, err = %v", err)
+	}
+
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read response body, err = %v", err)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("HTTP error = %d, message = %s", resp.StatusCode, string(b))
+	}
+
+	var buckets dfc.BucketNames
+	if len(b) != 0 {
+		err = json.Unmarshal(b, &buckets)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to unmarshal bucket names, err: %v - [%s]", err, string(b))
+		}
+	} else {
+		return nil, fmt.Errorf("Empty response instead of empty bucket list from %s\n", proxyurl)
+	}
+
+	return &buckets, nil
+}
+
+// DoesLocalBucketExist queries a proxy or target to get a list of all local buckets, returns true if
+// the bucket exists.
+func DoesLocalBucketExist(serverURL string, bucket string) (bool, error) {
+	buckets, err := GetLocalBucketNames(serverURL)
+	if err != nil {
+		return false, err
+	}
+
+	for _, b := range buckets.Local {
+		if b == bucket {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func WaitMapVersionSync(timeout time.Time, smap dfc.Smap, prevVersion int64, idsToIgnore []string) error {
+	inList := func(s string, values []string) bool {
+		for _, v := range values {
+			if s == v {
+				return true
+			}
+		}
+
+		return false
+	}
+	urls := make(map[string]struct{})
+	for _, d := range smap.Tmap {
+		if !inList(d.DaemonID, idsToIgnore) {
+			urls[d.DirectURL] = struct{}{}
+		}
+	}
+	for _, d := range smap.Pmap {
+		if !inList(d.DaemonID, idsToIgnore) {
+			urls[d.DirectURL] = struct{}{}
+		}
+	}
+
+	for len(urls) > 0 {
+		var u string
+		for u = range urls {
+			break
+		}
+		smap, err := GetClusterMap(u)
+		if err != nil && !dfc.IsErrConnectionRefused(err) {
+			return err
+		}
+
+		if err == nil && smap.Version > prevVersion {
+			delete(urls, u)
+			continue
+		}
+
+		if time.Now().After(timeout) {
+			return fmt.Errorf("timed out waiting for sync-ed Smap version > %d from %s", prevVersion, u)
+		}
+		if len(urls) > 0 {
+			fmt.Printf("wait-for-Smap-synced: ")
+			for k, _ := range urls {
+				fmt.Printf("%s ", k)
+			}
+			fmt.Printf("did not respond yet\n")
+			time.Sleep(time.Second)
+		}
+	}
+	return nil
+}
+
+func getWhatRawQuery(getWhat string, getProps string) string {
+	q := url.Values{}
+	q.Add(dfc.URLParamWhat, getWhat)
+	if getProps != "" {
+		q.Add(dfc.URLParamProps, getProps)
+	}
+	return q.Encode()
 }

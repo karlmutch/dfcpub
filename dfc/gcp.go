@@ -1,41 +1,59 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends.
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.  *
  */
 package dfc
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/golang/glog"
-	"golang.org/x/net/context"
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 )
 
 const (
+	gcsURL = "http://storage.googleapis.com"
+
 	gcpDfcHashType = "x-goog-meta-dfc-hash-type"
 	gcpDfcHashVal  = "x-goog-meta-dfc-hash-val"
 
 	gcpPageSize = 1000
 )
 
+// To get projectID from gcp auth json file, to get rid of reading projectID
+// from environment variable
+type gcpAuthRec struct {
+	ProjectID string `json:"project_id"`
+}
+
 //======
 //
 // implements cloudif
 //
 //======
-type gcpimpl struct {
-	t *targetrunner
-}
+type (
+	gcpCreds struct {
+		projectID string
+		creds     string
+	}
+
+	gcpimpl struct {
+		t *targetrunner
+	}
+)
 
 //======
 //
@@ -54,16 +72,104 @@ func gcpErrorToHTTP(gcpError error) int {
 	return http.StatusInternalServerError
 }
 
-func createclient() (*storage.Client, context.Context, string) {
-	if getProjID() == "" {
-		return nil, nil, "Failed to get ProjectID from GCP"
+// If extractGCPCreds returns no error and gcpCreds is nil then the default
+//   GCP client is used (that loads credentials from dir ~/.config/gcloud/ -
+//   the directory is created after the first successful login with gsutil)
+func extractGCPCreds(credsList map[string]string) (*gcpCreds, error) {
+	if len(credsList) == 0 {
+		return nil, nil
 	}
-	gctx := context.Background()
+	raw, ok := credsList[ProviderGoogle]
+	if raw == "" || !ok {
+		return nil, nil
+	}
+	rec := &gcpAuthRec{}
+	if err := json.Unmarshal([]byte(raw), rec); err != nil {
+		return nil, err
+	}
+
+	return &gcpCreds{rec.ProjectID, raw}, nil
+}
+
+func defaultClient(gctx context.Context) (*storage.Client, context.Context, string, string) {
+	if glog.V(5) {
+		glog.Info("Creating default google cloud session")
+	}
+	if getProjID() == "" {
+		return nil, nil, "", "Failed to get ProjectID from GCP"
+	}
 	client, err := storage.NewClient(gctx)
 	if err != nil {
-		return nil, nil, fmt.Sprintf("Failed to create client, err: %v", err)
+		return nil, nil, "", fmt.Sprintf("Failed to create client, err: %v", err)
 	}
-	return client, gctx, ""
+	return client, gctx, getProjID(), ""
+}
+
+func saveCredentialsToFile(baseDir, userID, userCreds string) (string, error) {
+	dir := filepath.Join(baseDir, ProviderGoogle)
+	filePath := filepath.Join(dir, userID+".json")
+
+	if _, err := os.Stat(filePath); err == nil {
+		// credentials already saved, no need to do anything
+		// TODO: keep the list of stored creds in-memory instead of calling os functions
+		return "", nil
+	}
+
+	if err := CreateDir(dir); err != nil {
+		return "", fmt.Errorf("Failed to create directory %s: %v", dir, err)
+	}
+
+	if err := ioutil.WriteFile(filePath, []byte(userCreds), 0755); err != nil {
+		return "", fmt.Errorf("Failed to save to file: %v", err)
+	}
+
+	return filePath, nil
+}
+
+// createClient support two ways of creating a connection to cloud:
+// 1. With Authn server disabled (old way):
+//    In this case all are read from environment variables and a user
+//    should be logged in to the cloud
+// 2. If Authn is enabled and directory with user credentials is set:
+//    The directory contains credentials for every user who want to connect
+//    storage. A file per a user.  A userID is retrieved from a token - it the
+//    file name with the user's credentials. Full path to user credentials is
+//    CredDir + userID + ".json"
+//    The file is standard GCP credentials file (e.g, check ~/gcp_creds.json
+//    for details). If the file does not include project_id, the function reads
+//    it from environment variable GOOGLE_CLOUD_PROJECT
+// The function returns:
+//   connection to the cloud, GCP context, project_id, error_string
+// project_id is used only by getbucketnames function
+
+func createClient(ct context.Context) (*storage.Client, context.Context, string, string) {
+	gctx := context.Background()
+	userID := getStringFromContext(ct, ctxUserID)
+	userCreds := userCredsFromContext(ct)
+	credsDir := getStringFromContext(ct, ctxCredsDir)
+	if userID == "" || userCreds == nil || credsDir == "" {
+		return defaultClient(gctx)
+	}
+
+	creds, err := extractGCPCreds(userCreds)
+	if err != nil || creds == nil {
+		glog.Errorf("Failed to retrieve %s credentials %s: %v", ProviderGoogle, userID, err)
+		return defaultClient(gctx)
+	}
+
+	filePath, err := saveCredentialsToFile(credsDir, userID, creds.creds)
+	if err != nil {
+		glog.Errorf("Failed to save credentials: %v", err)
+		return defaultClient(gctx)
+	}
+
+	client, err := storage.NewClient(gctx, option.WithCredentialsFile(filePath))
+	if err != nil {
+		glog.Errorf("Failed to create storage client for %s: %v", userID, err)
+		return defaultClient(gctx)
+	}
+
+	return client, gctx, creds.projectID, ""
 }
 
 //==================
@@ -71,11 +177,11 @@ func createclient() (*storage.Client, context.Context, string) {
 // bucket operations
 //
 //==================
-func (gcpimpl *gcpimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) listbucket(ct context.Context, bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("listbucket %s", bucket)
 	}
-	client, gctx, errstr := createclient()
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
@@ -137,21 +243,23 @@ func (gcpimpl *gcpimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, 
 
 		reslist.Entries = append(reslist.Entries, entry)
 	}
+
 	if glog.V(4) {
 		glog.Infof("listbucket count %d", len(reslist.Entries))
 	}
+
 	jsbytes, err = json.Marshal(reslist)
 	assert(err == nil, err)
 	return
 }
 
-func (gcpimpl *gcpimpl) headbucket(bucket string) (bucketprops map[string]string, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) headbucket(ct context.Context, bucket string) (bucketprops simplekvs, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("headbucket %s", bucket)
 	}
-	bucketprops = make(map[string]string)
+	bucketprops = make(simplekvs)
 
-	client, gctx, errstr := createclient()
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
@@ -168,13 +276,13 @@ func (gcpimpl *gcpimpl) headbucket(bucket string) (bucketprops map[string]string
 	return
 }
 
-func (gcpimpl *gcpimpl) getbucketnames() (buckets []string, errstr string, errcode int) {
-	client, gctx, errstr := createclient()
+func (gcpimpl *gcpimpl) getbucketnames(ct context.Context) (buckets []string, errstr string, errcode int) {
+	client, gctx, projectID, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
 	buckets = make([]string, 0, 16)
-	it := client.Buckets(gctx, getProjID())
+	it := client.Buckets(gctx, projectID)
 	for {
 		battrs, err := it.Next()
 		if err == iterator.Done {
@@ -198,13 +306,13 @@ func (gcpimpl *gcpimpl) getbucketnames() (buckets []string, errstr string, errco
 // object meta
 //
 //============
-func (gcpimpl *gcpimpl) headobject(bucket string, objname string) (objmeta map[string]string, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) headobject(ct context.Context, bucket string, objname string) (objmeta simplekvs, errstr string, errcode int) {
 	if glog.V(4) {
 		glog.Infof("headobject %s/%s", bucket, objname)
 	}
-	objmeta = make(map[string]string)
+	objmeta = make(simplekvs)
 
-	client, gctx, errstr := createclient()
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
@@ -224,9 +332,9 @@ func (gcpimpl *gcpimpl) headobject(bucket string, objname string) (objmeta map[s
 // object data operations
 //
 //=======================
-func (gcpimpl *gcpimpl) getobj(fqn string, bucket string, objname string) (props *objectProps, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) getobj(ct context.Context, fqn string, bucket string, objname string) (props *objectProps, errstr string, errcode int) {
 	var v cksumvalue
-	client, gctx, errstr := createclient()
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
@@ -244,30 +352,31 @@ func (gcpimpl *gcpimpl) getobj(fqn string, bucket string, objname string) (props
 		errstr = fmt.Sprintf("The object %s/%s either does not exist or is not accessible, err: %v", bucket, objname, err)
 		return
 	}
-	defer rc.Close()
 	// hashtype and hash could be empty for legacy objects.
 	props = &objectProps{version: fmt.Sprintf("%d", attrs.Generation)}
-	if _, props.nhobj, props.size, errstr = gcpimpl.t.receive(fqn, false, objname, md5, v, rc); errstr != "" {
+	if _, props.nhobj, props.size, errstr = gcpimpl.t.receive(fqn, objname, md5, v, rc); errstr != "" {
+		rc.Close()
 		return
 	}
 	if glog.V(4) {
 		glog.Infof("GET %s/%s", bucket, objname)
 	}
+	rc.Close()
 	return
 }
 
-func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) putobj(ct context.Context, file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
 	var (
 		htype, hval string
-		md          map[string]string
+		md          simplekvs
 	)
-	client, gctx, errstr := createclient()
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}
 	if ohash != nil {
 		htype, hval = ohash.get()
-		md = make(map[string]string)
+		md = make(simplekvs)
 		md[gcpDfcHashType] = htype
 		md[gcpDfcHashVal] = hval
 	}
@@ -276,8 +385,8 @@ func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 	wc.Metadata = md
 	slab := selectslab(0)
 	buf := slab.alloc()
-	defer slab.free(buf)
 	written, err := io.CopyBuffer(wc, file, buf)
+	slab.free(buf)
 	if err != nil {
 		errstr = fmt.Sprintf("PUT %s/%s: failed to copy, err: %v", bucket, objname, err)
 		return
@@ -298,8 +407,8 @@ func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 	return
 }
 
-func (gcpimpl *gcpimpl) deleteobj(bucket, objname string) (errstr string, errcode int) {
-	client, gctx, errstr := createclient()
+func (gcpimpl *gcpimpl) deleteobj(ct context.Context, bucket, objname string) (errstr string, errcode int) {
+	client, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
 	}

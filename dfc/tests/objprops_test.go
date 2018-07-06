@@ -39,7 +39,7 @@ func propsUpdateObjects(t *testing.T, bucket string, oldVersions map[string]stri
 		t.Fail()
 	}
 	for fname, _ := range oldVersions {
-		err = client.Put(proxyurl, r, bucket, fname, false)
+		err = client.Put(proxyurl, r, bucket, fname, !testing.Verbose())
 		if err != nil {
 			t.Errorf("Failed to put new data to object %s/%s, err: %v", bucket, fname, err)
 			t.Fail()
@@ -210,20 +210,21 @@ func propsRecacheObjects(t *testing.T, bucket string, objs map[string]string, ms
 func propsRebalance(t *testing.T, bucket string, objects map[string]string, msg *dfc.GetMsg, versionEnabled bool, isLocalBucket bool) {
 	propsCleanupObjects(t, bucket, objects)
 
-	smap := getClusterMap(httpclient, t)
-	l := len(smap.Smap)
+	smap := getClusterMap(t)
+	l := len(smap.Tmap)
 	if l < 2 {
 		t.Skipf("Only %d targets found, need at least 2", l)
 	}
 
 	var removedSid string
-	for sid := range smap.Smap {
+	for sid := range smap.Tmap {
 		removedSid = sid
 		break
 	}
 
 	tlogf("Removing a target: %s\n", removedSid)
-	unregisterTarget(removedSid, t)
+	err := client.UnregisterTarget(proxyurl, removedSid)
+	checkFatal(err, t)
 	waitProgressBar("Removing: ", time.Second*10)
 
 	tlogf("Target %s is removed\n", removedSid)
@@ -232,18 +233,19 @@ func propsRebalance(t *testing.T, bucket string, objects map[string]string, msg 
 	newobjs := propsUpdateObjects(t, bucket, objects, msg, versionEnabled, isLocalBucket)
 
 	tlogf("Reregistering target...\n")
-	registerTarget(removedSid, &smap, t)
-	for i := 0; i < 10; i++ {
+	err = client.RegisterTarget(removedSid, smap)
+	checkFatal(err, t)
+	for i := 0; i < 25; i++ {
 		time.Sleep(time.Second)
-		smap = getClusterMap(httpclient, t)
-		if len(smap.Smap) == l {
+		smap = getClusterMap(t)
+		if len(smap.Tmap) == l {
 			break
 		}
 	}
 
-	smap = getClusterMap(httpclient, t)
-	if l != len(smap.Smap) {
-		t.Errorf("Target failed to reregister. Current number of targets: %d (expected %d)", len(smap.Smap), l)
+	smap = getClusterMap(t)
+	if l != len(smap.Tmap) {
+		t.Errorf("Target failed to reregister. Current number of targets: %d (expected %d)", len(smap.Tmap), l)
 	}
 	//
 	// wait for rebalance to run its course
@@ -295,7 +297,7 @@ func propsCleanupObjects(t *testing.T, bucket string, newVersions map[string]str
 	wg := &sync.WaitGroup{}
 	for objname, _ := range newVersions {
 		wg.Add(1)
-		go client.Del(proxyurl, bucket, objname, wg, errch, false)
+		go client.Del(proxyurl, bucket, objname, wg, errch, !testing.Verbose())
 	}
 	wg.Wait()
 	selectErr(errch, "delete", t, abortonerr)
@@ -324,7 +326,8 @@ func propsTestCore(t *testing.T, versionEnabled bool, isLocalBucket bool) {
 	tlogf("Creating %d objects...\n", numPuts)
 	ldir := LocalSrcDir + "/" + versionDir
 	htype := dfc.ChecksumNone
-	putRandomFiles(0, baseseed+110, filesize, int(numPuts), bucket, t, nil, errch, filesput, ldir, versionDir, htype, true, sgl)
+	putRandomFiles(0, baseseed+110, filesize, int(numPuts), bucket, t, nil, errch, filesput,
+		ldir, versionDir, htype, true, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput)
 	for fname := range filesput {
@@ -405,21 +408,23 @@ func propsMainTest(t *testing.T, versioning string) {
 	config := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
 	versionCfg := config["version_config"].(map[string]interface{})
 	rebalanceCfg := config["rebalance_conf"].(map[string]interface{})
-	oldChkVersion := versionCfg["validate_warm_get"].(bool)
+	oldChkVersion := versionCfg["validate_version_warm_get"].(bool)
 	oldVersioning := versionCfg["versioning"].(string)
 	oldRBDelay := rebalanceCfg["startup_delay_time"].(string)
 	if oldChkVersion != chkVersion {
-		setConfig("validate_warm_get", fmt.Sprintf("%v", chkVersion), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("validate_version_warm_get", fmt.Sprintf("%v", chkVersion), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 	}
 	if oldVersioning != versioning {
 		setConfig("versioning", versioning, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 	}
 	setConfig("startup_delay_time", rbdelay, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 
+	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+
 	defer func() {
 		// restore configuration
 		if oldChkVersion != chkVersion {
-			setConfig("validate_warm_get", fmt.Sprintf("%v", oldChkVersion), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+			setConfig("validate_version_warm_get", fmt.Sprintf("%v", oldChkVersion), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 		}
 		if oldVersioning != versioning {
 			setConfig("versioning", oldVersioning, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
@@ -427,23 +432,25 @@ func propsMainTest(t *testing.T, versioning string) {
 		if oldRBDelay != "" {
 			setConfig("startup_delay_time", oldRBDelay, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 		}
+
+		if created {
+			if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
+				t.Errorf("Failed to delete local bucket: %v", err)
+			}
+		}
 	}()
 
-	// Skip the test when given a local bucket
 	props, err := client.HeadBucket(proxyurl, clibucket)
 	if err != nil {
-		t.Errorf("Could not execute HeadBucket Request: %v", err)
-		return
-	}
-	if props.CloudProvider == dfc.ProviderDfc {
-		isLocalBucket = true
+		t.Fatalf("Could not execute HeadBucket Request: %v", err)
 	}
 	versionEnabled := props.Versioning != dfc.VersionNone
+	isLocalBucket = props.CloudProvider == dfc.ProviderDfc
 
 	propsTestCore(t, versionEnabled, isLocalBucket)
 }
 
-func Test_objpropsVersionEnabled(t *testing.T) {
+func TestObjPropsVersionEnabled(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Long run only")
 	}
@@ -451,7 +458,7 @@ func Test_objpropsVersionEnabled(t *testing.T) {
 	propsMainTest(t, dfc.VersionAll)
 }
 
-func Test_objpropsVersionDisabled(t *testing.T) {
+func TestObjPropsVersionDisabled(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Long run only")
 	}

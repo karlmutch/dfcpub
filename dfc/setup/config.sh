@@ -12,18 +12,18 @@
 	},
 	"periodic": {
 		"stats_time":		"10s",
-		"keep_alive_time":	"20s"
+		"retry_sync_time":	"2s"
 	},
 	"timeout": {
 		"default_timeout":	"30s",
 		"default_long_timeout":	"30m",
 		"max_keepalive":	"4s",
 		"proxy_ping":		"100ms",
-		"vote_request":		"2s",
-		"send_file_time":	"5m"
+		"cplane_operation":	"1s",
+		"send_file_time":	"5m",
+		"startup_time":		"1m"
 	},
 	"proxyconfig": {
-		"startup_get_smap_maximum":	"1m",
 		"primary": {
 			"id":		"${PROXYID}",
 			"url": 		"${PROXYURL}",
@@ -49,15 +49,17 @@
 		"rebalancing_enabled": 	true
 	},
 	"cksum_config": {
-                 "checksum":		"xxhash",
-                 "validate_cold_get":	true
+                 "checksum":                    "xxhash",
+                 "validate_checksum_cold_get":  true,
+                 "validate_checksum_warm_get":  false,
+                 "enable_read_range_checksum":  false
 	},
 	"version_config": {
-		"validate_warm_get":	false,
-		"versioning":		"all"
+		"validate_version_warm_get":    false,
+		"versioning":                   "all"
 	},
 	"fspaths": {
-$FSPATHS
+	    $FSPATHS
 	},
 	"test_fspaths": {
 		"root":			"/tmp/dfc/",
@@ -72,8 +74,10 @@ $FSPATHS
 		},
 		"http": {
 			"max_num_targets":    16,
-			"use_https":          false,
-			"server_certificate": "server.pem",
+			"use_https":          ${USE_HTTPS},
+			"use_http2":          false,
+			"use_as_proxy":       false,
+			"server_certificate": "server.crt",
 			"server_key":         "server.key"
 		}
 	},
@@ -82,15 +86,29 @@ $FSPATHS
 		"offline_fs_check_time": "0",
 		"fskeeper_enabled":      false
 	},
-	"experimental": {
-		"ack_put":		"disk",
-		"max_mem_mb":		16
-	},
 	"auth": {
 		"secret": "$SECRETKEY",
-		"enabled": $AUTHENABLED
+		"enabled": $AUTHENABLED,
+		"creddir": "$CREDDIR"
 	},
-	"h2c": 				false
+	"keepalivetracker": {
+		"proxy": {
+			"interval": "10s",
+			"name": "heartbeat",
+			"max": "20s",
+			"factor": 3
+		},
+		"target": {
+			"interval": "10s",
+			"name": "heartbeat",
+			"max": "20s",
+			"factor": 3
+		}
+	},
+	"callstats": {
+		"request_included": [ "keepalive", "metasync" ],
+		"factor": 2.5
+	}
 }
 EOL
 

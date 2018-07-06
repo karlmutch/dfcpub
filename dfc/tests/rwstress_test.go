@@ -145,9 +145,7 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 		defer taskGrp.Done()
 	}
 
-	wg := &sync.WaitGroup{}
-
-	fmt.Printf("Running stress test...0%%")
+	var wg sync.WaitGroup
 	totalCount := fileCount * numLoops
 	filesPut := 0
 	for i := 0; i < numLoops; i++ {
@@ -171,7 +169,7 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 					wg.Add(1)
 					localIdx := idx
 					go func() {
-						client.PutAsync(wg, proxyurl, r, clibucket, keyname, errch, true /* silent */)
+						client.PutAsync(&wg, proxyurl, r, clibucket, keyname, errch, true /* silent */)
 						unlockFile(localIdx, rwFileCreated)
 						atomic.AddInt64(&putCounter, -1)
 					}()
@@ -187,7 +185,6 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 			filesPut++
 			newPrc := 100 * filesPut / totalCount
 			if prc != newPrc {
-				fmt.Printf("\rRunning stress test...%d%%", prc)
 				prc = newPrc
 			}
 			select {
@@ -198,16 +195,14 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 			}
 		}
 	}
+
 	wg.Wait()
-	fmt.Printf("\rRunning stress test...100%%\n")
 
 	// emit signals for DEL and GET loops
 	doneCh <- 1
 	if !skipdel {
 		doneCh <- 1
 	}
-
-	fmt.Printf("PUT %6d files\n", totalOps)
 }
 
 func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int, doCleanUp bool) {
@@ -245,7 +240,6 @@ func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 			totalOps++
 		} else {
 			if doCleanUp {
-				fmt.Printf("Cleanup finished\n")
 				break
 			}
 			time.Sleep(delSleep * time.Millisecond)
@@ -261,12 +255,6 @@ func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 		}
 	}
 	wg.Wait()
-
-	if doCleanUp {
-		fmt.Printf("DEL cleaned up %d files\n", totalOps)
-	} else {
-		fmt.Printf("DEL %6d files\n", totalOps)
-	}
 }
 
 func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
@@ -314,9 +302,8 @@ func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 		default:
 		}
 	}
-	wg.Wait()
 
-	fmt.Printf("GET %6d files\n", totalOps)
+	wg.Wait()
 }
 
 func rwstress(t *testing.T) {
@@ -324,28 +311,31 @@ func rwstress(t *testing.T) {
 		t.Fatalf("Failed to create dir %s/%s, err: %v", baseDir, rwdir, err)
 	}
 
+	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
 	filelock.files = make([]fileLock, numFiles, numFiles)
 
 	generateRandomData(t, baseseed+10000, numFiles)
-	fmt.Printf("PUT %v files x %v times\n", len(fileNames), numLoops)
 
-	var wg = &sync.WaitGroup{}
-
+	var wg sync.WaitGroup
 	doneCh := make(chan int, 2)
 	wg.Add(1)
-	go rwPutLoop(t, fileNames, wg, doneCh)
+	go rwPutLoop(t, fileNames, &wg, doneCh)
 	wg.Add(1)
-	go rwGetLoop(t, fileNames, wg, doneCh)
+	go rwGetLoop(t, fileNames, &wg, doneCh)
 	if !skipdel {
 		wg.Add(1)
-		go rwDelLoop(t, fileNames, wg, doneCh, rwRunNormal)
+		go rwDelLoop(t, fileNames, &wg, doneCh, rwRunNormal)
 	}
+
 	wg.Wait()
-
-	fmt.Printf("Cleaning up...\n")
 	rwDelLoop(t, fileNames, nil, doneCh, rwRunCleanUp)
-
 	rwstressCleanup(t)
+
+	if created {
+		if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
+			t.Errorf("Failed to delete local bucket: %v", err)
+		}
+	}
 }
 
 func rwstressCleanup(t *testing.T) {
@@ -360,9 +350,7 @@ func rwstressCleanup(t *testing.T) {
 	}
 }
 
-// The regression verions of the test should run around 30 seconds
-// 25 files written 8 times takes 20-25 seconds
-func regressionRWStress(t *testing.T) {
+func TestRWStress(t *testing.T) {
 	numFiles = 25
 	numLoops = 8
 
