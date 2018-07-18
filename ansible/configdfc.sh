@@ -16,7 +16,7 @@ export TESTFSPATHCOUNT=0
 export c=0
 export AUTHENABLED=false
 export USE_HTTPS=false
-export NON_ELECTABLE=fasle
+export NON_ELECTABLE=false
 FSP=
 for disk in "$@"; do
     if [ -z "$FSP" ]; then
