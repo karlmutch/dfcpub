@@ -25,7 +25,8 @@ echo 'Go get DFC'
 cd $GOPATH/src
 go get -u -v github.com/NVIDIA/dfcpub/dfc
 cd $DFCSRC
-$GOBIN/dep ensure
+$GOBIN/dep ensure -v
+$GOBIN/dep ensure -v -update
 BUILD=`git rev-parse --short HEAD`
 go build && go install && GOBIN=$GOPATH/bin go install -ldflags "-X github.com/NVIDIA/dfcpub/dfc.build=$BUILD" setup/dfc.go
 
