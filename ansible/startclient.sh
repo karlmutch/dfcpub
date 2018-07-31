@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -ex
 
 PROXYIP=`cat /home/ubuntu/inventory/proxy.txt`
 PROXYPORT='8081'
@@ -75,6 +75,8 @@ do
 done
 
 echo "screenlog file created"
+cat screenlog.0
+
 if grep -q 'Failed to boot strap' screenlog.0; then
 	echo 'Failed to boot strap, restarting one more time'
 	sudo rm -rf screenlog.0
