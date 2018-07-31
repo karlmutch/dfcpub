@@ -15,8 +15,8 @@ if [ ! -d "/usr/local/go" ]; then
     echo 'Download go'
     curl -LO https://storage.googleapis.com/golang/go1.9.linux-amd64.tar.gz
     shasum -a 256 go1.*
-    tar -C /usr/local -xvzf go1.9.linux-amd64.tar.gz > /dev/null
-    ln -s /usr/loca/go/bin/go /usr/bin/go
+    sudo tar -C /usr/local -xvzf go1.9.linux-amd64.tar.gz > /dev/null
+    sudo ln -s /usr/loca/go/bin/go /usr/bin/go
     rm -rf go1.9.linux-amd64.tar.gz
     curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 fi
