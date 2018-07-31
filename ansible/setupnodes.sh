@@ -18,9 +18,9 @@ if [ ! -d "/usr/local/go" ]; then
     sudo tar -C /usr/local -xvzf go1.9.linux-amd64.tar.gz > /dev/null
     sudo ln -s /usr/loca/go/bin/go /usr/bin/go
     rm -rf go1.9.linux-amd64.tar.gz
-    curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 fi
-
+echo 'Setup go dep binary'
+curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 echo 'Go get DFC'
 cd $GOPATH/src
 go get -u -v github.com/NVIDIA/dfcpub/dfc
