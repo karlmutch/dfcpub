@@ -91,4 +91,5 @@ if grep -q 'Failed to boot strap' screenlog.0; then
 	done
 
 	echo "screenlog file created"
+        cat screenlog.0
 fi
