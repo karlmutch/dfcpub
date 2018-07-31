@@ -3,7 +3,9 @@ set -e
 . /etc/profile.d/dfcpaths.sh
 echo 'Pull latest DFC'
 cd $DFCSRC
-git pull
+git fetch
+git reset --hard origin/master
+git status
 if [ ! -z $1 ]; then
     echo Git checkout branch $1
     git checkout $1
