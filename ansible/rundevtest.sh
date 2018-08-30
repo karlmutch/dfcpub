@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 set -o xtrace
 source /etc/profile.d/dfcpaths.sh
 source aws.env
@@ -11,7 +12,8 @@ if [ ! -z $1 ]; then
     git checkout $1
 fi
 
-git pull
+git fetch --all
+git reset --hard origin/master
 git status
 git log | head -5
 
