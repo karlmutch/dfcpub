@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 set -o xtrace
 source /etc/profile.d/dfcpaths.sh
 source aws.env
