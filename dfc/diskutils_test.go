@@ -1,11 +1,9 @@
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  */
-
 package dfc
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -13,8 +11,15 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/json-iterator/go"
 )
+
+func init() {
+	ctx.config.CloudBuckets = "cloud"
+	ctx.config.LocalBuckets = "local"
+}
 
 func TestGetFSUsedPercentage(t *testing.T) {
 	percentage, ok := getFSUsedPercentage("/")
@@ -32,11 +37,10 @@ func TestGetFSDiskUtil(t *testing.T) {
 	}
 
 	tempRoot := "/tmp"
-	ctx.mountpaths.Available = make(map[string]*fs.MountpathInfo, 1)
-	ctx.mountpaths.AddMountpath(tempRoot)
+	fs.Mountpaths.AddMountpath(tempRoot)
 
 	riostat := newIostatRunner()
-	go riostat.run()
+	go riostat.Run()
 
 	time.Sleep(50 * time.Millisecond)
 	percentage, ok := riostat.diskUtilFromFQN(tempRoot + "/test")
@@ -47,7 +51,7 @@ func TestGetFSDiskUtil(t *testing.T) {
 		t.Errorf("Invalid FS disk utilization percentage [%f].", percentage)
 	}
 	glog.Infof("Disk utilization fetched. Value [%f]", percentage)
-	riostat.stop(fmt.Errorf("test"))
+	riostat.Stop(fmt.Errorf("test"))
 }
 
 func TestGetDiskFromFileSystem(t *testing.T) {
@@ -93,7 +97,7 @@ func TestGetDiskFromFileSystem(t *testing.T) {
 }
 
 func TestMultipleMountPathsOnSameDisk(t *testing.T) {
-	rawJson := json.RawMessage(
+	rawJson := jsoniter.RawMessage(
 		`{
         "blockdevices": [{
                 "name": "xvda",
@@ -114,7 +118,7 @@ func TestMultipleMountPathsOnSameDisk(t *testing.T) {
             }
         ]
 		}`)
-	bytes, err := json.Marshal(&rawJson)
+	bytes, err := jsoniter.Marshal(&rawJson)
 	if err != nil {
 		t.Errorf("Unable to marshal input json. Error: [%v]", err)
 	}
@@ -139,18 +143,18 @@ func TestMultipleMountPathsOnSameDisk(t *testing.T) {
 
 func TestGetMaxUtil(t *testing.T) {
 	riostat := newIostatRunner()
-	riostat.Disk = make(map[string]simplekvs, 2)
-	disks := make(StringSet)
+	riostat.Disk = make(map[string]cmn.SimpleKVs, 2)
+	disks := make(cmn.StringSet)
 	disk1 := "disk1"
 	disks[disk1] = struct{}{}
-	riostat.Disk[disk1] = make(simplekvs, 1)
+	riostat.Disk[disk1] = make(cmn.SimpleKVs, 1)
 	riostat.Disk[disk1]["%util"] = "23.2"
 	util := maxUtilDisks(riostat.Disk, disks)
 	if math.Abs(23.2-util) > 0.0001 {
 		t.Errorf("Expected: 23.2. Actual: %f", util)
 	}
 	disk2 := "disk2"
-	riostat.Disk[disk2] = make(simplekvs, 1)
+	riostat.Disk[disk2] = make(cmn.SimpleKVs, 1)
 	riostat.Disk[disk2]["%util"] = "25.9"
 	disks[disk2] = struct{}{}
 	util = maxUtilDisks(riostat.Disk, disks)
@@ -177,76 +181,101 @@ func TestGetFSDiskUtilizationInvalid(t *testing.T) {
 }
 
 func TestSearchValidMountPath(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	oldMPs := setAvailableMountPaths("/")
-	longestPrefix := fqn2mountPath("/abc")
+	mpathInfo, _ := path2mpathInfo("/abc")
+	longestPrefix := mpathInfo.Path
 	testAssert(t, longestPrefix == "/", "Actual: [%s]. Expected: [%s]", longestPrefix, "/")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func TestSearchInvalidMountPath(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	oldMPs := setAvailableMountPaths("/")
-	longestPrefix := fqn2mountPath("xabc")
-	testAssert(t, longestPrefix == "", "Actual: [%s]. Expected: [%s]", longestPrefix, "")
+	mpathInfo, _ := path2mpathInfo("xabc")
+	testAssert(t, mpathInfo == nil, "Expected a nil mountpath info for fqn %q", "xabc")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func TestSearchWithNoMountPath(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	oldMPs := setAvailableMountPaths("")
-	longestPrefix := fqn2mountPath("xabc")
-	testAssert(t, longestPrefix == "", "Actual: [%s]. Expected: [%s]", longestPrefix, "")
+	mpathInfo, _ := path2mpathInfo("xabc")
+	testAssert(t, mpathInfo == nil, "Expected a nil mountpath info for fqn %q", "xabc")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func TestSearchWithASuffixToAnotherValue(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	dirs := []string{"/tmp/x", "/tmp/xabc", "/tmp/x/abc"}
 	createDirs(dirs...)
 	defer removeDirs(dirs...)
 
 	oldMPs := setAvailableMountPaths("/tmp", "/tmp/x")
-	longestPrefix := fqn2mountPath("xabc")
-	testAssert(t, longestPrefix == "", "Actual: [%s]. Expected: [%s]", longestPrefix, "")
-	longestPrefix = fqn2mountPath("/tmp/xabc")
+
+	mpathInfo, _ := path2mpathInfo("xabc")
+	testAssert(t, mpathInfo == nil, "Expected a nil mountpath info for fqn %q", "xabc")
+
+	mpathInfo, _ = path2mpathInfo("/tmp/xabc")
+	longestPrefix := mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp")
-	longestPrefix = fqn2mountPath("/tmp/x/abc")
+
+	mpathInfo, _ = path2mpathInfo("/tmp/x/abc")
+	longestPrefix = mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp/x", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp/x")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func TestSimilarCases(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	dirs := []string{"/tmp/abc", "/tmp/abx"}
 	createDirs(dirs...)
 	defer removeDirs(dirs...)
 
 	oldMPs := setAvailableMountPaths("/tmp/abc")
-	longestPrefix := fqn2mountPath("/tmp/abc")
+
+	mpathInfo, _ := path2mpathInfo("/tmp/abc")
+	longestPrefix := mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp/abc", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp/abc")
-	longestPrefix = fqn2mountPath("/tmp/abc/")
+
+	mpathInfo, _ = path2mpathInfo("/tmp/abc/")
+	longestPrefix = mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp/abc", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp/abc")
-	longestPrefix = fqn2mountPath("/abx")
-	testAssert(t, longestPrefix == "", "Actual: [%s]. Expected: [%s]", longestPrefix, "")
+
+	mpathInfo, _ = path2mpathInfo("/abx")
+	testAssert(t, mpathInfo == nil, "Expected a nil mountpath info for fqn %q", "/abx")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func TestSimilarCasesWithRoot(t *testing.T) {
+	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
 	oldMPs := setAvailableMountPaths("/tmp", "/")
-	longestPrefix := fqn2mountPath("/tmp")
+
+	mpathInfo, _ := path2mpathInfo("/tmp")
+	longestPrefix := mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp")
-	longestPrefix = fqn2mountPath("/tmp/")
+
+	mpathInfo, _ = path2mpathInfo("/tmp/")
+	longestPrefix = mpathInfo.Path
 	testAssert(t, longestPrefix == "/tmp", "Actual: [%s]. Expected: [%s]", longestPrefix, "/tmp")
-	longestPrefix = fqn2mountPath("/abx")
+
+	mpathInfo, _ = path2mpathInfo("/abx")
+	longestPrefix = mpathInfo.Path
 	testAssert(t, longestPrefix == "/", "Actual: [%s]. Expected: [%s]", longestPrefix, "/")
 	setAvailableMountPaths(oldMPs...)
 }
 
 func setAvailableMountPaths(paths ...string) []string {
-	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	fs.Mountpaths.DisableFsIDCheck()
+
+	availablePaths, _ := fs.Mountpaths.Mountpaths()
 	oldPaths := make([]string, 0, len(availablePaths))
 	for _, mpathInfo := range availablePaths {
 		oldPaths = append(oldPaths, mpathInfo.Path)
 	}
 
 	for _, mpathInfo := range availablePaths {
-		ctx.mountpaths.RemoveMountpath(mpathInfo.Path)
+		fs.Mountpaths.RemoveMountpath(mpathInfo.Path)
 	}
 
 	for _, path := range paths {
@@ -254,7 +283,7 @@ func setAvailableMountPaths(paths ...string) []string {
 			continue
 		}
 
-		ctx.mountpaths.AddMountpath(path)
+		fs.Mountpaths.AddMountpath(path)
 	}
 
 	return oldPaths
@@ -268,7 +297,7 @@ func testAssert(t *testing.T, condition bool, msg string, args ...interface{}) {
 
 func createDirs(dirs ...string) error {
 	for _, dir := range dirs {
-		err := CreateDir(dir)
+		err := cmn.CreateDir(dir)
 		if err != nil {
 			return err
 		}
@@ -280,5 +309,62 @@ func createDirs(dirs ...string) error {
 func removeDirs(dirs ...string) {
 	for _, dir := range dirs {
 		os.RemoveAll(dir)
+	}
+}
+
+func TestLsblk(t *testing.T) {
+	out := []byte(`{
+		   "blockdevices": [
+				{"name": "xvda", "size": "8G", "type": "disk", "mountpoint": null,
+					"children": [
+						{"name": "xvda1", "size": "8G", "type": "part", "mountpoint": "/"}
+					]
+				},
+				{"name": "xvdf", "size": "1.8T", "type": "disk", "mountpoint": null},
+				{"name": "xvdh", "size": "1.8T", "type": "disk", "mountpoint": null},
+				{"name": "xvdi", "size": "1.8T", "type": "disk", "mountpoint": null},
+				{"name": "xvdl", "size": "100G", "type": "disk", "mountpoint": "/dfc/xvdl"},
+				{"name": "xvdy", "mountpoint": null, "fstype": "linux_raid_member",
+					"children": [
+						{"name": "md2", "mountpoint": "/dfc/3", "fstype": "xfs"}
+					]
+				},
+				{"name": "xvdz", "mountpoint": null, "fstype": "linux_raid_member",
+					"children": [
+						{"name": "md2", "mountpoint": "/dfc/3", "fstype": "xfs"}
+					]
+				}
+			]
+		}
+	`)
+
+	type test struct {
+		desc      string
+		dev       string
+		diskCnt   int
+		diskNames []string
+	}
+	testSets := []test{
+		{"Single disk (no children)", "/dev/xvdi", 1, []string{"xvdi"}},
+		{"Single disk (with children)", "/dev/xvda1", 1, []string{"xvda"}},
+		{"Invalid device", "/dev/xvda7", 0, []string{}},
+		{"Device with 2 disks", "/dev/md2", 2, []string{"xvdz", "xvdy"}},
+	}
+
+	for _, tst := range testSets {
+		t.Log(tst.desc)
+		disks := lsblkOutput2disks(out, tst.dev)
+		if len(disks) != tst.diskCnt {
+			t.Errorf("Expected %d disk(s) for %s but found %d (%v)",
+				tst.diskCnt, tst.dev, len(disks), disks)
+		}
+		if tst.diskCnt != 0 {
+			for _, disk := range tst.diskNames {
+				if _, ok := disks[disk]; !ok {
+					t.Errorf("Disk %s is not detected for device %s (disk list %v)",
+						disk, tst.dev, disks)
+				}
+			}
+		}
 	}
 }

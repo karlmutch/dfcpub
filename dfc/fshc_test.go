@@ -1,7 +1,6 @@
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  */
-
 package dfc
 
 import (
@@ -9,35 +8,37 @@ import (
 	"os"
 	"testing"
 
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/NVIDIA/dfcpub/memsys"
 )
 
 const (
 	fsCheckerTmpDir = "/tmp/fshc"
 )
 
-func testTmpFileName(fname string) string {
-	return fname + "-tmp"
+func testMemInit(name string) {
+	gmem2 = &memsys.Mem2{Name: name}
+	_ = gmem2.Init(false /* ignore init-time errors */)
 }
 
 func testCheckerMountPaths() *fs.MountedFS {
-	CreateDir(fsCheckerTmpDir)
-	CreateDir(fsCheckerTmpDir + "/1")
-	CreateDir(fsCheckerTmpDir + "/2")
+	cmn.CreateDir(fsCheckerTmpDir)
+	cmn.CreateDir(fsCheckerTmpDir + "/1")
+	cmn.CreateDir(fsCheckerTmpDir + "/2")
+	cmn.CreateDir(fsCheckerTmpDir + "/3")
+	cmn.CreateDir(fsCheckerTmpDir + "/4")
 
-	avail := make(map[string]*fs.MountpathInfo)
-	unavail := make(map[string]*fs.MountpathInfo)
-
-	for i := 1; i < 4; i++ {
+	mountedFS := fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
+	mountedFS.DisableFsIDCheck()
+	for i := 1; i <= 4; i++ {
 		name := fmt.Sprintf("%s/%d", fsCheckerTmpDir, i)
-		avail[name] = &fs.MountpathInfo{Path: name}
+		mountedFS.AddMountpath(name)
 	}
-	unavail[fsCheckerTmpDir+"/4"] = &fs.MountpathInfo{Path: fsCheckerTmpDir + "/4"}
 
-	return &fs.MountedFS{
-		Available: avail,
-		Disabled:  unavail,
-	}
+	os.RemoveAll(fsCheckerTmpDir + "/3") // one folder is deleted
+	mountedFS.DisableMountpath(fsCheckerTmpDir + "/4")
+	return mountedFS
 }
 
 func testCheckerConfig() *fshcconf {
@@ -47,21 +48,39 @@ func testCheckerConfig() *fshcconf {
 	}
 }
 
+type MockFSDispatcher struct {
+	faultyPath    string
+	faultDetected bool
+}
+
+func newMockFSDispatcher(mpathToFail string) *MockFSDispatcher {
+	return &MockFSDispatcher{
+		faultyPath: mpathToFail,
+	}
+}
+
+func (d *MockFSDispatcher) DisableMountpath(path, why string) (disabled, exists bool) {
+	d.faultDetected = path == d.faultyPath
+	return d.faultDetected, true
+}
+
 func testCheckerCleanup() {
 	os.RemoveAll(fsCheckerTmpDir)
 }
 
 func TestFSCheckerMain(t *testing.T) {
-	fshc := newFSHealthChecker(testCheckerMountPaths(), testCheckerConfig(), testTmpFileName)
+	testMemInit("fshctest")
+	fshc := newFSHC(testCheckerMountPaths(), testCheckerConfig())
 
 	if fshc == nil {
 		t.Error("Failed to create fshc")
 	}
 
 	// intial state = 2 availble FSes - must pass
-	if len(fshc.mountpaths.Available) != 3 || len(fshc.mountpaths.Disabled) != 1 {
+	availablePaths, disabledPaths := fshc.mountpaths.Mountpaths()
+	if len(availablePaths) != 3 || len(disabledPaths) != 1 {
 		t.Errorf("Invalid number of mountpaths at start: %v - %v",
-			fshc.mountpaths.Available, fshc.mountpaths.Disabled)
+			availablePaths, disabledPaths)
 	}
 
 	// inaccessible mountpath
@@ -83,16 +102,12 @@ func TestFSCheckerMain(t *testing.T) {
 
 	// failed mountpath must be disabled
 	failedMpath := fsCheckerTmpDir + "/3"
+	dispatcher := newMockFSDispatcher(failedMpath)
+	fshc.SetDispatcher(dispatcher)
 	fshc.runMpathTest(failedMpath, failedMpath+"/dir/testfile")
-	if len(fshc.mountpaths.Available) != 2 || len(fshc.mountpaths.Disabled) != 2 {
-		t.Errorf("Failed mountpath %s must be detected: %v - %v",
-			failedMpath, fshc.mountpaths.Available, fshc.mountpaths.Disabled)
-	}
-	if len(fshc.mountpaths.Disabled) == 1 {
-		if _, ok := fshc.mountpaths.Disabled[failedMpath]; !ok {
-			t.Errorf("Incorrect mountpath was disabled. Failed one: %s, disabled: %v",
-				failedMpath, fshc.mountpaths.Disabled)
-		}
+
+	if !dispatcher.faultDetected {
+		t.Errorf("Faulty mountpath %s was not detected", failedMpath)
 	}
 
 	// decision making function
@@ -103,7 +118,7 @@ func TestFSCheckerMain(t *testing.T) {
 	}
 	testList := []tstInfo{
 		{"Inaccessible mountpath", 0, 0, false, false},
-		{"Healthy mounpath", 0, 0, true, true},
+		{"Healthy mountpath", 0, 0, true, true},
 		{"Unstable but OK mountpath", 1, 1, true, true},
 		{"Reads failed", 3, 0, true, false},
 		{"Writes failed", 1, 3, true, false},
@@ -112,7 +127,7 @@ func TestFSCheckerMain(t *testing.T) {
 
 	for _, tst := range testList {
 		fmt.Printf("Test: %s.\n", tst.title)
-		res := fshc.isTestPassed("/tmp", tst.readErrs, tst.writeErrs, tst.avail)
+		res, _ := fshc.isTestPassed("/tmp", tst.readErrs, tst.writeErrs, tst.avail)
 		if res == tst.result {
 			fmt.Printf("    PASSED\n")
 		} else {

@@ -1,14 +1,14 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -17,10 +17,75 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/dfc/statsd"
+	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/json-iterator/go"
 )
 
+//==============================
+//
+// constants
+//
+//==============================
+
 const logsTotalSizeCheckTime = time.Hour * 3
+
+const (
+	statsKindCounter = "counter"
+	statsKindLatency = "latency"
+)
+
+// Stats common to proxyCoreStats and targetCoreStats
+const (
+	statGetCount            = "get.n"
+	statPutCount            = "put.n"
+	statPostCount           = "pst.n"
+	statDeleteCount         = "del.n"
+	statRenameCount         = "ren.n"
+	statListCount           = "lst.n"
+	statGetLatency          = "get.μs"
+	statListLatency         = "lst.μs"
+	statKeepAliveMinLatency = "kalive.μs.min"
+	statKeepAliveMaxLatency = "kalive.μs.max"
+	statKeepAliveLatency    = "kalive.μs"
+	statUptimeLatency       = "uptime.μs"
+	statErrCount            = "err.n"
+	statErrGetCount         = "err.get.n"
+	statErrDeleteCount      = "err.delete.n"
+	statErrPostCount        = "err.post.n"
+	statErrPutCount         = "err.put.n"
+	statErrHeadCount        = "err.head.n"
+	statErrListCount        = "err.list.n"
+	statErrRangeCount       = "err.range.n"
+)
+
+// Stats only found in targetCoreStats
+const (
+	statPutLatency       = "put.μs"
+	statGetColdCount     = "get.cold.n"
+	statGetColdSize      = "get.cold.size"
+	statLruEvictSize     = "lru.evict.size"
+	statLruEvictCount    = "lru.evict.n"
+	statTxCount          = "tx.n"
+	statTxSize           = "tx.size"
+	statRxCount          = "rx.n"
+	statRxSize           = "rx.size"
+	statPrefetchCount    = "pre.n"
+	statPrefetchSize     = "pre.size"
+	statVerChangeCount   = "vchange.n"
+	statVerChangeSize    = "vchange.size"
+	statErrCksumCount    = "err.cksum.n"
+	statErrCksumSize     = "err.cksum.size"
+	statGetRedirLatency  = "get.redir.μs"
+	statPutRedirLatency  = "put.redir.μs"
+	statRebalGlobalCount = "reb.global.n"
+	statRebalLocalCount  = "reb.local.n"
+	statRebalGlobalSize  = "reb.global.size"
+	statRebalLocalSize   = "reb.local.size"
+	statReplPutCount     = "replication.put.n"
+	statReplPutLatency   = "replication.put.µs"
+)
 
 //==============================
 //
@@ -39,69 +104,65 @@ type fscapacity struct {
 type statslogger interface {
 	log() (runlru bool)
 	housekeep(bool)
+	doAdd(nv namedVal64)
 }
 
 // implemented by the ***CoreStats types
 type statsif interface {
 	add(name string, val int64)
-	addMany(nameval ...interface{})
+	addErrorHTTP(method string, val int64)
+	addMany(namedVal64 ...namedVal64)
 }
 
-// TODO: use static map[string]int64
+type namedVal64 struct {
+	name string
+	val  int64
+}
+
+// Stats are monitored using a map of stat names (key)
+// to statInstances (values). There are two main types
+// of stats: counter and latency, which are described using the
+// kind field. Only latency stats have associatedVals to them
+// that are used in calculating latency measurements.
+type statsInstance struct {
+	Value         int64 `json:"value"`
+	kind          string
+	associatedVal int64
+}
+
+type statsTracker map[string]*statsInstance
+
 type proxyCoreStats struct {
-	Numget      int64 `json:"numget"`
-	Numput      int64 `json:"numput"`
-	Numpost     int64 `json:"numpost"`
-	Numdelete   int64 `json:"numdelete"`
-	Numrename   int64 `json:"numrename"`
-	Numlist     int64 `json:"numlist"`
-	Getlatency  int64 `json:"getlatency"`  // microseconds
-	Putlatency  int64 `json:"putlatency"`  // ---/---
-	Listlatency int64 `json:"listlatency"` // ---/---
-	Numerr      int64 `json:"numerr"`
+	Tracker statsTracker
 	// omitempty
-	ngets  int64
-	nputs  int64
-	nlists int64
-	logged bool
+	statsdC *statsd.Client
+	logged  bool
 }
 
 type targetCoreStats struct {
 	proxyCoreStats
-	Numcoldget       int64 `json:"numcoldget"`
-	Bytesloaded      int64 `json:"bytesloaded"`
-	Bytesevicted     int64 `json:"bytesevicted"`
-	Filesevicted     int64 `json:"filesevicted"`
-	Numsentfiles     int64 `json:"numsentfiles"`
-	Numsentbytes     int64 `json:"numsentbytes"`
-	Numrecvfiles     int64 `json:"numrecvfiles"`
-	Numrecvbytes     int64 `json:"numrecvbytes"`
-	Numprefetch      int64 `json:"numprefetch"`
-	Bytesprefetched  int64 `json:"bytesprefetched"`
-	Numvchanged      int64 `json:"numvchanged"`
-	Bytesvchanged    int64 `json:"bytesvchanged"`
-	Numbadchecksum   int64 `json:"numbadchecksum"`
-	Bytesbadchecksum int64 `json:"bytesbadchecksum"`
 }
 
 type statsrunner struct {
 	sync.RWMutex
-	namedrunner
-	chsts chan struct{}
+	cmn.Named
+	stopCh    chan struct{}
+	workCh    chan namedVal64
+	starttime time.Time
 }
 
 type proxystatsrunner struct {
-	statsrunner `json:"-"`
-	Core        proxyCoreStats `json:"core"`
+	statsrunner
+	Core *proxyCoreStats `json:"core"`
 }
 
 type storstatsrunner struct {
-	statsrunner `json:"-"`
-	Core        targetCoreStats        `json:"core"`
-	Capacity    map[string]*fscapacity `json:"capacity"`
+	statsrunner
+	Core     *targetCoreStats       `json:"core"`
+	Capacity map[string]*fscapacity `json:"capacity"`
 	// iostat
-	CPUidle string               `json:"cpuidle"`
-	Disk    map[string]simplekvs `json:"disk"`
+	CPUidle string                      `json:"cpuidle"`
+	Disk    map[string]cmn.SimpleKVs `json:"disk"`
 	// omitempty
 	timeUpdatedCapacity time.Time
 	timeCheckedLogSizes time.Time
@@ -114,22 +175,20 @@ type ClusterStats struct {
 }
 
 type ClusterStatsRaw struct {
-	Proxy  *proxyCoreStats            `json:"proxy"`
-	Target map[string]json.RawMessage `json:"target"`
+	Proxy  *proxyCoreStats                `json:"proxy"`
+	Target map[string]jsoniter.RawMessage `json:"target"`
 }
 
 type iostatrunner struct {
 	sync.RWMutex
-	namedrunner
-	chsts       chan struct{}
+	cmn.Named
+	stopCh      chan struct{}
 	CPUidle     string
 	metricnames []string
-	Disk        map[string]simplekvs
+	Disk        map[string]cmn.SimpleKVs
 	process     *os.Process // running iostat process. Required so it can be killed later
-	fsdisks     map[string]StringSet
+	fsdisks     map[string]cmn.StringSet
 }
-
-type StringSet map[string]struct{}
 
 type (
 	XactionStatsRetriever interface {
@@ -137,8 +196,8 @@ type (
 	}
 
 	XactionStats struct {
-		Kind        string                     `json:"kind"`
-		TargetStats map[string]json.RawMessage `json:"target"`
+		Kind        string                         `json:"kind"`
+		TargetStats map[string]jsoniter.RawMessage `json:"target"`
 	}
 
 	XactionDetails struct {
@@ -175,40 +234,163 @@ type (
 
 //==================
 //
+// common statsTracker
+//
+//==================
+
+func (stats statsTracker) register(key string, kind string) {
+	cmn.Assert(kind == statsKindCounter || kind == statsKindLatency, "Invalid stats kind "+kind)
+	stats[key] = &statsInstance{0, kind, 0}
+}
+
+// These stats are common to proxyCoreStats and targetCoreStats
+func (stats statsTracker) registerCommonStats() {
+	cmn.Assert(stats != nil, "Error attempting to register stats into nil map")
+
+	stats.register(statGetCount, statsKindCounter)
+	stats.register(statPutCount, statsKindCounter)
+	stats.register(statPostCount, statsKindCounter)
+	stats.register(statDeleteCount, statsKindCounter)
+	stats.register(statRenameCount, statsKindCounter)
+	stats.register(statListCount, statsKindCounter)
+	stats.register(statGetLatency, statsKindCounter)
+	stats.register(statListLatency, statsKindLatency)
+	stats.register(statKeepAliveMinLatency, statsKindLatency)
+	stats.register(statKeepAliveMaxLatency, statsKindLatency)
+	stats.register(statKeepAliveLatency, statsKindLatency)
+	stats.register(statUptimeLatency, statsKindLatency)
+	stats.register(statErrCount, statsKindCounter)
+	stats.register(statErrGetCount, statsKindCounter)
+	stats.register(statErrDeleteCount, statsKindCounter)
+	stats.register(statErrPostCount, statsKindCounter)
+	stats.register(statErrPutCount, statsKindCounter)
+	stats.register(statErrHeadCount, statsKindCounter)
+	stats.register(statErrListCount, statsKindCounter)
+	stats.register(statErrRangeCount, statsKindCounter)
+}
+
+func (p *proxyCoreStats) initStatsTracker() {
+	p.Tracker = statsTracker(map[string]*statsInstance{})
+	p.Tracker.registerCommonStats()
+}
+
+func (t *targetCoreStats) initStatsTracker() {
+	// Call the embedded procxyCoreStats init method then register our own stats
+	t.proxyCoreStats.initStatsTracker()
+
+	t.Tracker.register(statPutLatency, statsKindLatency)
+	t.Tracker.register(statGetColdCount, statsKindCounter)
+	t.Tracker.register(statGetColdSize, statsKindCounter)
+	t.Tracker.register(statLruEvictSize, statsKindCounter)
+	t.Tracker.register(statLruEvictCount, statsKindCounter)
+	t.Tracker.register(statTxCount, statsKindCounter)
+	t.Tracker.register(statTxSize, statsKindCounter)
+	t.Tracker.register(statRxCount, statsKindCounter)
+	t.Tracker.register(statRxSize, statsKindCounter)
+	t.Tracker.register(statPrefetchCount, statsKindCounter)
+	t.Tracker.register(statPrefetchSize, statsKindCounter)
+	t.Tracker.register(statVerChangeCount, statsKindCounter)
+	t.Tracker.register(statVerChangeSize, statsKindCounter)
+	t.Tracker.register(statErrCksumCount, statsKindCounter)
+	t.Tracker.register(statErrCksumSize, statsKindCounter)
+	t.Tracker.register(statGetRedirLatency, statsKindLatency)
+	t.Tracker.register(statPutRedirLatency, statsKindLatency)
+	t.Tracker.register(statRebalGlobalCount, statsKindCounter)
+	t.Tracker.register(statRebalLocalCount, statsKindCounter)
+	t.Tracker.register(statRebalGlobalSize, statsKindCounter)
+	t.Tracker.register(statRebalLocalSize, statsKindCounter)
+	t.Tracker.register(statReplPutCount, statsKindCounter)
+	t.Tracker.register(statReplPutLatency, statsKindLatency)
+}
+
+func (p *proxyCoreStats) MarshalJSON() ([]byte, error) {
+	return jsoniter.Marshal(p.Tracker)
+}
+
+func (p *proxyCoreStats) UnmarshalJSON(b []byte) error {
+	return jsoniter.Unmarshal(b, &p.Tracker)
+}
+
+func (t *targetCoreStats) MarshalJSON() ([]byte, error) {
+	return jsoniter.Marshal(t.Tracker)
+}
+
+func (t *targetCoreStats) UnmarshalJSON(b []byte) error {
+	return jsoniter.Unmarshal(b, &t.Tracker)
+}
+
+func (stat *statsInstance) MarshalJSON() ([]byte, error) {
+	return jsoniter.Marshal(stat.Value)
+}
+
+func (stat *statsInstance) UnmarshalJSON(b []byte) error {
+	return jsoniter.Unmarshal(b, &stat.Value)
+}
+
+//==================
+//
 // common statsunner
 //
 //==================
 func (r *statsrunner) runcommon(logger statslogger) error {
-	r.chsts = make(chan struct{}, 4)
+	r.stopCh = make(chan struct{}, 4)
+	r.workCh = make(chan namedVal64, 256)
+	r.starttime = time.Now()
 
-	glog.Infof("Starting %s", r.name)
+	glog.Infof("Starting %s", r.Getname())
 	ticker := time.NewTicker(ctx.config.Periodic.StatsTime)
 	for {
 		select {
+		case nv, ok := <-r.workCh:
+			if ok {
+				logger.doAdd(nv)
+			}
 		case <-ticker.C:
 			runlru := logger.log()
 			logger.housekeep(runlru)
-		case <-r.chsts:
+		case <-r.stopCh:
 			ticker.Stop()
 			return nil
 		}
 	}
 }
 
-func (r *statsrunner) stop(err error) {
-	glog.Infof("Stopping %s, err: %v", r.name, err)
-	var v struct{}
-	r.chsts <- v
-	close(r.chsts)
+func (r *statsrunner) Stop(err error) {
+	glog.Infof("Stopping %s, err: %v", r.Getname(), err)
+	r.stopCh <- struct{}{}
+	close(r.stopCh)
 }
 
 // statslogger interface impl
-func (r *statsrunner) log() (runlru bool) {
-	assert(false)
-	return false
+func (r *statsrunner) log() (runlru bool)  { return false }
+func (r *statsrunner) housekeep(bool)      {}
+func (r *statsrunner) doAdd(nv namedVal64) {}
+
+func (r *statsrunner) addMany(nvs ...namedVal64) {
+	for _, nv := range nvs {
+		r.workCh <- nv
+	}
 }
 
-func (r *statsrunner) housekeep(bool) {
+func (r *statsrunner) add(name string, val int64) {
+	r.workCh <- namedVal64{name, val}
+}
+
+func (r *statsrunner) addErrorHTTP(method string, val int64) {
+	switch method {
+	case http.MethodGet:
+		r.workCh <- namedVal64{statErrGetCount, val}
+	case http.MethodDelete:
+		r.workCh <- namedVal64{statErrDeleteCount, val}
+	case http.MethodPost:
+		r.workCh <- namedVal64{statErrPostCount, val}
+	case http.MethodPut:
+		r.workCh <- namedVal64{statErrPutCount, val}
+	case http.MethodHead:
+		r.workCh <- namedVal64{statErrHeadCount, val}
+	default:
+		r.workCh <- namedVal64{statErrCount, val}
+	}
 }
 
 //=================
@@ -216,8 +398,12 @@ func (r *statsrunner) housekeep(bool) {
 // proxystatsrunner
 //
 //=================
-func (r *proxystatsrunner) run() error {
+func (r *proxystatsrunner) Run() error {
 	return r.runcommon(r)
+}
+func (r *proxystatsrunner) init() {
+	r.Core = &proxyCoreStats{}
+	r.Core.initStatsTracker()
 }
 
 // statslogger interface impl
@@ -227,18 +413,20 @@ func (r *proxystatsrunner) log() (runlru bool) {
 		r.Unlock()
 		return
 	}
-	if r.Core.ngets > 0 {
-		r.Core.Getlatency /= r.Core.ngets
+	for _, v := range r.Core.Tracker {
+		if v.kind == statsKindLatency && v.associatedVal > 0 {
+			v.Value /= v.associatedVal
+		}
 	}
-	if r.Core.nputs > 0 {
-		r.Core.Putlatency /= r.Core.nputs
+	b, err := jsoniter.Marshal(r.Core)
+
+	// reset all the latency stats only
+	for _, v := range r.Core.Tracker {
+		if v.kind == statsKindLatency {
+			v.Value = 0
+			v.associatedVal = 0
+		}
 	}
-	if r.Core.nlists > 0 {
-		r.Core.Listlatency /= r.Core.nlists
-	}
-	b, err := json.Marshal(r.Core)
-	r.Core.Getlatency, r.Core.Putlatency, r.Core.Listlatency = 0, 0, 0
-	r.Core.ngets, r.Core.nputs, r.Core.nlists = 0, 0, 0
 	r.Unlock()
 
 	if err == nil {
@@ -248,59 +436,29 @@ func (r *proxystatsrunner) log() (runlru bool) {
 	return
 }
 
-func (r *proxystatsrunner) add(name string, val int64) {
+func (r *proxystatsrunner) doAdd(nv namedVal64) {
 	r.Lock()
-	r.addL(name, val)
+	s := r.Core
+	s.doAdd(nv.name, nv.val)
 	r.Unlock()
 }
 
-func (r *proxystatsrunner) addMany(nameval ...interface{}) {
-	r.Lock()
-	i := 0
-	for i < len(nameval) {
-		statsname, ok := nameval[i].(string)
-		assert(ok, fmt.Sprintf("Invalid stats name: %v, %T", nameval[i], nameval[i]))
-		i++
-		statsval, ok := nameval[i].(int64)
-		assert(ok, fmt.Sprintf("Invalid stats type: %v, %T", nameval[i], nameval[i]))
-		i++
-		r.addL(statsname, statsval)
+func (s *proxyCoreStats) doAdd(name string, val int64) {
+	if v, ok := s.Tracker[name]; !ok {
+		cmn.Assert(false, "Invalid stats name "+name)
+	} else if v.kind == statsKindLatency {
+		s.Tracker[name].associatedVal++
+		s.statsdC.Send(name,
+			metric{statsd.Counter, "count", 1},
+			metric{statsd.Timer, "latency", float64(time.Duration(val) / time.Millisecond)})
+		val = int64(time.Duration(val) / time.Microsecond)
+	} else {
+		switch name {
+		case statPostCount, statDeleteCount, statRenameCount:
+			s.statsdC.Send(name, metric{statsd.Counter, "count", val})
+		}
 	}
-	r.Unlock()
-}
-
-func (r *proxystatsrunner) addL(name string, val int64) {
-	var v *int64
-	s := &r.Core
-	switch name {
-	case "numget":
-		v = &s.Numget
-	case "numput":
-		v = &s.Numput
-	case "numpost":
-		v = &s.Numpost
-	case "numdelete":
-		v = &s.Numdelete
-	case "numrename":
-		v = &s.Numrename
-	case "numlist":
-		v = &s.Numlist
-	case "getlatency":
-		v = &s.Getlatency
-		s.ngets++
-	case "putlatency":
-		v = &s.Putlatency
-		s.nputs++
-	case "listlatency":
-		v = &s.Listlatency
-		s.nlists++
-	case "numerr":
-		v = &s.Numerr
-	default:
-		assert(false, "Invalid stats name "+name)
-	}
-	*v += val
-	// FIXME: This causes a race between this line and the 'logged = true' line in log().
+	s.Tracker[name].Value += val
 	s.logged = false
 }
 
@@ -309,9 +467,23 @@ func (r *proxystatsrunner) addL(name string, val int64) {
 // storstatsrunner
 //
 //================
-func (r *storstatsrunner) run() error {
-	r.init()
+func newFSCapacity(statfs *syscall.Statfs_t) *fscapacity {
+	return &fscapacity{
+		Used:    (statfs.Blocks - statfs.Bavail) * uint64(statfs.Bsize),
+		Avail:   statfs.Bavail * uint64(statfs.Bsize),
+		Usedpct: uint32((statfs.Blocks - statfs.Bavail) * 100 / statfs.Blocks),
+	}
+}
+
+func (r *storstatsrunner) Run() error {
 	return r.runcommon(r)
+}
+
+func (r *storstatsrunner) init() {
+	r.Disk = make(map[string]cmn.SimpleKVs, 8)
+	r.updateCapacity()
+	r.Core = &targetCoreStats{}
+	r.Core.initStatsTracker()
 }
 
 func (r *storstatsrunner) log() (runlru bool) {
@@ -322,19 +494,22 @@ func (r *storstatsrunner) log() (runlru bool) {
 	}
 	lines := make([]string, 0, 16)
 	// core stats
-	if r.Core.ngets > 0 {
-		r.Core.Getlatency /= r.Core.ngets
+	for _, v := range r.Core.Tracker {
+		if v.kind == statsKindLatency && v.associatedVal > 0 {
+			v.Value /= v.associatedVal
+		}
 	}
-	if r.Core.nputs > 0 {
-		r.Core.Putlatency /= r.Core.nputs
-	}
-	if r.Core.nlists > 0 {
-		r.Core.Listlatency /= r.Core.nlists
-	}
+	r.Core.Tracker[statUptimeLatency].Value = int64(time.Since(r.starttime) / time.Microsecond)
 
-	b, err := json.Marshal(r.Core)
-	r.Core.Getlatency, r.Core.Putlatency, r.Core.Listlatency = 0, 0, 0
-	r.Core.ngets, r.Core.nputs, r.Core.nlists = 0, 0, 0
+	b, err := jsoniter.Marshal(r.Core)
+
+	// reset all the latency stats only
+	for _, v := range r.Core.Tracker {
+		if v.kind == statsKindLatency {
+			v.Value = 0
+			v.associatedVal = 0
+		}
+	}
 	if err == nil {
 		lines = append(lines, string(b))
 	}
@@ -342,9 +517,8 @@ func (r *storstatsrunner) log() (runlru bool) {
 	if time.Since(r.timeUpdatedCapacity) >= ctx.config.LRU.CapacityUpdTime {
 		runlru = r.updateCapacity()
 		r.timeUpdatedCapacity = time.Now()
-		for _, mpath := range r.fsmap {
-			fscapacity := r.Capacity[mpath]
-			b, err := json.Marshal(fscapacity)
+		for mpath, fsCapacity := range r.Capacity {
+			b, err := jsoniter.Marshal(fsCapacity)
 			if err == nil {
 				lines = append(lines, mpath+": "+string(b))
 			}
@@ -360,14 +534,16 @@ func (r *storstatsrunner) log() (runlru bool) {
 		if riostat.isZeroUtil(dev) {
 			continue // skip zeros
 		}
-		b, err := json.Marshal(r.Disk[dev])
+		b, err := jsoniter.Marshal(r.Disk[dev])
 		if err == nil {
 			lines = append(lines, dev+": "+string(b))
 		}
 
-		var stats []metric
+		stats := make([]metric, len(iometrics))
+		idx := 0
 		for k, v := range iometrics {
-			stats = append(stats, metric{statsd.Gauge, k, v})
+			stats[idx] = metric{statsd.Gauge, k, v}
+			idx++
 		}
 		gettarget().statsdC.Send("iostat_"+dev, stats...)
 	}
@@ -415,7 +591,7 @@ func (r *storstatsrunner) removeLogs(maxtotal uint64) {
 	for _, logtype := range logtypes {
 		var (
 			tot   = int64(0)
-			infos = []os.FileInfo{}
+			infos = make([]os.FileInfo, 0, len(logfinfos))
 		)
 		for _, logfi := range logfinfos {
 			if logfi.IsDir() {
@@ -465,137 +641,70 @@ func (r *storstatsrunner) removeOlderLogs(tot, maxtotal int64, filteredInfos []o
 }
 
 func (r *storstatsrunner) updateCapacity() (runlru bool) {
-	for _, mpath := range r.fsmap {
+	availableMountpaths, _ := fs.Mountpaths.Mountpaths()
+	capacities := make(map[string]*fscapacity, len(availableMountpaths))
+
+	for mpath := range availableMountpaths {
 		statfs := &syscall.Statfs_t{}
 		if err := syscall.Statfs(mpath, statfs); err != nil {
 			glog.Errorf("Failed to statfs mp %q, err: %v", mpath, err)
 			continue
 		}
-		fscapacity := r.Capacity[mpath]
-		r.fillfscap(fscapacity, statfs)
-		if fscapacity.Usedpct >= ctx.config.LRU.HighWM {
+		fsCap := newFSCapacity(statfs)
+		capacities[mpath] = fsCap
+		if fsCap.Usedpct >= ctx.config.LRU.HighWM {
 			runlru = true
 		}
 	}
+
+	r.Capacity = capacities
 	return
 }
 
-func (r *storstatsrunner) fillfscap(fscapacity *fscapacity, statfs *syscall.Statfs_t) {
-	fscapacity.Used = (statfs.Blocks - statfs.Bavail) * uint64(statfs.Bsize)
-	fscapacity.Avail = statfs.Bavail * uint64(statfs.Bsize)
-	fscapacity.Usedpct = uint32((statfs.Blocks - statfs.Bavail) * 100 / statfs.Blocks)
-}
-
-func (r *storstatsrunner) init() {
-	r.Disk = make(map[string]simplekvs, 8)
-	// local filesystems and their cap-s
-	r.Capacity = make(map[string]*fscapacity)
-	r.fsmap = make(map[syscall.Fsid]string)
-
-	availablePaths, _ := ctx.mountpaths.Mountpaths()
-	for _, mpathInfo := range availablePaths {
-		mpath := mpathInfo.Path
-		mp1, ok := r.fsmap[mpathInfo.Fsid]
-		if ok {
-			// the same filesystem: usage cannot be different..
-			assert(r.Capacity[mp1] != nil)
-			r.Capacity[mpath] = r.Capacity[mp1]
-			continue
-		}
-		statfs := &syscall.Statfs_t{}
-		if err := syscall.Statfs(mpath, statfs); err != nil {
-			glog.Errorf("Failed to statfs mp %q, err: %v", mpath, err)
-			continue
-		}
-		r.fsmap[mpathInfo.Fsid] = mpath
-		r.Capacity[mpath] = &fscapacity{}
-		r.fillfscap(r.Capacity[mpath], statfs)
-	}
-}
-
-func (r *storstatsrunner) add(name string, val int64) {
+func (r *storstatsrunner) doAdd(nv namedVal64) {
 	r.Lock()
-	r.addL(name, val)
+	s := r.Core
+	s.doAdd(nv.name, nv.val)
 	r.Unlock()
 }
 
-// FIXME: copy paste
-func (r *storstatsrunner) addMany(nameval ...interface{}) {
-	r.Lock()
-	i := 0
-	for i < len(nameval) {
-		statsname, ok := nameval[i].(string)
-		assert(ok, fmt.Sprintf("Invalid stats name: %v, %T", nameval[i], nameval[i]))
-		i++
-		statsval, ok := nameval[i].(int64)
-		assert(ok, fmt.Sprintf("Invalid stats type: %v, %T", nameval[i], nameval[i]))
-		i++
-		r.addL(statsname, statsval)
+func (s *targetCoreStats) doAdd(name string, val int64) {
+	if _, ok := s.Tracker[name]; !ok {
+		cmn.Assert(false, "Invalid stats name "+name)
 	}
-	r.Unlock()
-}
 
-func (r *storstatsrunner) addL(name string, val int64) {
-	var v *int64
-	s := &r.Core
 	switch name {
 	// common
-	case "numget":
-		v = &s.Numget
-	case "numput":
-		v = &s.Numput
-	case "numpost":
-		v = &s.Numpost
-	case "numdelete":
-		v = &s.Numdelete
-	case "numrename":
-		v = &s.Numrename
-	case "numlist":
-		v = &s.Numlist
-	case "getlatency":
-		v = &s.Getlatency
-		s.ngets++
-	case "putlatency":
-		v = &s.Putlatency
-		s.nputs++
-	case "listlatency":
-		v = &s.Listlatency
-		s.nlists++
-	case "numerr":
-		v = &s.Numerr
+	case statGetCount, statPutCount, statPostCount, statDeleteCount, statRenameCount, statListCount,
+		statGetLatency, statPutLatency, statListLatency,
+		statKeepAliveLatency, statKeepAliveMinLatency, statKeepAliveMaxLatency,
+		statErrCount, statErrGetCount, statErrDeleteCount, statErrPostCount,
+		statErrPutCount, statErrHeadCount, statErrListCount, statErrRangeCount:
+		s.proxyCoreStats.doAdd(name, val)
+		return
 	// target only
-	case "numcoldget":
-		v = &s.Numcoldget
-	case "bytesloaded":
-		v = &s.Bytesloaded
-	case "bytesevicted":
-		v = &s.Bytesevicted
-	case "filesevicted":
-		v = &s.Filesevicted
-	case "numsentfiles":
-		v = &s.Numsentfiles
-	case "numsentbytes":
-		v = &s.Numsentbytes
-	case "numrecvfiles":
-		v = &s.Numrecvfiles
-	case "numrecvbytes":
-		v = &s.Numrecvbytes
-	case "numprefetch":
-		v = &s.Numprefetch
-	case "bytesprefetched":
-		v = &s.Bytesprefetched
-	case "numvchanged":
-		v = &s.Numvchanged
-	case "bytesvchanged":
-		v = &s.Bytesvchanged
-	case "numbadchecksum":
-		v = &s.Numbadchecksum
-	case "bytesbadchecksum":
-		v = &s.Bytesbadchecksum
-	default:
-		assert(false, "Invalid stats name "+name)
+	case statGetColdSize:
+		s.statsdC.Send("get.cold",
+			metric{statsd.Counter, "count", 1},
+			metric{statsd.Counter, "get.cold.size", val})
+	case statVerChangeSize:
+		s.statsdC.Send("get.cold",
+			metric{statsd.Counter, "vchanged", 1},
+			metric{statsd.Counter, "vchange.size", val})
+	case statLruEvictSize, statTxSize, statRxSize, statErrCksumSize: // byte stats
+		s.statsdC.Send(name, metric{statsd.Counter, "bytes", val})
+	case statLruEvictCount, statTxCount, statRxCount: // files stats
+		s.statsdC.Send(name, metric{statsd.Counter, "files", val})
+	case statErrCksumCount: // counter stats
+		s.statsdC.Send(name, metric{statsd.Counter, "count", val})
+	case statGetRedirLatency, statPutRedirLatency: // latency stats
+		s.Tracker[name].associatedVal++
+		s.statsdC.Send(name,
+			metric{statsd.Counter, "count", 1},
+			metric{statsd.Timer, "latency", float64(time.Duration(val) / time.Millisecond)})
+		val = int64(time.Duration(val) / time.Microsecond)
 	}
-	*v += val
+	s.Tracker[name].Value += val
 	s.logged = false
 }
 
@@ -604,12 +713,12 @@ func (p PrefetchTargetStats) getStats(allXactionDetails []XactionDetails) []byte
 	rstor.RLock()
 	prefetchXactionStats := PrefetchTargetStats{
 		Xactions:           allXactionDetails,
-		NumBytesPrefetched: rstor.Core.Numprefetch,
-		NumFilesPrefetched: rstor.Core.Bytesprefetched,
+		NumBytesPrefetched: rstor.Core.Tracker[statPrefetchCount].Value,
+		NumFilesPrefetched: rstor.Core.Tracker[statPrefetchSize].Value,
 	}
 	rstor.RUnlock()
-	jsonBytes, err := json.Marshal(prefetchXactionStats)
-	assert(err == nil, err)
+	jsonBytes, err := jsoniter.Marshal(prefetchXactionStats)
+	cmn.Assert(err == nil, err)
 	return jsonBytes
 }
 
@@ -618,30 +727,15 @@ func (r RebalanceTargetStats) getStats(allXactionDetails []XactionDetails) []byt
 	rstor.RLock()
 	rebalanceXactionStats := RebalanceTargetStats{
 		Xactions:     allXactionDetails,
-		NumRecvBytes: rstor.Core.Numrecvbytes,
-		NumRecvFiles: rstor.Core.Numrecvfiles,
-		NumSentBytes: rstor.Core.Numsentbytes,
-		NumSentFiles: rstor.Core.Numsentfiles,
+		NumRecvBytes: rstor.Core.Tracker[statRxSize].Value,
+		NumRecvFiles: rstor.Core.Tracker[statRxCount].Value,
+		NumSentBytes: rstor.Core.Tracker[statTxSize].Value,
+		NumSentFiles: rstor.Core.Tracker[statTxCount].Value,
 	}
 	rstor.RUnlock()
-	jsonBytes, err := json.Marshal(rebalanceXactionStats)
-	assert(err == nil, err)
+	jsonBytes, err := jsoniter.Marshal(rebalanceXactionStats)
+	cmn.Assert(err == nil, err)
 	return jsonBytes
-}
-
-func getToEvict(mpath string, hwm uint32, lwm uint32) (int64, error) {
-	blocks, bavail, bsize, err := getFSStats(mpath)
-	if err != nil {
-		return -1, err
-	}
-	used := blocks - bavail
-	usedpct := used * 100 / blocks
-	glog.Infof("Blocks %d Bavail %d used %d%% hwm %d%% lwm %d%%", blocks, bavail, usedpct, hwm, lwm)
-	if usedpct < uint64(hwm) {
-		return 0, nil // 0 to evict
-	}
-	lwmblocks := blocks * uint64(lwm) / 100
-	return int64(used-lwmblocks) * bsize, nil
 }
 
 func getFSUsedPercentage(path string) (usedPercentage uint64, ok bool) {

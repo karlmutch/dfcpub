@@ -7,9 +7,7 @@ package main
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"html"
 	"io"
 	"io/ioutil"
 	"net"
@@ -19,7 +17,8 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
-	"github.com/NVIDIA/dfcpub/dfc"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/json-iterator/go"
 )
 
 const (
@@ -48,21 +47,6 @@ type tokenMsg struct {
 //-------------------------------------
 // global functions (borrowed from DFC)
 //-------------------------------------
-
-func invalhdlr(w http.ResponseWriter, r *http.Request, msg string, errcode ...int) {
-	code := http.StatusInternalServerError
-	if len(errcode) != 0 {
-		code = errcode[0]
-	}
-	s := http.StatusText(code)
-	s += ": " + r.Method + " " + r.URL.Path + " from " + r.RemoteAddr
-	if msg != "" {
-		s += ", " + msg
-	}
-
-	http.Error(w, s, code)
-}
-
 func isSyscallWriteError(err error) bool {
 	switch e := err.(type) {
 	case *url.Error:
@@ -77,7 +61,17 @@ func isSyscallWriteError(err error) bool {
 }
 
 func isValidProvider(prov string) bool {
-	return prov == dfc.ProviderAmazon || prov == dfc.ProviderGoogle || prov == dfc.ProviderDfc
+	return prov == cmn.ProviderAmazon || prov == cmn.ProviderGoogle || prov == cmn.ProviderDFC
+}
+
+func checkRESTItems(w http.ResponseWriter, r *http.Request, itemsAfter int, items ...string) ([]string, error) {
+	items, err := cmn.MatchRESTItems(r.URL.Path, itemsAfter, true, items...)
+	if err != nil {
+		cmn.InvalidHandlerWithMsg(w, r, err.Error())
+		return nil, err
+	}
+
+	return items, err
 }
 
 //-------------------------------------
@@ -136,8 +130,8 @@ func (a *authServ) registerHandler(path string, handler func(http.ResponseWriter
 }
 
 func (a *authServ) registerPublicHandlers() {
-	a.registerHandler(dfc.URLPath(dfc.Rversion, pathUsers), a.userHandler)
-	a.registerHandler(dfc.URLPath(dfc.Rversion, pathTokens), a.tokenHandler)
+	a.registerHandler(cmn.URLPath(cmn.Version, pathUsers), a.userHandler)
+	a.registerHandler(cmn.URLPath(cmn.Version, pathTokens), a.tokenHandler)
 }
 
 func (a *authServ) userHandler(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +143,7 @@ func (a *authServ) userHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		a.httpUserPut(w, r)
 	default:
-		invalhdlr(w, r, "Unsupported method", http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, "Unsupported method for /users handler")
 	}
 }
 
@@ -158,35 +152,18 @@ func (a *authServ) tokenHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		a.httpRevokeToken(w, r)
 	default:
-		invalhdlr(w, r, "Unsupported method", http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, "Unsupported method for /token handler")
 	}
-}
-
-// divide URL into words, throw away all before the word 'takeAfter' (including
-// it) and returns the rest
-func (a *authServ) restAPIItems(unescapedPath string, takeAfter string) []string {
-	escaped := html.EscapeString(unescapedPath)
-	parts := strings.Split(escaped, "/")
-	for idx, part := range parts {
-		if part == takeAfter {
-			return parts[idx+1:]
-		}
-	}
-
-	return nil
 }
 
 // Deletes existing token, a.k.a log out
 func (a *authServ) httpRevokeToken(w http.ResponseWriter, r *http.Request) {
-	var err error
-	apiItems := a.restAPIItems(r.URL.Path, pathTokens)
-	if len(apiItems) != 0 {
-		invalhdlr(w, r, "Invalid request", http.StatusBadRequest)
+	if _, err := checkRESTItems(w, r, 0, cmn.Version, pathTokens); err != nil {
 		return
 	}
 
 	msg := &tokenMsg{}
-	if err = a.readJSON(w, r, msg); err != nil || msg.Token == "" {
+	if err := a.readJSON(w, r, msg); err != nil || msg.Token == "" {
 		glog.Errorf("Failed to read request: %v\n", err)
 		return
 	}
@@ -195,22 +172,20 @@ func (a *authServ) httpRevokeToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *authServ) httpUserDel(w http.ResponseWriter, r *http.Request) {
-	apiItems := a.restAPIItems(r.URL.Path, pathUsers)
-	if len(apiItems) == 0 {
-		invalhdlr(w, r, "User name is not defined", http.StatusBadRequest)
+	apiItems, err := checkRESTItems(w, r, 1, cmn.Version, pathUsers)
+	if err != nil {
 		return
 	}
 
-	err := a.checkAuthorization(w, r)
-	if err != nil {
+	if err := a.checkAuthorization(w, r); err != nil {
 		glog.Errorf("Not authorized: %v\n", err)
 		return
 	}
 
 	if len(apiItems) == 1 {
-		if err = a.users.delUser(apiItems[0]); err != nil {
+		if err := a.users.delUser(apiItems[0]); err != nil {
 			glog.Errorf("Failed to delete user: %v\n", err)
-			invalhdlr(w, r, "Failed to delete user")
+			cmn.InvalidHandlerWithMsg(w, r, "Failed to delete user")
 		}
 	} else {
 		a.userRemoveCredentials(w, r)
@@ -218,8 +193,9 @@ func (a *authServ) httpUserDel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *authServ) httpUserPost(w http.ResponseWriter, r *http.Request) {
-	apiItems := a.restAPIItems(r.URL.Path, pathUsers)
-	if len(apiItems) == 0 {
+	if apiItems, err := checkRESTItems(w, r, 0, cmn.Version, pathUsers); err != nil {
+		return
+	} else if len(apiItems) == 0 {
 		a.userAdd(w, r)
 	} else {
 		a.userLogin(w, r)
@@ -230,13 +206,11 @@ func (a *authServ) httpUserPost(w http.ResponseWriter, r *http.Request) {
 // If user did not have credentials before updating or the credentials changes
 //   then new user list is saved and sent to the proxy to update the cluster
 func (a *authServ) httpUserPut(w http.ResponseWriter, r *http.Request) {
-	apiItems := a.restAPIItems(r.URL.Path, pathUsers)
-	if len(apiItems) < 2 {
-		invalhdlr(w, r, "Invalid request")
+	apiItems, err := checkRESTItems(w, r, 2, cmn.Version, pathUsers)
+	if err != nil {
 		return
 	}
-	err := a.checkAuthorization(w, r)
-	if err != nil {
+	if err = a.checkAuthorization(w, r); err != nil {
 		glog.Errorf("Not authorized: %v\n", err)
 		return
 	}
@@ -246,7 +220,7 @@ func (a *authServ) httpUserPut(w http.ResponseWriter, r *http.Request) {
 
 	b, err := ioutil.ReadAll(r.Body)
 	if len(b) == 0 {
-		invalhdlr(w, r, "Invalid request", http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, "Invalid request")
 		return
 	}
 
@@ -255,7 +229,7 @@ func (a *authServ) httpUserPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := a.users.updateCredentials(userID, provider, string(b)); err != nil {
-		invalhdlr(w, r, fmt.Sprintf("Failed to update credentials: %v", err), http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, fmt.Sprintf("Failed to update credentials: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -264,20 +238,19 @@ func (a *authServ) httpUserPut(w http.ResponseWriter, r *http.Request) {
 
 // Adds a new user to user list
 func (a *authServ) userAdd(w http.ResponseWriter, r *http.Request) {
-	err := a.checkAuthorization(w, r)
-	if err != nil {
+	if err := a.checkAuthorization(w, r); err != nil {
 		glog.Errorf("Not authorized: %v\n", err)
 		return
 	}
 
 	info := &userInfo{}
-	if err = a.readJSON(w, r, info); err != nil {
+	if err := a.readJSON(w, r, info); err != nil {
 		glog.Errorf("Failed to read credentials: %v\n", err)
 		return
 	}
 
-	if err = a.users.addUser(info.UserID, info.Password); err != nil {
-		invalhdlr(w, r, fmt.Sprintf("Failed to add user: %v", err))
+	if err := a.users.addUser(info.UserID, info.Password); err != nil {
+		cmn.InvalidHandlerWithMsg(w, r, fmt.Sprintf("Failed to add user: %v", err), http.StatusInternalServerError)
 		return
 	}
 	if glog.V(4) {
@@ -294,24 +267,24 @@ func (a *authServ) userAdd(w http.ResponseWriter, r *http.Request) {
 func (a *authServ) checkAuthorization(w http.ResponseWriter, r *http.Request) error {
 	s := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
 	if len(s) != 2 {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return fmt.Errorf("Invalid header")
 	}
 
 	b, err := base64.StdEncoding.DecodeString(s[1])
 	if err != nil {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return fmt.Errorf("Invalid header authorization")
 	}
 
 	pair := strings.SplitN(string(b), ":", 2)
 	if len(pair) != 2 {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return fmt.Errorf("Invalid header authorization")
 	}
 
 	if pair[0] != conf.Auth.Username || pair[1] != conf.Auth.Password {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return fmt.Errorf("Invalid credentials")
 	}
 
@@ -324,9 +297,8 @@ func (a *authServ) checkAuthorization(w http.ResponseWriter, r *http.Request) er
 func (a *authServ) userLogin(w http.ResponseWriter, r *http.Request) {
 	var err error
 
-	apiItems := a.restAPIItems(r.URL.Path, pathUsers)
-	if len(apiItems) == 0 {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+	apiItems, err := checkRESTItems(w, r, 1, cmn.Version, pathUsers)
+	if err != nil {
 		return
 	}
 
@@ -337,7 +309,7 @@ func (a *authServ) userLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if msg.Password == "" {
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -350,7 +322,7 @@ func (a *authServ) userLogin(w http.ResponseWriter, r *http.Request) {
 	tokenString, err := a.users.issueToken(userID, pass)
 	if err != nil {
 		glog.Errorf("Failed to generate token: %v\n", err)
-		invalhdlr(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.InvalidHandlerWithMsg(w, r, "Not authorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -358,7 +330,7 @@ func (a *authServ) userLogin(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, r, []byte(repl), "auth")
 }
 
-// Borrowed from DFC (modified invalhdlr calls)
+// Borrowed from DFC (modified cmn.InvalidHandler calls)
 func (a *authServ) writeJSON(w http.ResponseWriter, r *http.Request, jsbytes []byte, tag string) (ok bool) {
 	w.Header().Set("Content-Type", "application/json")
 	var err error
@@ -373,15 +345,15 @@ func (a *authServ) writeJSON(w http.ResponseWriter, r *http.Request, jsbytes []b
 		return
 	}
 	errstr := fmt.Sprintf("%s: Failed to write json, err: %v", tag, err)
-	invalhdlr(w, r, errstr)
+	cmn.InvalidHandlerWithMsg(w, r, errstr, http.StatusInternalServerError)
 	return
 }
 
-// Borrowed from DFC (modified invalhdlr calls)
+// Borrowed from DFC (modified cmn.InvalidHandler calls)
 func (a *authServ) readJSON(w http.ResponseWriter, r *http.Request, out interface{}) error {
 	b, err := ioutil.ReadAll(r.Body)
 	if len(b) == 0 {
-		invalhdlr(w, r, "Invalid request", http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, "request body is empty")
 		return fmt.Errorf("%s", "Invalid request")
 	}
 	if err != nil {
@@ -393,15 +365,15 @@ func (a *authServ) readJSON(w http.ResponseWriter, r *http.Request, out interfac
 			}
 		}
 		glog.Errorf(s)
-		invalhdlr(w, r, s)
+		cmn.InvalidHandlerWithMsg(w, r, s, http.StatusInternalServerError)
 		return err
 	}
 
-	err = json.Unmarshal(b, out)
+	err = jsoniter.Unmarshal(b, out)
 	if err != nil {
 		s := fmt.Sprintf("Failed to json-unmarshal %s request, err: %v [%v]", r.Method, err, string(b))
 		glog.Errorf(s)
-		invalhdlr(w, r, "Incorrect input data format", http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, "incorrect input data format")
 		return err
 	}
 	return nil
@@ -411,12 +383,16 @@ func (a *authServ) readJSON(w http.ResponseWriter, r *http.Request, out interfac
 // On successful update the function sends new credentials list to primary
 //   proxy to update the cluster
 func (a *authServ) userRemoveCredentials(w http.ResponseWriter, r *http.Request) {
-	apiItems := a.restAPIItems(r.URL.Path, pathUsers)
+	apiItems, err := checkRESTItems(w, r, 2, cmn.Version, pathUsers)
+	if err != nil {
+		return
+	}
+
 	userID := apiItems[0]
 	provider := apiItems[1]
 	if !isValidProvider(provider) {
 		errmsg := fmt.Sprintf("Invalid cloud provider: %s", provider)
-		invalhdlr(w, r, errmsg, http.StatusBadRequest)
+		cmn.InvalidHandlerWithMsg(w, r, errmsg, http.StatusBadRequest)
 		return
 	}
 
@@ -424,9 +400,8 @@ func (a *authServ) userRemoveCredentials(w http.ResponseWriter, r *http.Request)
 		glog.Infof("Removing %s credentials for %s\n", provider, userID)
 	}
 
-	_, err := a.users.deleteCredentials(userID, provider)
-	if err != nil {
-		invalhdlr(w, r, fmt.Sprintf("Failed to delete credentials: %v", err), http.StatusBadRequest)
+	if _, err = a.users.deleteCredentials(userID, provider); err != nil {
+		cmn.InvalidHandlerWithMsg(w, r, fmt.Sprintf("Failed to delete credentials: %v", err), http.StatusBadRequest)
 		return
 	}
 

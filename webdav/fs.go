@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/webdav"
-	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 type (
@@ -835,7 +835,7 @@ func (f *File) Readdir(count int) ([]os.FileInfo, error) {
 
 		for _, c := range n.children {
 			// adding a "/" at the end to indicate to DFC this is a directory
-			objs = append(objs, &dfc.BucketEntry{Name: c.name + separator})
+			objs = append(objs, &cmn.BucketEntry{Name: c.name + separator})
 		}
 
 		fis := group(objs, f.prefix)
@@ -1038,7 +1038,7 @@ func (d *inode) find(pth string) *inode {
 // output will be: loader(directory), obj3(file)
 // prefix is removed from object name before grouping.
 // do not expect duplicate keys (upper layer should not allow that to happen)
-func group(objs []*dfc.BucketEntry, prefix string) []os.FileInfo {
+func group(objs []*cmn.BucketEntry, prefix string) []os.FileInfo {
 	keys := make(map[string]bool) // string = first part after split by "/", bool = true if it is a file
 	var fis []os.FileInfo
 
@@ -1077,7 +1077,7 @@ func group(objs []*dfc.BucketEntry, prefix string) []os.FileInfo {
 // localFileName returns a full path of a temporary file used while a DFC object is opened for read or write
 func (fs *FileSystem) localFileName() string {
 	return filepath.Join(fs.localDir,
-		client.FastRandomFilename(rand.New(rand.NewSource(time.Now().UnixNano())), 32 /* length */))
+		tutils.FastRandomFilename(rand.New(rand.NewSource(time.Now().UnixNano())), 32 /* length */))
 }
 
 type fiSortByName []os.FileInfo

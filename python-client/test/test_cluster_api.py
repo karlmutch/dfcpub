@@ -42,11 +42,7 @@ class TestClusterApi(unittest.TestCase):
         """
         smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
         target =  smap.tmap.values()[1]
-        daemon_info = self.models.DaemonInfo(
-            target.node_ip_addr,
-            target.daemon_port,
-            target.daemon_id,
-            target.direct_url)
+        daemon_info = self.models.DaemonInfo(target.daemon_id, public_net=target.public_net, internal_net=target.internal_net, repl_net=target.repl_net)
 
         self.cluster.unregister_target(daemon_info.daemon_id)
         smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
@@ -142,6 +138,15 @@ class TestClusterApi(unittest.TestCase):
             props=self.models.GetProps.REBALANCE))
         self.assertTrue(len(stats.target.keys()) != 0,
                         "No targets retrieved while querying for stats")
+
+    def test_get_all_mountpaths(self):
+        mountpaths = DictParser.parse(
+                self.cluster.get(what=self.models.GetWhat.MOUNTPATHS))
+        for target in mountpaths.targets:
+            self.assertTrue(len(mountpaths.targets[target].available) > 0,
+                    "Number of available mountpaths on target %s is zero."
+                    % target)
+
 
 class DictParser(dict):
     __getattr__= dict.__getitem__

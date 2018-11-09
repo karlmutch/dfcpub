@@ -12,8 +12,14 @@
     "internal/version",
     "storage"
   ]
-  revision = "0fd7230b2a7505833d5f69b75cbd6c9582401479"
-  version = "v0.23.0"
+  revision = "c728a003b238b26cef9ab6753a5dc424b331c3ad"
+  version = "v0.27.0"
+
+[[projects]]
+  name = "contrib.go.opencensus.io/exporter/stackdriver"
+  packages = ["propagation"]
+  revision = "2b93072101d466aa4120b3c23c2e1b08af01541c"
+  version = "v0.6.0"
 
 [[projects]]
   name = "github.com/OneOfOne/xxhash"
@@ -58,14 +64,17 @@
     "service/s3/s3manager",
     "service/sts"
   ]
-  revision = "8475c414b1bd58b8cc214873a8854e3a621e67d7"
-  version = "v1.15.0"
+  revision = "1186f7e6f000ce13edff71ed5ecc8b0e27ba38d7"
+  version = "v1.15.33"
 
 [[projects]]
-  branch = "master"
-  name = "github.com/bradfitz/gomemcache"
-  packages = ["memcache"]
-  revision = "bc664df9673713a0ccf26e3b55a673ec7301088b"
+  name = "github.com/cloudfoundry/gosigar"
+  packages = [
+    ".",
+    "sys/windows"
+  ]
+  revision = "dcb1afc219e4c99f21c37fb1ec22ed9ffe443317"
+  version = "v1.1.0"
 
 [[projects]]
   name = "github.com/dgrijalva/jwt-go"
@@ -76,8 +85,8 @@
 [[projects]]
   name = "github.com/go-ini/ini"
   packages = ["."]
-  revision = "358ee7663966325963d4e8b2e1fbd570c5195153"
-  version = "v1.38.1"
+  revision = "5cf292cae48347c2490ac1a58fe36735fb78df7e"
+  version = "v1.38.2"
 
 [[projects]]
   name = "github.com/golang/protobuf"
@@ -89,8 +98,8 @@
     "ptypes/duration",
     "ptypes/timestamp"
   ]
-  revision = "b4deda0973fb4c70b50d226b1af49f3da59f5265"
-  version = "v1.1.0"
+  revision = "aa810b61a9c79d51363740d207bb46cf8e620ed5"
+  version = "v1.2.0"
 
 [[projects]]
   name = "github.com/googleapis/gax-go"
@@ -104,22 +113,33 @@
   revision = "0b12d6b5"
 
 [[projects]]
-  branch = "master"
-  name = "github.com/tatsuhiro-t/go-nghttp2"
+  name = "github.com/json-iterator/go"
   packages = ["."]
-  revision = "4742878d9c9052d786a7b0cd3589bc50e031e20b"
+  revision = "1624edc4454b8682399def8740d46db5e4362ba4"
+  version = "v1.1.5"
 
 [[projects]]
-  branch = "master"
-  name = "github.com/tatsuhiro-t/spdy"
+  name = "github.com/modern-go/concurrent"
   packages = ["."]
-  revision = "3e25f173236051630d530d15e13439bef3191fbf"
+  revision = "bacd9c7ef1dd9b15be4a9909b8ac7a4e313eec94"
+  version = "1.0.3"
+
+[[projects]]
+  name = "github.com/modern-go/reflect2"
+  packages = ["."]
+  revision = "4b7aa43c6742a2c18fdef89dd197aaae7dac7ccd"
+  version = "1.0.1"
+
+[[projects]]
+  name = "github.com/pkg/errors"
+  packages = ["."]
+  revision = "645ef00459ed84a119197bfb8d8205042c6df63d"
+  version = "v0.8.0"
 
 [[projects]]
   name = "go.opencensus.io"
   packages = [
     ".",
-    "exporter/stackdriver/propagation",
     "internal",
     "internal/tagencoding",
     "plugin/ochttp",
@@ -130,10 +150,11 @@
     "tag",
     "trace",
     "trace/internal",
-    "trace/propagation"
+    "trace/propagation",
+    "trace/tracestate"
   ]
-  revision = "e262766cd0d230a1bb7c37281e345e465f19b41b"
-  version = "v0.14.0"
+  revision = "b11f239c032624b045c4c2bfd3d1287b4012ce89"
+  version = "v0.16.0"
 
 [[projects]]
   branch = "master"
@@ -147,10 +168,9 @@
     "http2/hpack",
     "idna",
     "internal/timeseries",
-    "trace",
-    "websocket"
+    "trace"
   ]
-  revision = "c4299a1a0d8524c11563db160fbf9bddbceadb21"
+  revision = "26e67e76b6c3f6ce91f7c52def5af501b4e0f3a2"
 
 [[projects]]
   branch = "master"
@@ -162,7 +182,16 @@
     "jws",
     "jwt"
   ]
-  revision = "3d292e4d0cdc3a0113e6d207bb137145ef1de42f"
+  revision = "d2e6202438beef2727060aa7cabdd924d92ebfd9"
+
+[[projects]]
+  branch = "master"
+  name = "golang.org/x/sys"
+  packages = [
+    "unix",
+    "windows"
+  ]
+  revision = "d0be0721c37eeb5299f245a996a483160fc36940"
 
 [[projects]]
   name = "golang.org/x/text"
@@ -199,7 +228,7 @@
     "storage/v1",
     "transport/http"
   ]
-  revision = "31ca0e01cd791f07750cb23fc99327721f753290"
+  revision = "7ca32eb868bf53ea2fc406698eb98583a8073d19"
 
 [[projects]]
   name = "google.golang.org/appengine"
@@ -227,7 +256,7 @@
     "googleapis/rpc/code",
     "googleapis/rpc/status"
   ]
-  revision = "2a72893556e4d1f6c795a4c039314c9fa751eedb"
+  revision = "36d5787dc5356b711fe8f3040271aaf51c35955b"
 
 [[projects]]
   name = "google.golang.org/grpc"
@@ -245,7 +274,9 @@
     "internal",
     "internal/backoff",
     "internal/channelz",
+    "internal/envconfig",
     "internal/grpcrand",
+    "internal/transport",
     "keepalive",
     "metadata",
     "naming",
@@ -255,15 +286,14 @@
     "resolver/passthrough",
     "stats",
     "status",
-    "tap",
-    "transport"
+    "tap"
   ]
-  revision = "168a6198bcb0ef175f7dacec0b8691fc141dc9b8"
-  version = "v1.13.0"
+  revision = "8dea3dc473e90c8179e519d91302d0597c0ca1d1"
+  version = "v1.15.0"
 
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "1c6a7f74c4d4ce60455026268b485765f0f7642cd87a8802ec7b3251615c25fa"
+  inputs-digest = "edc8d0b1bb0d02aac3458bc90ffbdef3bd1710306373fb5c788d254e81681d43"
   solver-name = "gps-cdcl"
   solver-version = 1

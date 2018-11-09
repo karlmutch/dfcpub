@@ -1,13 +1,12 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -15,6 +14,9 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/json-iterator/go"
 )
 
 const (
@@ -26,8 +28,8 @@ const (
 // newIostatRunner initalizes iostatrunner struct with default values
 func newIostatRunner() *iostatrunner {
 	return &iostatrunner{
-		chsts:       make(chan struct{}, 1),
-		Disk:        make(map[string]simplekvs),
+		stopCh:      make(chan struct{}, 1),
+		Disk:        make(map[string]cmn.SimpleKVs),
 		metricnames: make([]string, 0),
 	}
 }
@@ -37,27 +39,19 @@ type LsBlk struct {
 }
 
 type BlockDevice struct {
-	Name              string             `json:"name"`
-	ChildBlockDevices []ChildBlockDevice `json:"children"`
+	Name         string        `json:"name"`
+	BlockDevices []BlockDevice `json:"children"`
 }
 
-type ChildBlockDevice struct {
-	Name string `json:"name"`
-}
+// as an fsprunner
+func (r *iostatrunner) reqEnableMountpath(mpath string)  { r.updateFSDisks() }
+func (r *iostatrunner) reqDisableMountpath(mpath string) { r.updateFSDisks() }
+func (r *iostatrunner) reqAddMountpath(mpath string)     { r.updateFSDisks() }
+func (r *iostatrunner) reqRemoveMountpath(mpath string)  { r.updateFSDisks() }
 
 // iostat -cdxtm 10
-func (r *iostatrunner) run() error {
-	availablePaths, _ := ctx.mountpaths.Mountpaths()
-	r.fsdisks = make(map[string]StringSet, len(availablePaths))
-	for _, mpathInfo := range availablePaths {
-		disks := fs2disks(mpathInfo.FileSystem)
-		if len(disks) == 0 {
-			glog.Errorf("filesystem (%+v) - no disks?", mpathInfo)
-			continue
-		}
-		r.fsdisks[mpathInfo.FileSystem] = disks
-	}
-
+func (r *iostatrunner) Run() error {
+	r.updateFSDisks()
 	refreshPeriod := int(ctx.config.Periodic.StatsTime / time.Second)
 	cmd := exec.Command("iostat", "-cdxtm", strconv.Itoa(refreshPeriod))
 	stdout, err := cmd.StdoutPipe()
@@ -72,7 +66,7 @@ func (r *iostatrunner) run() error {
 	// Assigning started process
 	r.process = cmd.Process
 
-	glog.Infof("Starting %s", r.name)
+	glog.Infof("Starting %s", r.Getname())
 
 	for {
 		b, err := reader.ReadBytes('\n')
@@ -95,11 +89,11 @@ func (r *iostatrunner) run() error {
 				r.Lock()
 				device := fields[0]
 				var (
-					iometrics simplekvs
+					iometrics cmn.SimpleKVs
 					ok        bool
 				)
 				if iometrics, ok = r.Disk[device]; !ok {
-					iometrics = make(simplekvs, len(fields)-1) // first time
+					iometrics = make(cmn.SimpleKVs, len(fields)-1) // first time
 				}
 				for i := 1; i < len(fields); i++ {
 					name := r.metricnames[i-1]
@@ -110,18 +104,17 @@ func (r *iostatrunner) run() error {
 			}
 		}
 		select {
-		case <-r.chsts:
+		case <-r.stopCh:
 			return nil
 		default:
 		}
 	}
 }
 
-func (r *iostatrunner) stop(err error) {
-	glog.Infof("Stopping %s, err: %v", r.name, err)
-	var v struct{}
-	r.chsts <- v
-	close(r.chsts)
+func (r *iostatrunner) Stop(err error) {
+	glog.Infof("Stopping %s, err: %v", r.Getname(), err)
+	r.stopCh <- struct{}{}
+	close(r.stopCh)
 
 	// Kill process if started
 	if r.process != nil {
@@ -143,12 +136,27 @@ func (r *iostatrunner) isZeroUtil(dev string) bool {
 	return false
 }
 
+func (r *iostatrunner) updateFSDisks() {
+	availablePaths, _ := fs.Mountpaths.Mountpaths()
+	r.Lock()
+	r.fsdisks = make(map[string]cmn.StringSet, len(availablePaths))
+	for _, mpathInfo := range availablePaths {
+		disks := fs2disks(mpathInfo.FileSystem)
+		if len(disks) == 0 {
+			glog.Errorf("filesystem (%+v) - no disks?", mpathInfo)
+			continue
+		}
+		r.fsdisks[mpathInfo.FileSystem] = disks
+	}
+	r.Unlock()
+}
+
 func (r *iostatrunner) diskUtilFromFQN(fqn string) (util float32, ok bool) {
-	fs := fqn2fs(fqn)
-	if fs == "" {
+	mpathInfo, _ := path2mpathInfo(fqn)
+	if mpathInfo == nil {
 		return
 	}
-	return r.maxUtilFS(fs)
+	return r.maxUtilFS(mpathInfo.FileSystem)
 }
 
 func (r *iostatrunner) maxUtilFS(fs string) (util float32, ok bool) {
@@ -170,7 +178,7 @@ func (r *iostatrunner) maxUtilFS(fs string) (util float32, ok bool) {
 // Do not use this in code paths which are executed per object.
 // This method is used only while starting the iostat runner to
 // retrieve the disks associated with a file system.
-func fs2disks(fs string) (disks StringSet) {
+func fs2disks(fs string) (disks cmn.StringSet) {
 	getDiskCommand := exec.Command("lsblk", "-no", "name", "-J")
 	outputBytes, err := getDiskCommand.Output()
 	if err != nil || len(outputBytes) == 0 {
@@ -182,25 +190,50 @@ func fs2disks(fs string) (disks StringSet) {
 	return
 }
 
-func lsblkOutput2disks(lsblkOutputBytes []byte, fs string) (disks StringSet) {
-	disks = make(StringSet)
+func childMatches(devList []BlockDevice, device string) bool {
+	for _, dev := range devList {
+		if dev.Name == device {
+			return true
+		}
+
+		if len(dev.BlockDevices) != 0 && childMatches(dev.BlockDevices, device) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func findDevDisks(devList []BlockDevice, device string, disks cmn.StringSet) {
+	for _, bd := range devList {
+		if bd.Name == device {
+			disks[bd.Name] = struct{}{}
+			continue
+		}
+		if len(bd.BlockDevices) != 0 {
+			if childMatches(bd.BlockDevices, device) {
+				disks[bd.Name] = struct{}{}
+			}
+		}
+	}
+}
+
+func lsblkOutput2disks(lsblkOutputBytes []byte, fs string) (disks cmn.StringSet) {
+	disks = make(cmn.StringSet)
 	device := strings.TrimPrefix(fs, "/dev/")
 	var lsBlkOutput LsBlk
-	err := json.Unmarshal(lsblkOutputBytes, &lsBlkOutput)
+	err := jsoniter.Unmarshal(lsblkOutputBytes, &lsBlkOutput)
 	if err != nil {
 		glog.Errorf("Unable to unmarshal lsblk output [%s]. Error: [%v]", string(lsblkOutputBytes), err)
 		return
 	}
-	for _, blockDevice := range lsBlkOutput.BlockDevices {
-		for _, child := range blockDevice.ChildBlockDevices {
-			if child.Name == device {
-				if _, ok := disks[blockDevice.Name]; !ok {
-					disks[blockDevice.Name] = struct{}{}
-				}
-			}
-		}
+
+	findDevDisks(lsBlkOutput.BlockDevices, device, disks)
+	if glog.V(3) {
+		glog.Infof("Device: %s, disk list: %v\n", device, disks)
 	}
-	return
+
+	return disks
 }
 
 // checkIostatVersion determines whether iostat command is present and
@@ -223,16 +256,12 @@ func checkIostatVersion() error {
 		return fmt.Errorf("[iostat] Error: unexpected version format: %v", vss)
 	}
 
-	version := []int64{}
-	for _, vs := range vss {
-		v, err := strconv.ParseInt(vs, 10, 64)
-		if err != nil {
-			return fmt.Errorf("[iostat] Error: failed to parse version %v", vss)
-		}
-		version = append(version, v)
+	version, err := strconv.ParseInt(vss[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("[iostat] Error: failed to parse version %v, error %v", vss, err)
 	}
 
-	if version[0] < iostatMinVersion {
+	if version < iostatMinVersion {
 		return fmt.Errorf("[iostat] Error: version %v is too old. At least %v version is required", version, iostatMinVersion)
 	}
 

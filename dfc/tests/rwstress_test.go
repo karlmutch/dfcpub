@@ -18,10 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/dfcpub/pkg/client/readers"
-
-	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 const (
@@ -123,7 +121,7 @@ func generateRandomData(t *testing.T, seed int64, fileCount int) {
 	fileNames = make([]string, fileCount)
 
 	for i := 0; i < fileCount; i++ {
-		fileNames[i] = client.FastRandomFilename(random, fnlen)
+		fileNames[i] = tutils.FastRandomFilename(random, fnlen)
 	}
 }
 
@@ -134,12 +132,12 @@ func rwCanRunAsync(currAsyncOps int64, maxAsycOps int) bool {
 	return currAsyncOps+1 < int64(maxAsycOps)
 }
 
-func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
+func rwPutLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
 	var (
 		totalOps int
 		prc      int
 	)
-	errch := make(chan error, 10)
+	errCh := make(chan error, 10)
 	fileCount := len(fileNames)
 	if taskGrp != nil {
 		defer taskGrp.Done()
@@ -153,12 +151,12 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 			keyname := fmt.Sprintf("%s/%s", rwdir, fileNames[idx])
 
 			// Note: This test depends on the files it creates, so ignore reader type, always use file reader
-			r, err := readers.NewFileReader(baseDir, keyname, fileSize, true /* withHash */)
+			r, err := tutils.NewFileReader(baseDir, keyname, fileSize, true /* withHash */)
 			if err != nil {
-				fmt.Fprintf(os.Stdout, "PUT write FAIL: %v\n", err)
+				tutils.Logf("PUT write FAIL: %v\n", err)
 				t.Error(err)
-				if errch != nil {
-					errch <- err
+				if errCh != nil {
+					errCh <- err
 				}
 				return
 			}
@@ -169,14 +167,14 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 					wg.Add(1)
 					localIdx := idx
 					go func() {
-						client.PutAsync(&wg, proxyurl, r, clibucket, keyname, errch, true /* silent */)
+						tutils.PutAsync(&wg, proxyURL, r, clibucket, keyname, errCh, true /* silent */)
 						unlockFile(localIdx, rwFileCreated)
 						atomic.AddInt64(&putCounter, -1)
 					}()
 				} else {
-					err = client.Put(proxyurl, r, clibucket, keyname, true /* silent */)
+					err = tutils.Put(proxyURL, r, clibucket, keyname, true /* silent */)
 					if err != nil {
-						errch <- err
+						errCh <- err
 					}
 					unlockFile(idx, rwFileCreated)
 				}
@@ -188,8 +186,8 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 				prc = newPrc
 			}
 			select {
-			case e := <-errch:
-				fmt.Printf("PUT failed: %v\n", e.Error())
+			case e := <-errCh:
+				tutils.Logf("PUT failed: %v\n", e.Error())
 				t.Fail()
 			default:
 			}
@@ -205,10 +203,10 @@ func rwPutLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 	}
 }
 
-func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int, doCleanUp bool) {
+func rwDelLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int, doCleanUp bool) {
 	done := false
 	var totalOps, currIdx int
-	errch := make(chan error, 10)
+	errCh := make(chan error, 10)
 	var wg = &sync.WaitGroup{}
 
 	if taskGrp != nil {
@@ -224,12 +222,12 @@ func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 				wg.Add(1)
 				localIdx := idx
 				go func() {
-					client.Del(proxyurl, clibucket, keyname, wg, errch, true)
+					tutils.Del(proxyURL, clibucket, keyname, wg, errCh, true)
 					unlockFile(localIdx, rwFileDeleted)
 					atomic.AddInt64(&delCounter, -1)
 				}()
 			} else {
-				client.Del(proxyurl, clibucket, keyname, nil, errch, true)
+				tutils.Del(proxyURL, clibucket, keyname, nil, errCh, true)
 				unlockFile(idx, rwFileDeleted)
 			}
 
@@ -248,8 +246,8 @@ func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 		select {
 		case <-doneCh:
 			done = true
-		case e := <-errch:
-			fmt.Printf("DEL failed: %v\n", e.Error())
+		case e := <-errCh:
+			tutils.Logf("DEL failed: %v\n", e.Error())
 			t.Fail()
 		default:
 		}
@@ -257,10 +255,10 @@ func rwDelLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 	wg.Wait()
 }
 
-func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
+func rwGetLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
 	done := false
 	var currIdx, totalOps int
-	errch := make(chan error, 10)
+	errCh := make(chan error, 10)
 	var wg = &sync.WaitGroup{}
 
 	if taskGrp != nil {
@@ -276,12 +274,12 @@ func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 				wg.Add(1)
 				localIdx := idx
 				go func() {
-					client.Get(proxyurl, clibucket, keyname, wg, errch, true, false)
+					tutils.Get(proxyURL, clibucket, keyname, wg, errCh, true, false)
 					unlockFile(localIdx, rwFileExists)
 					atomic.AddInt64(&getCounter, -1)
 				}()
 			} else {
-				client.Get(proxyurl, clibucket, keyname, nil, errch, true, false)
+				tutils.Get(proxyURL, clibucket, keyname, nil, errCh, true, false)
 				unlockFile(idx, rwFileExists)
 			}
 			currIdx = idx + 1
@@ -296,8 +294,8 @@ func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 		select {
 		case <-doneCh:
 			done = true
-		case e := <-errch:
-			fmt.Printf("GET failed: %v\n", e.Error())
+		case e := <-errCh:
+			tutils.Logf("GET failed: %v\n", e.Error())
 			t.Fail()
 		default:
 		}
@@ -307,11 +305,12 @@ func rwGetLoop(t *testing.T, fileNames []string, taskGrp *sync.WaitGroup, doneCh
 }
 
 func rwstress(t *testing.T) {
-	if err := dfc.CreateDir(fmt.Sprintf("%s/%s", baseDir, rwdir)); err != nil {
+	if err := cmn.CreateDir(fmt.Sprintf("%s/%s", baseDir, rwdir)); err != nil {
 		t.Fatalf("Failed to create dir %s/%s, err: %v", baseDir, rwdir, err)
 	}
 
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	created := createLocalBucketIfNotExists(t, proxyURL, clibucket)
 	filelock.files = make([]fileLock, numFiles, numFiles)
 
 	generateRandomData(t, baseseed+10000, numFiles)
@@ -319,22 +318,20 @@ func rwstress(t *testing.T) {
 	var wg sync.WaitGroup
 	doneCh := make(chan int, 2)
 	wg.Add(1)
-	go rwPutLoop(t, fileNames, &wg, doneCh)
+	go rwPutLoop(t, proxyURL, fileNames, &wg, doneCh)
 	wg.Add(1)
-	go rwGetLoop(t, fileNames, &wg, doneCh)
+	go rwGetLoop(t, proxyURL, fileNames, &wg, doneCh)
 	if !skipdel {
 		wg.Add(1)
-		go rwDelLoop(t, fileNames, &wg, doneCh, rwRunNormal)
+		go rwDelLoop(t, proxyURL, fileNames, &wg, doneCh, rwRunNormal)
 	}
 
 	wg.Wait()
-	rwDelLoop(t, fileNames, nil, doneCh, rwRunCleanUp)
+	rwDelLoop(t, proxyURL, fileNames, nil, doneCh, rwRunCleanUp)
 	rwstressCleanup(t)
 
 	if created {
-		if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-			t.Errorf("Failed to delete local bucket: %v", err)
-		}
+		destroyLocalBucket(t, proxyURL, clibucket)
 	}
 }
 
@@ -344,7 +341,7 @@ func rwstressCleanup(t *testing.T) {
 	for _, fileName := range fileNames {
 		e := os.Remove(fmt.Sprintf("%s/%s", fileDir, fileName))
 		if e != nil {
-			fmt.Printf("Failed to remove file %s: %v\n", fileName, e)
+			tutils.Logf("Failed to remove file %s: %v\n", fileName, e)
 			t.Error(e)
 		}
 	}
@@ -367,12 +364,7 @@ func TestRWStress(t *testing.T) {
 //    test finishes it executes extra loop to delete all files
 func Test_rwstress(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Long run only")
-	}
-
-	if err := client.Tcping(proxyurl); err != nil {
-		tlogf("%s: %v\n", proxyurl, err)
-		os.Exit(1)
+		t.Skip(skipping)
 	}
 
 	numLoops = cycles

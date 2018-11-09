@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
 )
 
@@ -93,10 +94,9 @@ func TestLRUBasic(t *testing.T) {
 			heap.Push(h, &tc[i])
 		}
 
-		var act fileInfos
+		act := make(fileInfos, len(tc))
 		for i := 0; i < len(tc); i++ {
-			fi := heap.Pop(h).(*fileInfo)
-			act = append(act, *fi)
+			act[i] = *heap.Pop(h).(*fileInfo)
 		}
 
 		sort.Sort(tc)
@@ -120,21 +120,22 @@ func TestLRUThrottling(t *testing.T) {
 	ctx.config.Xaction.DiskUtilHighWM = 40
 	ctx.config.Periodic.StatsTime = -1 * time.Second
 
-	ctx.mountpaths.AddMountpath("/")
-	fileSystem := ctx.mountpaths.Available["/"].FileSystem
+	fs.Mountpaths.AddMountpath("/")
+	available, _ := fs.Mountpaths.Mountpaths()
+	fileSystem := available["/"].FileSystem
 
 	disks := fs2disks(fileSystem)
 	riostat := newIostatRunner()
-	riostat.fsdisks = make(map[string]StringSet, len(ctx.mountpaths.Available))
+	riostat.fsdisks = make(map[string]cmn.StringSet, len(available))
 	riostat.fsdisks[fileSystem] = disks
 	for disk := range disks {
-		riostat.Disk[disk] = make(simplekvs, 0)
+		riostat.Disk[disk] = make(cmn.SimpleKVs, 0)
 		riostat.Disk[disk]["%util"] = strconv.Itoa(0)
 
 	}
 	ctx.rg = &rungroup{
-		runarr: make([]runner, 0, 4),
-		runmap: make(map[string]runner),
+		runarr: make([]cmn.Runner, 0, 4),
+		runmap: make(map[string]cmn.Runner),
 	}
 	ctx.rg.add(riostat, xiostat)
 
@@ -375,8 +376,8 @@ func testChangedFSUsedPercentageBeforeCapCheck(t *testing.T, riostat *iostatrunn
 	}
 
 	ctx.config.LRU.HighWM = uint32(curCapacity + 10)
-	lctx.computeThrottle("/")
-	sleepDuration = lctx.throttle.sleep
+	lctx.thrctx.computeThrottle(newLRUThrottleParams(lctx.fs, "/"))
+	sleepDuration = lctx.thrctx.sleep
 	if sleepDuration != initThrottleSleep {
 		t.Errorf("Expected sleep duration [%v] Actual sleep duration: [%v]", initThrottleSleep, sleepDuration)
 	}
@@ -396,8 +397,8 @@ func testChangedDiskUtilBeforeUtilCheck(t *testing.T, riostat *iostatrunner) {
 		riostat.Disk[disk]["%util"] = "99"
 	}
 
-	lctx.computeThrottle("/")
-	sleepDuration = lctx.throttle.sleep
+	lctx.thrctx.computeThrottle(newLRUThrottleParams(lctx.fs, "/"))
+	sleepDuration = lctx.thrctx.sleep
 	if sleepDuration != 0 {
 		t.Errorf("Expected sleep duration [%v] Actual sleep duration: [%v]", 0, sleepDuration)
 	}
@@ -409,25 +410,22 @@ func getSleepDuration(diskUtil uint32, lctx *lructx, riostat *iostatrunner) time
 		riostat.Disk[disk]["%util"] = strconv.Itoa(int(diskUtil))
 	}
 
-	lctx.throttle.nextCapCheck = time.Time{}
-	lctx.throttle.nextUtilCheck = time.Time{}
+	lctx.thrctx.nextCapCheck = time.Time{}
+	lctx.thrctx.nextUtilCheck = time.Time{}
 
-	lctx.computeThrottle("/")
-	return lctx.throttle.sleep
+	lctx.thrctx.computeThrottle(newLRUThrottleParams(lctx.fs, "/"))
+	return lctx.thrctx.sleep
 }
 
 func newLruContext() *lructx {
 	fileSystem, _ := fs.Fqn2fsAtStartup("/")
 	lruContext := &lructx{
 		xlru: new(xactLRU),
-		throttle: struct {
-			sleep         time.Duration
-			nextUtilCheck time.Time
-			nextCapCheck  time.Time
-			prevUtilPct   float32
-			prevFSUsedPct uint64
-		}{sleep: 0},
-		fs: fileSystem,
+		fs:   fileSystem,
 	}
 	return lruContext
+}
+
+func newLRUThrottleParams(fs, fqn string) *throttleParams {
+	return &throttleParams{throttle: onDiskUtil | onFSUsed, fs: fs, fqn: fqn}
 }

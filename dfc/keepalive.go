@@ -2,19 +2,20 @@
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
-
 // Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
-	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
 )
 
 const (
@@ -36,7 +37,7 @@ var (
 )
 
 type registerer interface {
-	register(t time.Duration) (int, error)
+	register(keepalive bool, t time.Duration) (int, error)
 }
 
 type keepaliver interface {
@@ -57,7 +58,7 @@ type proxyKeepaliveRunner struct {
 }
 
 type keepalive struct {
-	namedrunner
+	cmn.Named
 	k                          keepaliver
 	kt                         KeepaliveTracker
 	tt                         *timeoutTracker
@@ -123,7 +124,7 @@ func (tkr *targetKeepaliveRunner) doKeepalive() (stopped bool) {
 	if smap == nil || !smap.isValid() {
 		return
 	}
-	if stopped = tkr.register(tkr.t, smap.ProxySI.DaemonID); stopped {
+	if stopped = tkr.register(tkr.t, tkr.t.statsif, smap.ProxySI.DaemonID); stopped {
 		if smap = tkr.t.smapowner.get(); smap != nil && smap.isValid() {
 			tkr.t.onPrimaryProxyFailure()
 		}
@@ -143,7 +144,7 @@ func (pkr *proxyKeepaliveRunner) doKeepalive() (stopped bool) {
 		return
 	}
 
-	if stopped = pkr.register(pkr.p, smap.ProxySI.DaemonID); stopped {
+	if stopped = pkr.register(pkr.p, pkr.p.statsif, smap.ProxySI.DaemonID); stopped {
 		pkr.p.onPrimaryProxyFailure()
 	}
 	return
@@ -162,10 +163,12 @@ func (pkr *proxyKeepaliveRunner) pingAllOthers() (stopped bool) {
 	var (
 		smap       = pkr.p.smapowner.get()
 		wg         = &sync.WaitGroup{}
-		stoppedCh  = make(chan struct{}, smap.countProxies()+smap.countTargets())
-		toRemoveCh = make(chan string, smap.countProxies()+smap.countTargets())
+		daemonCnt  = smap.CountProxies() + smap.CountTargets()
+		stoppedCh  = make(chan struct{}, daemonCnt)
+		toRemoveCh = make(chan string, daemonCnt)
+		latencyCh  = make(chan time.Duration, daemonCnt)
 	)
-	for _, daemons := range []map[string]*daemonInfo{smap.Tmap, smap.Pmap} {
+	for _, daemons := range []map[string]*cluster.Snode{smap.Tmap, smap.Pmap} {
 		for sid, si := range daemons {
 			if sid == pkr.p.si.DaemonID {
 				continue
@@ -175,17 +178,20 @@ func (pkr *proxyKeepaliveRunner) pingAllOthers() (stopped bool) {
 				continue
 			}
 			wg.Add(1)
-			go func(si *daemonInfo) {
+			go func(si *cluster.Snode) {
 				if len(stoppedCh) > 0 {
 					wg.Done()
 					return
 				}
-				ok, s := pkr.ping(si)
+				ok, s, lat := pkr.ping(si)
 				if s {
 					stoppedCh <- struct{}{}
 				}
 				if !ok {
 					toRemoveCh <- si.DaemonID
+				}
+				if lat != defaultTimeout {
+					latencyCh <- lat
 				}
 				wg.Done()
 			}(si)
@@ -194,6 +200,9 @@ func (pkr *proxyKeepaliveRunner) pingAllOthers() (stopped bool) {
 	wg.Wait()
 	close(stoppedCh)
 	close(toRemoveCh)
+	close(latencyCh)
+
+	pkr.statsMinMaxLat(latencyCh)
 
 	pkr.p.smapowner.Lock()
 	newSmap := pkr.p.smapowner.get()
@@ -212,13 +221,17 @@ func (pkr *proxyKeepaliveRunner) pingAllOthers() (stopped bool) {
 		return false
 	}
 	clone := newSmap.clone()
+	metaction := "keepalive: removing ["
 	for sid := range toRemoveCh {
-		if clone.getProxy(sid) != nil {
+		if clone.GetProxy(sid) != nil {
 			clone.delProxy(sid)
+			metaction += " proxy " + sid
 		} else {
 			clone.delTarget(sid)
+			metaction += " target " + sid
 		}
 	}
+	metaction += " ]"
 
 	pkr.p.smapowner.put(clone)
 	if errstr := pkr.p.smapowner.persist(clone, true); errstr != "" {
@@ -226,30 +239,59 @@ func (pkr *proxyKeepaliveRunner) pingAllOthers() (stopped bool) {
 	}
 	pkr.p.smapowner.Unlock()
 
-	pkr.p.metasyncer.sync(true, &revspair{
-		revs: clone,
-		msg: &ActionMsg{
-			Action: fmt.Sprintf("keepalive: removing non-responding daemons"),
-		},
-	})
+	pkr.p.metasyncer.sync(true, clone, metaction)
 	return
 }
 
-func (pkr *proxyKeepaliveRunner) ping(to *daemonInfo) (ok, stopped bool) {
-	url := to.DirectURL + URLPath(Rversion, Rhealth) + "?" + URLParamFromID + "=" + pkr.p.si.DaemonID
-	timeout := time.Duration(pkr.timeoutStatsForDaemon(to.DaemonID).timeout)
-	t := time.Now()
-	res := pkr.p.call(nil, to, url, http.MethodGet, nil, timeout)
-	pkr.updateTimeoutForDaemon(to.DaemonID, time.Since(t))
-
-	if res.err == nil {
-		return true, false
+// min & max keepalive stats
+func (pkr *proxyKeepaliveRunner) statsMinMaxLat(latencyCh chan time.Duration) {
+	min, max := time.Duration(time.Hour), time.Duration(0)
+	for lat := range latencyCh {
+		if min > lat && lat != 0 {
+			min = lat
+		}
+		if max < lat {
+			max = lat
+		}
 	}
-	glog.Warningf("initial keepalive failed, err: %v, status: %d, polling again", res.err, res.status)
-	return pkr.retry(to, url)
+	if min != time.Duration(time.Hour) {
+		pkr.p.statsif.add(statKeepAliveMinLatency, int64(min/time.Microsecond))
+	}
+	if max != 0 {
+		pkr.p.statsif.add(statKeepAliveMaxLatency, int64(max/time.Microsecond))
+	}
 }
 
-func (pkr *proxyKeepaliveRunner) retry(si *daemonInfo, url string) (ok, stopped bool) {
+func (pkr *proxyKeepaliveRunner) ping(to *cluster.Snode) (ok, stopped bool, delta time.Duration) {
+	query := url.Values{}
+	query.Add(cmn.URLParamFromID, pkr.p.si.DaemonID)
+
+	timeout := time.Duration(pkr.timeoutStatsForDaemon(to.DaemonID).timeout)
+	args := callArgs{
+		si: to,
+		req: reqArgs{
+			method: http.MethodGet,
+			base:   to.IntraControlNet.DirectURL,
+			path:   cmn.URLPath(cmn.Version, cmn.Health),
+			query:  query,
+		},
+		timeout: timeout,
+	}
+	t := time.Now()
+	res := pkr.p.call(args)
+	delta = time.Since(t)
+	pkr.updateTimeoutForDaemon(to.DaemonID, delta)
+	pkr.p.statsif.add(statKeepAliveLatency, int64(delta/time.Microsecond))
+
+	if res.err == nil {
+		return true, false, delta
+	}
+	glog.Warningf("initial keepalive failed, err: %v, status: %d, polling again", res.err, res.status)
+	ok, stopped = pkr.retry(to, args)
+	return ok, stopped, defaultTimeout
+}
+
+func (pkr *proxyKeepaliveRunner) retry(si *cluster.Snode, args callArgs) (ok, stopped bool) {
 	var (
 		i       int
 		timeout = time.Duration(pkr.timeoutStatsForDaemon(si.DaemonID).timeout)
@@ -263,7 +305,8 @@ func (pkr *proxyKeepaliveRunner) retry(si *daemonInfo, url string) (ok, stopped 
 		select {
 		case <-ticker.C:
 			t := time.Now()
-			res := pkr.p.call(nil, si, url, http.MethodGet, nil, timeout)
+			args.timeout = timeout
+			res := pkr.p.call(args)
 			timeout = pkr.updateTimeoutForDaemon(si.DaemonID, time.Since(t))
 			if res.err == nil {
 				return true, false
@@ -274,7 +317,7 @@ func (pkr *proxyKeepaliveRunner) retry(si *daemonInfo, url string) (ok, stopped 
 					", removing daemon %s from smap", si.DaemonID)
 				return false, false
 			}
-			if IsErrConnectionRefused(res.err) || res.status == http.StatusRequestTimeout {
+			if cmn.IsErrConnectionRefused(res.err) || res.status == http.StatusRequestTimeout {
 				continue
 			}
 			glog.Warningf("keepalive: Unexpected status %d, err: %v", res.status, res.err)
@@ -286,8 +329,8 @@ func (pkr *proxyKeepaliveRunner) retry(si *daemonInfo, url string) (ok, stopped 
 	}
 }
 
-func (k *keepalive) run() error {
-	glog.Infof("Starting %s", k.name)
+func (k *keepalive) Run() error {
+	glog.Infof("Starting %s", k.Getname())
 	ticker := time.NewTicker(k.interval)
 	lastCheck := time.Time{}
 
@@ -321,11 +364,13 @@ func (k *keepalive) run() error {
 }
 
 // register is called by non-primary proxies and targets to send a keepalive to the primary proxy.
-func (k *keepalive) register(r registerer, primaryProxyID string) (stopped bool) {
+func (k *keepalive) register(r registerer, statsif statsif, primaryProxyID string) (stopped bool) {
 	timeout := time.Duration(k.timeoutStatsForDaemon(primaryProxyID).timeout)
 	now := time.Now()
-	s, err := r.register(timeout)
-	timeout = k.updateTimeoutForDaemon(primaryProxyID, time.Since(now))
+	s, err := r.register(true, timeout)
+	delta := time.Since(now)
+	statsif.add(statKeepAliveLatency, int64(delta/time.Microsecond))
+	timeout = k.updateTimeoutForDaemon(primaryProxyID, delta)
 	if err == nil {
 		return
 	}
@@ -339,7 +384,7 @@ func (k *keepalive) register(r registerer, primaryProxyID string) (stopped bool)
 		case <-ticker.C:
 			i++
 			now = time.Now()
-			s, err = r.register(timeout)
+			s, err = r.register(true, timeout)
 			timeout = k.updateTimeoutForDaemon(primaryProxyID, time.Since(now))
 			if err == nil {
 				glog.Infof(
@@ -351,7 +396,7 @@ func (k *keepalive) register(r registerer, primaryProxyID string) (stopped bool)
 					"daemon failed to register after retrying three times, removing from smap")
 				return true
 			}
-			if IsErrConnectionRefused(err) || s == http.StatusRequestTimeout {
+			if cmn.IsErrConnectionRefused(err) || s == http.StatusRequestTimeout {
 				continue
 			}
 			glog.Warningf(
@@ -400,7 +445,7 @@ func (k *keepalive) timeoutStatsForDaemon(sid string) *timeoutStats {
 }
 
 func (k *keepalive) onerr(err error, status int) {
-	if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
+	if cmn.IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
 		k.controlCh <- controlSignal{msg: someError, err: err}
 	}
 }
@@ -413,8 +458,8 @@ func (k *keepalive) isTimeToPing(sid string) bool {
 	return k.kt.TimedOut(sid)
 }
 
-func (k *keepalive) stop(err error) {
-	glog.Infof("Stopping %s, err: %v", k.name, err)
+func (k *keepalive) Stop(err error) {
+	glog.Infof("Stopping %s, err: %v", k.Getname(), err)
 	k.controlCh <- controlSignal{msg: stop}
 	close(k.controlCh)
 }

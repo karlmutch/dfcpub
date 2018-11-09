@@ -12,8 +12,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
-	"github.com/NVIDIA/dfcpub/pkg/client/readers"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 const (
@@ -47,7 +46,7 @@ var (
 	objlimit               int64
 	prefix                 string
 	abortonerr             = false
-	readerType             = readers.ReaderTypeSG
+	readerType             = tutils.ReaderTypeSG
 	prefetchPrefix         = "__bench/test-"
 	prefetchRegex          = "^\\d22\\d?"
 	prefetchRange          = "0:2000"
@@ -60,14 +59,14 @@ var (
 	clichecksum            string
 	cycles                 int
 
-	clibucket string
-	proxyurl  string
-	usingSG   bool // True if using SGL as reader backing memory
-	usingFile bool // True if using file as reader backing
+	clibucket  string
+	proxyURLRO string // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
+	usingSG    bool   // True if using SGL as reader backing memory
+	usingFile  bool   // True if using file as reader backing
 )
 
 func init() {
-	flag.StringVar(&proxyurl, "url", ProxyURL, "Proxy URL")
+	flag.StringVar(&proxyURLRO, "url", ProxyURL, "Proxy URL")
 	flag.IntVar(&numfiles, "numfiles", 100, "Number of the files to download")
 	flag.IntVar(&numworkers, "numworkers", 10, "Number of the workers")
 	flag.StringVar(&match, "match", ".*", "object name regex")
@@ -79,9 +78,9 @@ func init() {
 	flag.StringVar(&prefetchPrefix, "prefetchprefix", prefetchPrefix, "Prefix for Prefix-Regex Prefetch")
 	flag.StringVar(&prefetchRegex, "prefetchregex", prefetchRegex, "Regex for Prefix-Regex Prefetch")
 	flag.StringVar(&prefetchRange, "prefetchrange", prefetchRange, "Range for Prefix-Regex Prefetch")
-	flag.StringVar(&readerType, "readertype", readers.ReaderTypeSG,
-		fmt.Sprintf("Type of reader. {%s(default) | %s | %s | %s", readers.ReaderTypeSG,
-			readers.ReaderTypeFile, readers.ReaderTypeInMem, readers.ReaderTypeRand))
+	flag.StringVar(&readerType, "readertype", tutils.ReaderTypeSG,
+		fmt.Sprintf("Type of reader. {%s(default) | %s | %s | %s", tutils.ReaderTypeSG,
+			tutils.ReaderTypeFile, tutils.ReaderTypeInMem, tutils.ReaderTypeRand))
 	flag.BoolVar(&skipdel, "nodel", false, "Run only PUT and GET in a loop and do cleanup once at the end")
 	flag.IntVar(&numops, "numops", 4, "Number of PUT/GET per worker")
 	flag.IntVar(&fnlen, "fnlen", 20, "Length of randomly generated filenames")
@@ -99,13 +98,17 @@ func init() {
 
 	flag.Parse()
 
-	usingSG = readerType == readers.ReaderTypeSG
-	usingFile = readerType == readers.ReaderTypeFile
+	usingSG = readerType == tutils.ReaderTypeSG
+	usingFile = readerType == tutils.ReaderTypeFile
 	checkMemory()
+
+	if tutils.DockerRunning() && proxyURLRO == ProxyURL {
+		proxyURLRO = "http://172.50.0.2:8080"
+	}
 }
 
 func checkMemory() {
-	if readerType == readers.ReaderTypeSG || readerType == readers.ReaderTypeInMem {
+	if readerType == tutils.ReaderTypeSG || readerType == tutils.ReaderTypeInMem {
 		megabytes, _ := dfc.TotalMemory()
 		if megabytes < PhysMemSizeWarn {
 			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider use other reader type\n", megabytes)
@@ -122,12 +125,12 @@ func TestMain(m *testing.M) {
 
 	// primary proxy can change if proxy tests are run and no new cluster is re-deployed before each test
 	// find out who is the current primary proxy
-	url, err := client.GetPrimaryProxy(proxyurl)
+	url, err := tutils.GetPrimaryProxy(proxyURLRO)
 	if err != nil {
-		fmt.Printf("Failed to get primary proxy, err = %v", err)
+		tutils.Logf("Failed to get primary proxy, err = %v", err)
 		os.Exit(1)
 	}
 
-	proxyurl = url
+	proxyURLRO = url
 	os.Exit(m.Run())
 }

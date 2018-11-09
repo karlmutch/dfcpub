@@ -1,61 +1,48 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
-	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
 )
 
-const (
-	RWPolicyCloud    = "cloud"
-	RWPolicyNextTier = "next_tier"
-)
+// NOTE: to access bucket metadata and related structures, external
+//       packages and HTTP clients must import dfcpub/cluster (and not dfc)
 
-type BucketProps struct {
-	CloudProvider string `json:"cloud_provider,omitempty"`
-	NextTierURL   string `json:"next_tier_url,omitempty"`
-	ReadPolicy    string `json:"read_policy,omitempty"`
-	WritePolicy   string `json:"write_policy,omitempty"`
-}
-
+// - bucketMD is a server-side extension of the cluster.BMD
+// - bucketMD represents buckets (that store objects) and associated metadata
+// - bucketMD (instance) can be obtained via bmdowner.get()
+// - bucketMD is immutable and versioned
+// - bucketMD versioning is monotonic and incremental
+//
+// - bucketMD typical update transaction:
+// lock -- clone() -- modify the clone -- bmdowner.put(clone) -- unlock
+//
+// (*) for merges and conflict resolution, check the current version prior to put()
+//     (note that version check must be protected by the same critical section)
+//
 type bucketMD struct {
-	LBmap   map[string]BucketProps `json:"l_bmap"` // local cache-only buckets and their props
-	CBmap   map[string]BucketProps `json:"c_bmap"` // Cloud-based buckets and their DFC-only metadata
-	Version int64                  `json:"version"`
+	cluster.BMD
+	vstr string // itoa(Version), to have it handy for http redirects
 }
 
-type bmdowner struct {
-	sync.Mutex
-	bucketmd unsafe.Pointer
-}
-
-func (r *bmdowner) put(bucketmd *bucketMD) {
-	atomic.StorePointer(&r.bucketmd, unsafe.Pointer(bucketmd))
-}
-
-// the intended and implied usage of this inconspicuous method is CoW:
-// - read (shared/replicated bucket-metadata object) freely
-// - clone for writing
-// - and never-ever modify in place
-func (r *bmdowner) get() (bucketmd *bucketMD) {
-	bucketmd = (*bucketMD)(atomic.LoadPointer(&r.bucketmd))
-	return
-}
-
+// c-tor
 func newBucketMD() *bucketMD {
-	return &bucketMD{
-		LBmap: make(map[string]BucketProps),
-		CBmap: make(map[string]BucketProps),
-	}
+	lbmap := make(map[string]cmn.BucketProps)
+	cbmap := make(map[string]cmn.BucketProps)
+	return &bucketMD{cluster.BMD{LBmap: lbmap, CBmap: cbmap}, ""}
 }
 
-func (m *bucketMD) add(b string, local bool, p BucketProps) bool {
+func (m *bucketMD) add(b string, local bool, p cmn.BucketProps) bool {
 	mm := m.LBmap
 	if !local {
 		mm = m.CBmap
@@ -81,7 +68,7 @@ func (m *bucketMD) del(b string, local bool) bool {
 	return true
 }
 
-func (m *bucketMD) get(b string, local bool) (bool, BucketProps) {
+func (m *bucketMD) get(b string, local bool) (bool, cmn.BucketProps) {
 	mm := m.LBmap
 	if !local {
 		mm = m.CBmap
@@ -90,13 +77,13 @@ func (m *bucketMD) get(b string, local bool) (bool, BucketProps) {
 	return ok, p
 }
 
-func (m *bucketMD) set(b string, local bool, p BucketProps) {
+func (m *bucketMD) set(b string, local bool, p cmn.BucketProps) {
 	mm := m.LBmap
 	if !local {
 		mm = m.CBmap
 	}
 	if _, ok := mm[b]; !ok {
-		assert(false)
+		cmn.Assert(false)
 	}
 
 	m.Version++
@@ -108,6 +95,25 @@ func (m *bucketMD) islocal(bucket string) bool {
 	return ok
 }
 
+func (m *bucketMD) propsAndChecksum(bucket string) (p cmn.BucketProps, checksum string, defined bool) {
+	var ok bool
+	ok, p = m.get(bucket, m.islocal(bucket))
+	if !ok || p.Checksum == cmn.ChecksumInherit {
+		return p, "", false
+	}
+	return p, p.Checksum, true
+}
+
+// lruEnabled returns whether or not LRU is enabled
+// for the bucket. Returns the global setting if bucket not found
+func (m *bucketMD) lruEnabled(bucket string) bool {
+	ok, p := m.get(bucket, m.islocal(bucket))
+	if !ok {
+		return ctx.config.LRU.LRUEnabled
+	}
+	return p.LRUEnabled
+}
+
 func (m *bucketMD) clone() *bucketMD {
 	dst := &bucketMD{}
 	m.deepcopy(dst)
@@ -115,11 +121,11 @@ func (m *bucketMD) clone() *bucketMD {
 }
 
 func (m *bucketMD) deepcopy(dst *bucketMD) {
-	copyStruct(dst, m)
-	dst.LBmap = make(map[string]BucketProps, len(m.LBmap))
-	dst.CBmap = make(map[string]BucketProps, len(m.CBmap))
-	inmaps := [2]map[string]BucketProps{m.LBmap, m.CBmap}
-	outmaps := [2]map[string]BucketProps{dst.LBmap, dst.CBmap}
+	cmn.CopyStruct(dst, m)
+	dst.LBmap = make(map[string]cmn.BucketProps, len(m.LBmap))
+	dst.CBmap = make(map[string]cmn.BucketProps, len(m.CBmap))
+	inmaps := [2]map[string]cmn.BucketProps{m.LBmap, m.CBmap}
+	outmaps := [2]map[string]cmn.BucketProps{dst.LBmap, dst.CBmap}
 	for i := 0; i < len(inmaps); i++ {
 		mm := outmaps[i]
 		for name, props := range inmaps[i] {
@@ -135,5 +141,32 @@ func (m *bucketMD) tag() string    { return bucketmdtag }
 func (m *bucketMD) version() int64 { return m.Version }
 
 func (m *bucketMD) marshal() ([]byte, error) {
-	return json.Marshal(m)
+	return jsonCompat.Marshal(m) // jsoniter + sorting
+}
+
+//=====================================================================
+//
+// bmdowner: implements cluster.Bowner interface
+//
+//=====================================================================
+var _ cluster.Bowner = &bmdowner{}
+
+type bmdowner struct {
+	sync.Mutex
+	bucketmd unsafe.Pointer
+}
+
+func (r *bmdowner) put(bucketmd *bucketMD) {
+	bucketmd.vstr = strconv.FormatInt(bucketmd.Version, 10)
+	atomic.StorePointer(&r.bucketmd, unsafe.Pointer(bucketmd))
+}
+
+// implements cluster.Bowner.Get
+func (r *bmdowner) Get() *cluster.BMD {
+	bucketmd := (*bucketMD)(atomic.LoadPointer(&r.bucketmd))
+	return &bucketmd.BMD
+}
+func (r *bmdowner) get() (bucketmd *bucketMD) {
+	bucketmd = (*bucketMD)(atomic.LoadPointer(&r.bucketmd))
+	return
 }

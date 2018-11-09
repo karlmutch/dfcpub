@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/webdav"
-	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 func TestName(t *testing.T) {
@@ -138,7 +138,7 @@ func TestName(t *testing.T) {
 }
 
 func TestGroup(t *testing.T) {
-	act := groupBucketEntries("", []*dfc.BucketEntry{
+	act := groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "dir/file1", Size: 16},
 	})
 
@@ -146,7 +146,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "dir", size: 0, mode: defaultDirMode},
 	})
 
-	act = groupBucketEntries("", []*dfc.BucketEntry{
+	act = groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "dir/file1", Size: 16},
 		{Name: "dir/file2", Size: 160},
 		{Name: "dir/file1", Size: 16},
@@ -156,7 +156,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "dir", size: 0, mode: defaultDirMode},
 	})
 
-	act = groupBucketEntries("", []*dfc.BucketEntry{
+	act = groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "dir/file1", Size: 16},
 		{Name: "dir/file2", Size: 160},
 		{Name: "file1", Size: 164},
@@ -167,7 +167,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "file1", size: 164, mode: defaultFileMode},
 	})
 
-	act = groupBucketEntries("", []*dfc.BucketEntry{
+	act = groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "dir/file1", Size: 16},
 		{Name: "file1", Size: 164},
 		{Name: "dir/file2", Size: 160},
@@ -178,7 +178,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "file1", size: 164, mode: defaultFileMode},
 	})
 
-	act = groupBucketEntries("", []*dfc.BucketEntry{
+	act = groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "file1", Size: 164},
 		{Name: "dir/file1", Size: 16},
 		{Name: "dir/file2", Size: 160},
@@ -189,7 +189,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "file1", size: 164, mode: defaultFileMode},
 	})
 
-	act = groupBucketEntries("", []*dfc.BucketEntry{
+	act = groupBucketEntries("", []*cmn.BucketEntry{
 		{Name: "file1", Size: 164},
 		{Name: "dir/dir2/file1", Size: 16},
 		{Name: "dir/file2", Size: 160},
@@ -200,7 +200,7 @@ func TestGroup(t *testing.T) {
 		&fileInfo{name: "file1", size: 164, mode: defaultFileMode},
 	})
 
-	act = groupBucketEntries("loader", []*dfc.BucketEntry{
+	act = groupBucketEntries("loader", []*cmn.BucketEntry{
 		{Name: "loader/file1", Size: 164},
 		{Name: "loader/dir/dir2/file1", Size: 16},
 		{Name: "loader/dir/file2", Size: 160},
@@ -212,7 +212,7 @@ func TestGroup(t *testing.T) {
 	})
 }
 
-func groupBucketEntries(prefix string, entries []*dfc.BucketEntry) []os.FileInfo {
+func groupBucketEntries(prefix string, entries []*cmn.BucketEntry) []os.FileInfo {
 	act := group(entries, prefix)
 	return act
 }
@@ -302,14 +302,14 @@ func readTestRoot(t *testing.T) []string {
 		t.Fatalf("%s exists but not a directory", rootDir)
 	}
 
-	var files []string
 	fis, err := ioutil.ReadDir(rootDir)
 	if err != nil {
 		t.Fatalf("Failed to read test directory, err = %v", err)
 	}
 
-	for _, file := range fis {
-		files = append(files, file.Name())
+	files := make([]string, len(fis))
+	for idx, file := range fis {
+		files[idx] = file.Name()
 	}
 
 	return files
@@ -371,7 +371,7 @@ func readDir(t *testing.T, fs webdav.FileSystem, pth string) ([]os.FileInfo, err
 // This requirement can be removed after proxy/target can be started in unit test
 // Also assumes the localhost:8080 is one of the proxy
 func TestFS(t *testing.T) {
-	leader, err := client.GetPrimaryProxy("http://127.0.0.1:8080")
+	leader, err := tutils.GetPrimaryProxy("http://127.0.0.1:8080")
 	if err != nil {
 		t.Fatal(err)
 	}

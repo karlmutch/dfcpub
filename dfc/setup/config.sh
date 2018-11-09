@@ -1,9 +1,16 @@
-	cat > $CONFFILE <<EOL
+cat > $CONFFILE <<EOL
 {
 	"confdir":                	"$CONFDIR",
 	"cloudprovider":		"${CLDPROVIDER}",
 	"cloud_buckets":		"cloud",
 	"local_buckets":		"local",
+	"readahead": {
+		"rahobjectmem":		1048576,
+		"rahtotalmem":		1073741824,
+		"rahbyproxy":		true,
+		"rahdiscard":		false,
+		"rahenabled":		false
+	},
 	"log": {
 		"logdir":		"$LOGDIR",
 		"loglevel": 		"${LOGLEVEL}",
@@ -42,46 +49,54 @@
 	    "disk_util_high_wm":     80
 	},
 	"rebalance_conf": {
-		"startup_delay_time":	"3m",
 		"dest_retry_time":	"2m",
 		"rebalancing_enabled": 	true
 	},
+	"replication": {
+		"replicate_on_cold_get": 		false,
+		"replicate_on_put": 			false,
+		"replicate_on_lru_eviction": 	false
+	},
 	"cksum_config": {
-                 "checksum":                    "xxhash",
-                 "validate_checksum_cold_get":  true,
-                 "validate_checksum_warm_get":  false,
-                 "enable_read_range_checksum":  false
+		"checksum":                    "xxhash",
+		"validate_checksum_cold_get":  true,
+		"validate_checksum_warm_get":  false,
+		"enable_read_range_checksum":  false
 	},
 	"version_config": {
 		"validate_version_warm_get":    false,
 		"versioning":                   "all"
 	},
 	"fspaths": {
-	    $FSPATHS
+		$FSPATHS
 	},
 	"test_fspaths": {
-		"root":			"/tmp/dfc/",
+		"root":			"/tmp/dfc$NEXT_TIER/",
 		"count":		$TESTFSPATHCOUNT,
 		"instance":		$c
 	},
 	"netconfig": {
-		"ipv4": "$IPV4LIST",
+		"ipv4":               "${IPV4LIST}",
+		"ipv4_intra_control": "${IPV4LIST_INTRA_CONTROL}",
+		"ipv4_intra_data":     "${IPV4LIST_INTRA_DATA}",
 		"l4": {
-			"proto": 	"tcp",
-			"port":		"${PORT}"
+			"proto":              "tcp",
+			"port":	              "${PORT}",
+			"port_intra_control": "${PORT_INTRA_CONTROL}",
+			"port_intra_data":    "${PORT_INTRA_DATA}"
 		},
 		"http": {
-			"max_num_targets":    16,
-			"use_https":          ${USE_HTTPS},
-			"use_as_proxy":       false,
-			"server_certificate": "server.crt",
-			"server_key":         "server.key"
+			"rproxy":		"",
+			"server_certificate":	"server.crt",
+			"server_key":		"server.key",
+			"max_num_targets":	16,
+			"use_https":		${USE_HTTPS}
 		}
 	},
-	"fschecker": {
-		"fschecker_enabled":      true,
-		"fschecker_test_files":   4,
-		"fschecker_error_limit":  2
+	"fshc": {
+		"fshc_enabled":		true,
+		"fshc_test_files":	4,
+		"fshc_error_limit":	2
 	},
 	"auth": {
 		"secret": "$SECRETKEY",
@@ -103,15 +118,14 @@
 }
 EOL
 
-	cat > $CONFFILE_STATSD <<EOL
+cat > $CONFFILE_STATSD <<EOL
 {
-	graphitePort: 2003,
-	graphiteHost: "${GRAPHITE_SERVER}",
-	port: 8125
+	graphitePort: ${GRAPHITE_PORT},
+	graphiteHost: "${GRAPHITE_SERVER}"
 }
 EOL
 
-	cat > $CONFFILE_COLLECTD <<EOL
+cat > $CONFFILE_COLLECTD <<EOL
 LoadPlugin df
 LoadPlugin cpu
 LoadPlugin disk
@@ -122,35 +136,35 @@ LoadPlugin processes
 LoadPlugin write_graphite
 
 <Plugin syslog>
-        LogLevel info
+	LogLevel info
 </Plugin>
 
 <Plugin df>
-        FSType rootfs
-        FSType sysfs
-        FSType proc
-        FSType devtmpfs
-        FSType devpts
-        FSType tmpfs
-        FSType fusectl
-        FSType cgroup
-        IgnoreSelected true
-        ValuesPercentage True
+	FSType rootfs
+	FSType sysfs
+	FSType proc
+	FSType devtmpfs
+	FSType devpts
+	FSType tmpfs
+	FSType fusectl
+	FSType cgroup
+	IgnoreSelected true
+	ValuesPercentage True
 </Plugin>
 
 <Plugin write_graphite>
-        <Node "graphiting">
+	<Node "graphiting">
 		Host "${GRAPHITE_SERVER}"
-                Port "2003"
-                Protocol "tcp"
-                LogSendErrors true
-                StoreRates true
-                AlwaysAppendDS false
-                EscapeCharacter "_"
-        </Node>
+		Port "${GRAPHITE_PORT}"
+		Protocol "tcp"
+		LogSendErrors true
+		StoreRates true
+		AlwaysAppendDS false
+		EscapeCharacter "_"
+	</Node>
 </Plugin>
 
 <Include "/etc/collectd/collectd.conf.d">
-        Filter "*.conf"
+	Filter "*.conf"
 </Include>
 EOL

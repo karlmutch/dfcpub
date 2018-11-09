@@ -2,12 +2,10 @@
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
-
 // Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/json-iterator/go"
 )
 
 const maxRetrySeconds = 5
@@ -30,7 +30,7 @@ const maxRetrySeconds = 5
 //	  in this type scenarios
 func (p *proxyrunner) bootstrap() {
 	var (
-		found, smap    *Smap
+		found, smap    *smapX
 		guessAmPrimary bool
 		getSmapURL     = ctx.config.Proxy.PrimaryURL
 		tout           = ctx.config.Timeout.CplaneOperation
@@ -39,17 +39,17 @@ func (p *proxyrunner) bootstrap() {
 	// step 1: load a local copy of the cluster map and
 	//         try to use it for discovery of the current one
 	smap = newSmap()
-	if err := LocalLoad(filepath.Join(ctx.config.Confdir, smapname), smap); err == nil {
-		if smap.countTargets() > 0 || smap.countProxies() > 1 {
+	if err := cmn.LocalLoad(filepath.Join(ctx.config.Confdir, smapname), smap); err == nil {
+		if smap.CountTargets() > 0 || smap.CountProxies() > 1 {
 			glog.Infof("Fast discovery based on %s", smap.pp())
-			q.Add(URLParamWhat, GetWhatSmapVote)
-			res := p.broadcastCluster(URLPath(Rversion, Rdaemon), q, http.MethodGet, nil, smap, tout)
+			q.Add(cmn.URLParamWhat, cmn.GetWhatSmapVote)
+			res := p.broadcastCluster(cmn.URLPath(cmn.Version, cmn.Daemon), q, http.MethodGet, nil, smap, tout, false)
 			for re := range res {
 				if re.err != nil {
 					continue
 				}
 				svm := SmapVoteMsg{}
-				if err := json.Unmarshal(re.outjson, &svm); err != nil {
+				if err := jsoniter.Unmarshal(re.outjson, &svm); err != nil {
 					continue
 				}
 				if svm.Smap == nil || svm.Smap.version() == 0 {
@@ -84,7 +84,7 @@ func (p *proxyrunner) bootstrap() {
 				found.version(), found.ProxySI.DaemonID, smap.version(), smap.ProxySI.DaemonID)
 			smap = found
 		}
-		getSmapURL = smap.ProxySI.DirectURL
+		getSmapURL = smap.ProxySI.PublicNet.DirectURL
 		smap.Pmap[p.si.DaemonID] = p.si
 		guessAmPrimary = smap.isPrimary(p.si)
 		// environment is a clue, not a prescription: discovered Smap outweighs
@@ -105,7 +105,7 @@ func (p *proxyrunner) bootstrap() {
 	// step 3: join as a non-primary, or
 	// 	   keep starting up as a primary
 	if !guessAmPrimary {
-		assert(getSmapURL != p.si.DirectURL, getSmapURL)
+		cmn.Assert(getSmapURL != p.si.PublicNet.DirectURL, getSmapURL)
 		glog.Infof("%s: starting up as non-primary, joining => %s", p.si.DaemonID, getSmapURL)
 		p.secondaryStartup(getSmapURL)
 		return
@@ -116,29 +116,41 @@ func (p *proxyrunner) bootstrap() {
 
 // no change of mind when on the "secondary" track
 func (p *proxyrunner) secondaryStartup(getSmapURL string) {
-	url := fmt.Sprintf("%s/%s/%s?%s=%s", getSmapURL, Rversion, Rdaemon, URLParamWhat, GetWhatSmap)
+	query := url.Values{}
+	query.Add(cmn.URLParamWhat, cmn.GetWhatSmap)
+	req := reqArgs{
+		method: http.MethodGet,
+		base:   getSmapURL,
+		path:   cmn.URLPath(cmn.Version, cmn.Daemon),
+		query:  query,
+	}
 
 	f := func() {
 		// get Smap
 		var res callResult
+		var args = callArgs{
+			si:      p.si,
+			req:     req,
+			timeout: defaultTimeout,
+		}
 		for i := 0; i < maxRetrySeconds; i++ {
-			res = p.call(nil, p.si, url, http.MethodGet, nil)
+			res = p.call(args)
 			if res.err != nil {
-				if IsErrConnectionRefused(res.err) || res.status == http.StatusRequestTimeout {
-					glog.Errorf("Proxy %s: retrying getting Smap from primary %s", p.si.DaemonID, url)
-					time.Sleep(time.Second)
+				if cmn.IsErrConnectionRefused(res.err) || res.status == http.StatusRequestTimeout {
+					glog.Errorf("Proxy %s: retrying getting Smap from primary %s", p.si.DaemonID, getSmapURL)
+					time.Sleep(ctx.config.Timeout.CplaneOperation)
 					continue
 				}
 			}
 			break
 		}
 		if res.err != nil {
-			s := fmt.Sprintf("Error getting Smap from primary %s: %v", url, res.err)
+			s := fmt.Sprintf("Error getting Smap from primary %s: %v", getSmapURL, res.err)
 			glog.Fatalf("FATAL: %s", s)
 		}
-		smap := &Smap{}
-		if err := json.Unmarshal(res.outjson, smap); err != nil {
-			assert(false, err)
+		smap := &smapX{}
+		if err := jsoniter.Unmarshal(res.outjson, smap); err != nil {
+			cmn.Assert(false, err)
 		}
 		if !smap.isValid() {
 			s := fmt.Sprintf("Invalid Smap at startup/registration: %s", smap.pp())
@@ -175,9 +187,13 @@ func (p *proxyrunner) secondaryStartup(getSmapURL string) {
 // 	- (iii)  merge the Smap containing newly joined nodes with the guessSmap
 // 		 that was previously discovered/merged
 // 	- (iiii) discover cluster-wide metadata, and resolve remaining conflicts
-func (p *proxyrunner) primaryStartup(guessSmap *Smap, ntargets int) {
+func (p *proxyrunner) primaryStartup(guessSmap *smapX, ntargets int) {
+	const (
+		metaction1 = "early-start-have-registrations"
+		metaction2 = "primary-started-up"
+	)
 	// (i) initialize empty Smap
-	assert(p.smapowner.get() == nil)
+	cmn.Assert(p.smapowner.get() == nil)
 	p.smapowner.Lock()
 	startupSmap := newSmap()
 	startupSmap.Pmap[p.si.DaemonID] = p.si
@@ -190,15 +206,15 @@ func (p *proxyrunner) primaryStartup(guessSmap *Smap, ntargets int) {
 
 	smap := p.smapowner.get()
 	if !smap.isPrimary(p.si) {
-		glog.Infof("%s: change of mind #1, registering with %s", p.si.DaemonID, smap.ProxySI.DirectURL)
-		p.secondaryStartup(smap.ProxySI.DirectURL)
+		glog.Infof("%s: change of mind #1, registering with %s", p.si.DaemonID, smap.ProxySI.PublicNet.DirectURL)
+		p.secondaryStartup(smap.ProxySI.PublicNet.DirectURL)
 		return
 	}
 	// (iii) merge with the previously discovered/merged - but only if there were new registrations
 	haveRegistratons := false
 	p.smapowner.Lock()
 	if smap.version() > 0 {
-		assert(smap.countTargets() > 0 || smap.countProxies() > 1)
+		cmn.Assert(smap.CountTargets() > 0 || smap.CountProxies() > 1)
 		haveRegistratons = true
 		guessSmap.merge(smap)
 		p.smapowner.put(smap)
@@ -209,8 +225,8 @@ func (p *proxyrunner) primaryStartup(guessSmap *Smap, ntargets int) {
 
 	smap = p.smapowner.get()
 	if haveRegistratons {
-		glog.Infof("%s: merged local Smap (%d/%d)", p.si.DaemonID, smap.countTargets(), smap.countProxies())
-		p.metasyncer.sync(true, smap, p.bmdowner.get())
+		glog.Infof("%s: merged local Smap (%d/%d)", p.si.DaemonID, smap.CountTargets(), smap.CountProxies())
+		p.metasyncer.sync(true, smap, metaction1, p.bmdowner.get(), metaction1)
 	} else {
 		glog.Infof("%s: no registrations yet", p.si.DaemonID)
 	}
@@ -220,17 +236,17 @@ func (p *proxyrunner) primaryStartup(guessSmap *Smap, ntargets int) {
 	smap = p.smapowner.get()
 
 	if !smap.isPrimary(p.si) {
-		glog.Infof("%s: change of mind #2, registering with %s", p.si.DaemonID, smap.ProxySI.DirectURL)
-		p.secondaryStartup(smap.ProxySI.DirectURL)
+		glog.Infof("%s: change of mind #2, registering with %s", p.si.DaemonID, smap.ProxySI.PublicNet.DirectURL)
+		p.secondaryStartup(smap.ProxySI.PublicNet.DirectURL)
 		return
 	}
 
 	if s := p.smapowner.persist(p.smapowner.get(), true); s != "" {
 		glog.Fatalf("FATAL: %s", s)
 	}
-	p.metasyncer.sync(false, smap, p.bmdowner.get())
+	p.metasyncer.sync(false, smap, metaction2, p.bmdowner.get(), metaction2)
 	glog.Infof("%s: primary/cluster startup complete, Smap v%d, ntargets %d",
-		p.si.DaemonID, smap.version(), smap.countTargets())
+		p.si.DaemonID, smap.version(), smap.CountTargets())
 	p.startedup(1) // started up as primary
 }
 
@@ -241,14 +257,14 @@ func (p *proxyrunner) startup(ntargets int) {
 		if !smap.isPrimary(p.si) {
 			break
 		}
-		nt := smap.countTargets()
+		nt := smap.CountTargets()
 		if nt >= ntargets && ntargets > 0 {
 			glog.Infof("Reached the expected %d/%d target registrations", ntargets, nt)
 			return
 		}
 		time.Sleep(time.Second)
 	}
-	nt := p.smapowner.get().countTargets()
+	nt := p.smapowner.get().CountTargets()
 	if nt > 0 {
 		glog.Warningf("Timed out waiting for %d/%d target registrations", ntargets, nt)
 	}
@@ -289,7 +305,7 @@ func (p *proxyrunner) discoverMeta(haveRegistratons bool) {
 	// merge the discovered (max-version) Smap and the local/current one
 	// that was constructed from scratch via node-joins
 	glog.Infof("%s: merging discovered Smap v%d (%d, %d)", p.si.DaemonID,
-		maxVerSmap.version(), maxVerSmap.countTargets(), maxVerSmap.countProxies())
+		maxVerSmap.version(), maxVerSmap.CountTargets(), maxVerSmap.CountProxies())
 
 	p.smapowner.Lock()
 	clone := p.smapowner.get().clone()
@@ -303,18 +319,18 @@ func (p *proxyrunner) discoverMeta(haveRegistratons bool) {
 	glog.Infof("Merged %s", clone.pp())
 }
 
-func (p *proxyrunner) meta(deadline time.Time) (*Smap, *bucketMD) {
+func (p *proxyrunner) meta(deadline time.Time) (*smapX, *bucketMD) {
 	var (
 		maxVerBucketMD *bucketMD
-		maxVersionSmap *Smap
+		maxVersionSmap *smapX
 		bcastSmap      = p.smapowner.get().clone()
 		q              = url.Values{}
 		tout           = ctx.config.Timeout.CplaneOperation
 		keeptrying     = true
 	)
-	q.Add(URLParamWhat, GetWhatSmapVote)
+	q.Add(cmn.URLParamWhat, cmn.GetWhatSmapVote)
 	for keeptrying && time.Now().Before(deadline) {
-		res := p.broadcastCluster(URLPath(Rversion, Rdaemon), q, http.MethodGet, nil, bcastSmap, tout)
+		res := p.broadcastCluster(cmn.URLPath(cmn.Version, cmn.Daemon), q, http.MethodGet, nil, bcastSmap, tout, false)
 		keeptrying = false
 		for re := range res {
 			if re.err != nil {
@@ -322,7 +338,7 @@ func (p *proxyrunner) meta(deadline time.Time) (*Smap, *bucketMD) {
 				continue
 			}
 			svm := SmapVoteMsg{}
-			if err := json.Unmarshal(re.outjson, &svm); err != nil {
+			if err := jsoniter.Unmarshal(re.outjson, &svm); err != nil {
 				glog.Errorf("Unexpected unmarshal-error: %v", err)
 				keeptrying = true
 				continue
@@ -350,24 +366,24 @@ func (p *proxyrunner) meta(deadline time.Time) (*Smap, *bucketMD) {
 				if svm.Smap.ProxySI != nil {
 					s = " of the current one " + svm.Smap.ProxySI.DaemonID
 				}
-				glog.Errorf("Warning: '%s' is starting up as primary(?) during reelection%s", p.si.DaemonID, s)
+				glog.Warningf("Warning: '%s' is starting up as primary(?) during reelection%s", p.si.DaemonID, s)
 				maxVersionSmap, maxVerBucketMD = nil, nil // zero-out as unusable
 				keeptrying = true
-				time.Sleep(time.Second)
+				time.Sleep(ctx.config.Timeout.CplaneOperation)
 				break
 			}
 		}
-		time.Sleep(time.Second)
+		time.Sleep(ctx.config.Timeout.CplaneOperation)
 	}
 	return maxVersionSmap, maxVerBucketMD
 }
 
 func (p *proxyrunner) registerWithRetry() error {
-	if status, err := p.register(0); err != nil {
-		if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
+	if status, err := p.register(false, defaultTimeout); err != nil {
+		if cmn.IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
 			glog.Errorf("%s: retrying...", p.si.DaemonID)
-			time.Sleep(time.Second)
-			if _, err = p.register(0); err != nil {
+			time.Sleep(ctx.config.Timeout.CplaneOperation)
+			if _, err = p.register(false, defaultTimeout); err != nil {
 				glog.Errorf("%s failed the 2nd attempt to register, err: %v", p.si.DaemonID, err)
 				return err
 			}

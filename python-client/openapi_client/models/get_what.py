@@ -31,6 +31,7 @@ class GetWhat(object):
     CONFIG = "config"
     STATS = "stats"
     XACTION = "xaction"
+    MOUNTPATHS = "mountpaths"
 
     """
     Attributes:

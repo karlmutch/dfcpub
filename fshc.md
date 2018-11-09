@@ -38,14 +38,3 @@ curl -i -X PUT -H 'Content-Type: application/json' \
 	-d '{"action": "setconfig","name": "fschecker_enabled", "value": "true"}' \
 	http://localhost:8084/v1/daemon
 ```
-
-## REST operations
-
-| Operation | HTTP Action | Example |
-|---|---|---|
-| List target's filesystems (target only) | GET /v1/daemon?what=mountpaths | curl -X GET http://localhost:8084/v1/daemon?what=mountpaths |
-| List all targets' filesystems (proxy only) | GET /v1/cluster?what=mountpaths | curl -X GET http://localhost:8080/v1/cluster?what=mountpaths |
-| Enable a filesystem (target only) | PUT {"mountpath": "/dfc/test"} /v1/daemon/mountpaths | curl -X PUT http://localhost::8084/v1/daemon/mountpaths -H 'Content-Type: application/json' -d '{"mountpath": "/dfc/test"}'<sup>[1](#ft1)</sup> |
-
-<a name="ft1">1</a>: The request returns an HTTP status code 204 if the filesystem is already enabled
-

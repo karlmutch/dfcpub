@@ -1,26 +1,23 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"html"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -30,38 +27,105 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/dfc/statsd"
 	"github.com/OneOfOne/xxhash"
+	"github.com/json-iterator/go"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
 
-const ( // => Transport.MaxIdleConnsPerHost
-	targetMaxIdleConnsPer = 4
-	proxyMaxIdleConnsPer  = 8
-	initialBucketListSize = 512
+const ( // to compute MaxIdleConnsPerHost and MaxIdleConns
+	targetMaxIdleConnsPer = 32
+	proxyMaxIdleConnsPer  = 32
+)
+const ( //  h.call(timeout)
+	defaultTimeout = time.Duration(-1)
+	longTimeout    = time.Duration(0)
 )
 
-type objectProps struct {
-	version string
-	size    int64
-	nhobj   cksumvalue
-}
+type (
+	objectProps struct {
+		version string
+		atime   time.Time
+		size    int64
+		nhobj   cksumvalue
+	}
+
+	// callResult contains data returned by a server to server call
+	callResult struct {
+		si      *cluster.Snode
+		outjson []byte
+		err     error
+		errstr  string
+		status  int
+	}
+
+	// reqArgs contains information about the http request which we want to send
+	reqArgs struct {
+		method string      // GET, POST, ...
+		header http.Header // request headers
+		base   string      // base URL: http://xyz.abc
+		path   string      // path URL: /x/y/z
+		query  url.Values  // query: ?x=y&y=z
+		body   []byte      // body for POST, PUT, ...
+	}
+
+	// callArgs contains arguments for a server call
+	callArgs struct {
+		req     reqArgs
+		timeout time.Duration
+		si      *cluster.Snode
+	}
+
+	// bcastCallArgs contains arguments for a broadcast server call
+	bcastCallArgs struct {
+		req             reqArgs
+		internal        bool // specifies if the call is the internal communication
+		timeout         time.Duration
+		servers         []map[string]*cluster.Snode
+		serversToIgnore map[string]struct{}
+	}
+
+	// SmapVoteMsg contains the cluster map and a bool representing whether or not a vote is currently happening.
+	SmapVoteMsg struct {
+		VoteInProgress bool      `json:"vote_in_progress"`
+		Smap           *smapX    `json:"smap"`
+		BucketMD       *bucketMD `json:"bucketmd"`
+	}
+)
 
 //===========
 //
 // interfaces
 //
 //===========
+const initialBucketListSize = 512
+
 type cloudif interface {
-	listbucket(ctx context.Context, bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int)
-	headbucket(ctx context.Context, bucket string) (bucketprops simplekvs, errstr string, errcode int)
+	listbucket(ctx context.Context, bucket string, msg *cmn.GetMsg) (jsbytes []byte, errstr string, errcode int)
+	headbucket(ctx context.Context, bucket string) (bucketprops cmn.SimpleKVs, errstr string, errcode int)
 	getbucketnames(ctx context.Context) (buckets []string, errstr string, errcode int)
 	//
-	headobject(ctx context.Context, bucket string, objname string) (objmeta simplekvs, errstr string, errcode int)
+	headobject(ctx context.Context, bucket string, objname string) (objmeta cmn.SimpleKVs, errstr string, errcode int)
 	//
 	getobj(ctx context.Context, fqn, bucket, objname string) (props *objectProps, errstr string, errcode int)
 	putobj(ctx context.Context, file *os.File, bucket, objname string, ohobj cksumvalue) (version string, errstr string, errcode int)
 	deleteobj(ctx context.Context, bucket, objname string) (errstr string, errcode int)
+}
+
+func (u reqArgs) url() string {
+	url := strings.TrimSuffix(u.base, "/")
+	if !strings.HasPrefix(u.path, "/") {
+		url += "/"
+	}
+	url += u.path
+	query := u.query.Encode()
+	if query != "" {
+		url += "?" + query
+	}
+	return url
 }
 
 //===========
@@ -69,22 +133,14 @@ type cloudif interface {
 // generic bad-request http handler
 //
 //===========
-func invalhdlr(w http.ResponseWriter, r *http.Request) {
-	s := http.StatusText(http.StatusBadRequest)
-	s += ": " + r.Method + " " + r.URL.Path + " from " + r.RemoteAddr
-	glog.Errorln(s)
-	http.Error(w, s, http.StatusBadRequest)
-}
 
 // Copies headers from original request(from client) to
 // a new one(inter-cluster call)
-func copyHeaders(rOrig, rNew *http.Request) {
-	if rOrig == nil || rNew == nil {
-		return
-	}
-
-	for key, value := range rOrig.Header {
-		rNew.Header[key] = value
+func copyHeaders(src http.Header, dst *http.Header) {
+	for k, values := range src {
+		for _, v := range values {
+			dst.Add(k, v)
+		}
 	}
 }
 
@@ -108,25 +164,78 @@ func (r *glogwriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+type netServer struct {
+	s   *http.Server
+	mux *http.ServeMux
+}
+
 type httprunner struct {
-	namedrunner
-	mux                   *http.ServeMux
-	h                     *http.Server
+	cmn.Named
+	publicServer          *netServer
+	intraControlServer    *netServer
+	intraDataServer       *netServer
 	glogger               *log.Logger
-	si                    *daemonInfo
+	si                    *cluster.Snode
 	httpclient            *http.Client // http client for intra-cluster comm
 	httpclientLongTimeout *http.Client // http client for long-wait intra-cluster comm
-	statsif               statsif
 	keepalive             keepaliver
 	smapowner             *smapowner
 	bmdowner              *bmdowner
-	revProxy              *httputil.ReverseProxy
+	xactinp               *xactInProgress
+	statsif               statsif
+	statsdC               statsd.Client
 }
 
-func (h *httprunner) registerhdlr(path string, handler func(http.ResponseWriter, *http.Request)) {
-	h.mux.HandleFunc(path, handler)
+func (server *netServer) listenAndServe(addr string, logger *log.Logger) error {
+	if ctx.config.Net.HTTP.UseHTTPS {
+		server.s = &http.Server{Addr: addr, Handler: server.mux, ErrorLog: logger}
+		if err := server.s.ListenAndServeTLS(ctx.config.Net.HTTP.Certificate, ctx.config.Net.HTTP.Key); err != nil {
+			if err != http.ErrServerClosed {
+				glog.Errorf("Terminated server with err: %v", err)
+				return err
+			}
+		}
+	} else {
+		// Support for h2c is transparent using h2c.NewHandler, which implements a lightweight
+		// wrapper around server.mux.ServeHTTP to check for an h2c connection.
+		server.s = &http.Server{Addr: addr, Handler: h2c.NewHandler(server.mux, &http2.Server{}), ErrorLog: logger}
+		if err := server.s.ListenAndServe(); err != nil {
+			if err != http.ErrServerClosed {
+				glog.Errorf("Terminated server with err: %v", err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (server *netServer) shutdown() {
+	contextwith, cancel := context.WithTimeout(context.Background(), ctx.config.Timeout.Default)
+	if err := server.s.Shutdown(contextwith); err != nil {
+		glog.Infof("Stopped server, err: %v", err)
+	}
+	cancel()
+}
+
+func (h *httprunner) registerPublicNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
+	h.publicServer.mux.HandleFunc(path, handler)
 	if !strings.HasSuffix(path, "/") {
-		h.mux.HandleFunc(path+"/", handler)
+		h.publicServer.mux.HandleFunc(path+"/", handler)
+	}
+}
+
+func (h *httprunner) registerIntraControlNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
+	h.intraControlServer.mux.HandleFunc(path, handler)
+	if !strings.HasSuffix(path, "/") {
+		h.intraControlServer.mux.HandleFunc(path+"/", handler)
+	}
+}
+
+func (h *httprunner) registerIntraDataNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
+	h.intraDataServer.mux.HandleFunc(path, handler)
+	if !strings.HasSuffix(path, "/") {
+		h.intraDataServer.mux.HandleFunc(path+"/", handler)
 	}
 }
 
@@ -142,58 +251,95 @@ func (h *httprunner) init(s statsif, isproxy bool) {
 	if isproxy {
 		perhost = proxyMaxIdleConnsPer
 	}
-	numDaemons := ctx.config.Net.HTTP.MaxNumTargets * 2 // an estimate, given a dual-function
-	assert(numDaemons < 1024)                           // not a limitation!
-	if numDaemons < 4 {
-		numDaemons = 4
+
+	h.httpclient = &http.Client{
+		Transport: h.createTransport(perhost, 0),
+		Timeout:   ctx.config.Timeout.Default, // defaultTimeout
 	}
-
-	h.httpclient =
-		&http.Client{Transport: h.createTransport(perhost, numDaemons), Timeout: ctx.config.Timeout.Default}
-	h.httpclientLongTimeout =
-		&http.Client{Transport: h.createTransport(perhost, numDaemons), Timeout: ctx.config.Timeout.DefaultLong}
-
-	if isproxy && ctx.config.Net.HTTP.UseAsProxy {
-		h.revProxy = &httputil.ReverseProxy{
-			Director:  func(r *http.Request) {},
-			Transport: h.createTransport(proxyMaxIdleConnsPer, numDaemons),
+	h.httpclientLongTimeout = &http.Client{
+		Transport: h.createTransport(perhost, 0),
+		Timeout:   ctx.config.Timeout.DefaultLong, // longTimeout
+	}
+	h.publicServer = &netServer{
+		mux: http.NewServeMux(),
+	}
+	h.intraControlServer = h.publicServer // by default intra control net is the same as public
+	if ctx.config.Net.UseIntraControl {
+		h.intraControlServer = &netServer{
+			mux: http.NewServeMux(),
+		}
+	}
+	h.intraDataServer = h.publicServer // by default intra data net is the same as public
+	if ctx.config.Net.UseIntraData {
+		h.intraDataServer = &netServer{
+			mux: http.NewServeMux(),
 		}
 	}
 
-	h.mux = http.NewServeMux()
 	h.smapowner = &smapowner{}
 	h.bmdowner = &bmdowner{}
+	h.xactinp = newxactinp() // extended actions
 }
 
 // initSI initialize a daemon's identification (never changes once it is set)
 // Note: Sadly httprunner has become the sharing point where common code for
 //       proxyrunner and targetrunner exist.
 func (h *httprunner) initSI() {
-	ipaddr, errstr := getipv4addr()
-	if errstr != "" {
-		glog.Fatalf("FATAL: %s", errstr)
+	allowLoopback, _ := strconv.ParseBool(os.Getenv("ALLOW_LOOPBACK"))
+	addrList, err := getLocalIPv4List(allowLoopback)
+	if err != nil {
+		glog.Fatalf("FATAL: %v", err)
 	}
 
-	h.si = &daemonInfo{}
-	h.si.NodeIPAddr = ipaddr
-	h.si.DaemonPort = ctx.config.Net.L4.Port
-	id := os.Getenv("DFCDAEMONID")
-	if id != "" {
-		h.si.DaemonID = id
-	} else {
-		cs := xxhash.ChecksumString32S(ipaddr+":"+ctx.config.Net.L4.Port, mLCG32)
-		h.si.DaemonID = strconv.Itoa(int(cs & 0xfffff))
+	ipAddr, err := getipv4addr(addrList, ctx.config.Net.IPv4)
+	if err != nil {
+		glog.Fatalf("Failed to get public network address: %v", err)
+	}
+	glog.Infof("Configured PUBLIC NETWORK address: [%s:%d] (out of: %s)\n", ipAddr, ctx.config.Net.L4.Port, ctx.config.Net.IPv4)
+
+	ipAddrIntraControl := net.IP{}
+	if ctx.config.Net.UseIntraControl {
+		ipAddrIntraControl, err = getipv4addr(addrList, ctx.config.Net.IPv4IntraControl)
+		if err != nil {
+			glog.Fatalf("Failed to get intra control network address: %v", err)
+		}
+		glog.Infof("Configured INTRA CONTROL NETWORK address: [%s:%d] (out of: %s)\n",
+			ipAddrIntraControl, ctx.config.Net.L4.PortIntraControl, ctx.config.Net.IPv4IntraControl)
+	}
+
+	ipAddrIntraData := net.IP{}
+	if ctx.config.Net.UseIntraData {
+		ipAddrIntraData, err = getipv4addr(addrList, ctx.config.Net.IPv4IntraData)
+		if err != nil {
+			glog.Fatalf("Failed to get intra data network address: %v", err)
+		}
+		glog.Infof("Configured INTRA DATA NETWORK address: [%s:%d] (out of: %s)\n",
+			ipAddrIntraData, ctx.config.Net.L4.PortIntraData, ctx.config.Net.IPv4IntraData)
+	}
+
+	publicAddr := &net.TCPAddr{
+		IP:   ipAddr,
+		Port: ctx.config.Net.L4.Port,
+	}
+	intraControlAddr := &net.TCPAddr{
+		IP:   ipAddrIntraControl,
+		Port: ctx.config.Net.L4.PortIntraControl,
+	}
+	intraDataAddr := &net.TCPAddr{
+		IP:   ipAddrIntraData,
+		Port: ctx.config.Net.L4.PortIntraData,
+	}
+
+	daemonID := os.Getenv("DFCDAEMONID")
+	if daemonID == "" {
+		cs := xxhash.ChecksumString32S(publicAddr.String(), cluster.MLCG32)
+		daemonID = strconv.Itoa(int(cs & 0xfffff))
 		if testingFSPpaths() {
-			h.si.DaemonID += ":" + ctx.config.Net.L4.Port
+			daemonID += ":" + ctx.config.Net.L4.PortStr
 		}
 	}
 
-	proto := "http"
-	if ctx.config.Net.HTTP.UseHTTPS {
-		proto = "https"
-	}
-
-	h.si.DirectURL = proto + "://" + h.si.NodeIPAddr + ":" + h.si.DaemonPort
+	h.si = newSnode(daemonID, ctx.config.Net.HTTP.proto, publicAddr, intraControlAddr, intraDataAddr)
 }
 
 func (h *httprunner) createTransport(perhost, numDaemons int) *http.Transport {
@@ -211,7 +357,7 @@ func (h *httprunner) createTransport(perhost, numDaemons int) *http.Transport {
 		TLSHandshakeTimeout:   defaultTransport.TLSHandshakeTimeout,
 		// custom
 		MaxIdleConnsPerHost: perhost,
-		MaxIdleConns:        perhost * numDaemons,
+		MaxIdleConns:        0, // Zero means no limit
 	}
 	if ctx.config.Net.HTTP.UseHTTPS {
 		glog.Warningln("HTTPS for inter-cluster communications is not yet supported and should be avoided")
@@ -224,126 +370,168 @@ func (h *httprunner) run() error {
 	// a wrapper to glog http.Server errors - otherwise
 	// os.Stderr would be used, as per golang.org/pkg/net/http/#Server
 	h.glogger = log.New(&glogwriter{}, "net/http err: ", 0)
-	addr := ":" + ctx.config.Net.L4.Port
 
-	if ctx.config.Net.HTTP.UseHTTPS {
-		h.h = &http.Server{Addr: addr, Handler: h.mux, ErrorLog: h.glogger}
-		if err := h.h.ListenAndServeTLS(ctx.config.Net.HTTP.Certificate, ctx.config.Net.HTTP.Key); err != nil {
-			if err != http.ErrServerClosed {
-				glog.Errorf("Terminated %s with err: %v", h.name, err)
-				return err
-			}
+	if ctx.config.Net.UseIntraControl || ctx.config.Net.UseIntraData {
+		var errCh chan error
+		if ctx.config.Net.UseIntraControl && ctx.config.Net.UseIntraData {
+			errCh = make(chan error, 3)
+		} else {
+			errCh = make(chan error, 2)
 		}
-	} else {
-		// Support for h2c is transparent using h2c.NewHandler, which implements a lightweight
-		// wrapper around h.mux.ServeHTTP to check for an h2c connection.
-		h.h = &http.Server{Addr: addr, Handler: h2c.NewHandler(h.mux, &http2.Server{}), ErrorLog: h.glogger}
-		if err := h.h.ListenAndServe(); err != nil {
-			if err != http.ErrServerClosed {
-				glog.Errorf("Terminated %s with err: %v", h.name, err)
-				return err
-			}
+
+		if ctx.config.Net.UseIntraControl {
+			go func() {
+				addr := h.si.IntraControlNet.NodeIPAddr + ":" + h.si.IntraControlNet.DaemonPort
+				errCh <- h.intraControlServer.listenAndServe(addr, h.glogger)
+			}()
 		}
+
+		if ctx.config.Net.UseIntraData {
+			go func() {
+				addr := h.si.IntraDataNet.NodeIPAddr + ":" + h.si.IntraDataNet.DaemonPort
+				errCh <- h.intraDataServer.listenAndServe(addr, h.glogger)
+			}()
+		}
+
+		go func() {
+			addr := h.si.PublicNet.NodeIPAddr + ":" + h.si.PublicNet.DaemonPort
+			errCh <- h.publicServer.listenAndServe(addr, h.glogger)
+		}()
+
+		return <-errCh
 	}
-	return nil
+
+	// When only public net is configured listen on *:port
+	addr := ":" + h.si.PublicNet.DaemonPort
+	return h.publicServer.listenAndServe(addr, h.glogger)
 }
 
 // stop gracefully
 func (h *httprunner) stop(err error) {
-	glog.Infof("Stopping %s, err: %v", h.name, err)
+	glog.Infof("Stopping %s, err: %v", h.Getname(), err)
 
-	if h.h == nil {
+	h.statsdC.Close()
+	if h.publicServer.s == nil {
 		return
 	}
-	contextwith, cancel := context.WithTimeout(context.Background(), ctx.config.Timeout.Default)
 
-	err = h.h.Shutdown(contextwith)
-	if err != nil {
-		glog.Infof("Stopped %s, err: %v", h.name, err)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		h.publicServer.shutdown()
+		wg.Done()
+	}()
+
+	if ctx.config.Net.UseIntraControl {
+		wg.Add(1)
+		go func() {
+			h.intraControlServer.shutdown()
+			wg.Done()
+		}()
 	}
-	cancel()
+
+	if ctx.config.Net.UseIntraData {
+		wg.Add(1)
+		go func() {
+			h.intraDataServer.shutdown()
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
 }
 
-// intra-cluster IPC, control plane; calls (via http) another target or a proxy
-// optionally, sends a json-encoded body to the callee
-func (h *httprunner) call(rOrig *http.Request, si *daemonInfo, url, method string, injson []byte,
-	timeout ...time.Duration) callResult {
+//=================================
+//
+// intra-cluster IPC, control plane
+//
+//=================================
+// call another target or a proxy
+// optionally, include a json-encoded body
+func (h *httprunner) call(args callArgs) callResult {
 	var (
-		request       *http.Request
-		response      *http.Response
-		sid           = "unknown"
-		outjson       []byte
-		err           error
-		errstr        string
-		newPrimaryURL string
-		status        int
+		request  *http.Request
+		response *http.Response
+		sid      = "unknown"
+		outjson  []byte
+		err      error
+		errstr   string
+		status   int
 	)
 
-	if si != nil {
-		sid = si.DaemonID
+	if args.si != nil {
+		sid = args.si.DaemonID
 	}
 
-	if len(injson) == 0 {
-		request, err = http.NewRequest(method, url, nil)
+	cmn.Assert(args.si != nil || args.req.base != "") // either we have si or base
+	if args.req.base == "" && args.si != nil {
+		args.req.base = args.si.PublicNet.DirectURL
+	}
+
+	url := args.req.url()
+	if len(args.req.body) == 0 {
+		request, err = http.NewRequest(args.req.method, url, nil)
 		if glog.V(4) { // super-verbose
-			glog.Infof("%s %s", method, url)
+			glog.Infof("%s %s", args.req.method, url)
 		}
 	} else {
-		request, err = http.NewRequest(method, url, bytes.NewBuffer(injson))
+		request, err = http.NewRequest(args.req.method, url, bytes.NewBuffer(args.req.body))
 		if err == nil {
 			request.Header.Set("Content-Type", "application/json")
 		}
 		if glog.V(4) { // super-verbose
-			l := len(injson)
+			l := len(args.req.body)
 			if l > 16 {
 				l = 16
 			}
-			glog.Infof("%s %s %s...}", method, url, string(injson[:l]))
+			glog.Infof("%s %s %s...}", args.req.method, url, string(args.req.body[:l]))
 		}
 	}
 
 	if err != nil {
-		errstr = fmt.Sprintf("Unexpected failure to create http request %s %s, err: %v", method, url, err)
-		return callResult{si, outjson, err, errstr, "", status}
+		errstr = fmt.Sprintf("Unexpected failure to create http request %s %s, err: %v", args.req.method, url, err)
+		return callResult{args.si, outjson, err, errstr, status}
 	}
 
-	copyHeaders(rOrig, request)
-	if len(timeout) > 0 {
-		if timeout[0] != 0 {
-			contextwith, cancel := context.WithTimeout(context.Background(), timeout[0])
-			defer cancel()
-			newrequest := request.WithContext(contextwith)
-			copyHeaders(rOrig, newrequest)
-			response, err = h.httpclient.Do(newrequest) // timeout => context.deadlineExceededError
-		} else { // zero timeout means the client wants no timeout
-			response, err = h.httpclientLongTimeout.Do(request)
-		}
-	} else {
+	copyHeaders(args.req.header, &request.Header)
+	switch args.timeout {
+	case defaultTimeout:
 		response, err = h.httpclient.Do(request)
+	case longTimeout:
+		response, err = h.httpclientLongTimeout.Do(request)
+	default:
+		contextwith, cancel := context.WithTimeout(context.Background(), args.timeout)
+		defer cancel() // timeout => context.deadlineExceededError
+		newRequest := request.WithContext(contextwith)
+		copyHeaders(args.req.header, &newRequest.Header)
+		if args.timeout > h.httpclient.Timeout {
+			response, err = h.httpclientLongTimeout.Do(newRequest)
+		} else {
+			response, err = h.httpclient.Do(newRequest)
+		}
 	}
 	if err != nil {
 		if response != nil && response.StatusCode > 0 {
-			errstr = fmt.Sprintf("Failed to http-call %s (%s %s): status %s, err %v", sid, method, url, response.Status, err)
+			errstr = fmt.Sprintf("Failed to http-call %s (%s %s): status %s, err %v", sid, args.req.method, url, response.Status, err)
 			status = response.StatusCode
-			return callResult{si, outjson, err, errstr, "", status}
+			return callResult{args.si, outjson, err, errstr, status}
 		}
 
-		errstr = fmt.Sprintf("Failed to http-call %s (%s %s): err %v", sid, method, url, err)
-		return callResult{si, outjson, err, errstr, "", status}
+		errstr = fmt.Sprintf("Failed to http-call %s (%s %s): err %v", sid, args.req.method, url, err)
+		return callResult{args.si, outjson, err, errstr, status}
 	}
 
-	newPrimaryURL = response.Header.Get(HeaderPrimaryProxyURL)
 	if outjson, err = ioutil.ReadAll(response.Body); err != nil {
-		errstr = fmt.Sprintf("Failed to http-call %s (%s %s): read response err: %v", sid, method, url, err)
+		errstr = fmt.Sprintf("Failed to http-call %s (%s %s): read response err: %v", sid, args.req.method, url, err)
 		if err == io.EOF {
 			trailer := response.Trailer.Get("Error")
 			if trailer != "" {
-				errstr = fmt.Sprintf("Failed to http-call %s (%s %s): err: %v, trailer: %s", sid, method, url, err, trailer)
+				errstr = fmt.Sprintf("Failed to http-call %s (%s %s): err: %v, trailer: %s", sid, args.req.method, url, err, trailer)
 			}
 		}
 
 		response.Body.Close()
-		return callResult{si, outjson, err, errstr, newPrimaryURL, status}
+		return callResult{args.si, outjson, err, errstr, status}
 	}
 	response.Body.Close()
 
@@ -352,14 +540,53 @@ func (h *httprunner) call(rOrig *http.Request, si *daemonInfo, url, method strin
 		err = fmt.Errorf("%s, status code: %d", outjson, response.StatusCode)
 		errstr = err.Error()
 		status = response.StatusCode
-		return callResult{si, outjson, err, errstr, newPrimaryURL, status}
+		return callResult{args.si, outjson, err, errstr, status}
 	}
 
 	if sid != "unknown" {
 		h.keepalive.heardFrom(sid, false /* reset */)
 	}
 
-	return callResult{si, outjson, err, errstr, newPrimaryURL, status}
+	return callResult{args.si, outjson, err, errstr, status}
+}
+
+// broadcast sends a http call to all servers in parallel, wait until all calls are returned
+// NOTE: 'u' has only the path and query part, host portion will be set by this function.
+func (h *httprunner) broadcast(bcastArgs bcastCallArgs) chan callResult {
+	serverCount := 0
+	for _, serverMap := range bcastArgs.servers {
+		serverCount += len(serverMap)
+	}
+	ch := make(chan callResult, serverCount)
+	wg := &sync.WaitGroup{}
+
+	for _, serverMap := range bcastArgs.servers {
+		for sid, serverInfo := range serverMap {
+			if sid == h.si.DaemonID {
+				continue
+			}
+			wg.Add(1)
+			go func(di *cluster.Snode) {
+				args := callArgs{
+					si:      di,
+					req:     bcastArgs.req,
+					timeout: bcastArgs.timeout,
+				}
+				args.req.base = ""
+				if bcastArgs.internal {
+					args.req.base = di.IntraControlNet.DirectURL
+				}
+
+				res := h.call(args)
+				ch <- res
+				wg.Done()
+			}(serverInfo)
+		}
+	}
+
+	wg.Wait()
+	close(ch)
+	return ch
 }
 
 //=============================
@@ -367,54 +594,21 @@ func (h *httprunner) call(rOrig *http.Request, si *daemonInfo, url, method strin
 // http request parsing helpers
 //
 //=============================
-func (h *httprunner) restAPIItems(unescapedpath string, maxsplit int) []string {
-	escaped := html.EscapeString(unescapedpath)
-	split := strings.SplitN(escaped, "/", maxsplit)
-	apitems := make([]string, 0, len(split))
-	for i := 0; i < len(split); i++ {
-		if split[i] != "" { // omit empty
-			apitems = append(apitems, split[i])
-		}
-	}
-	return apitems
-}
 
 // remove validated fields and return the resulting slice
-func (h *httprunner) checkRestAPI(w http.ResponseWriter, r *http.Request, apitems []string, n int, ver, res string) []string {
-	if len(apitems) > 0 && ver != "" {
-		if apitems[0] != ver {
-			s := fmt.Sprintf("Invalid API version: %s (expecting %s)", apitems[0], ver)
-			if _, file, line, ok := runtime.Caller(1); ok {
-				f := filepath.Base(file)
-				s += fmt.Sprintf("(%s, #%d)", f, line)
-			}
-			h.invalmsghdlr(w, r, s)
-			return nil
-		}
-		apitems = apitems[1:]
-	}
-	if len(apitems) > 0 && res != "" {
-		if apitems[0] != res {
-			s := fmt.Sprintf("Invalid API resource: %s (expecting %s)", apitems[0], res)
-			if _, file, line, ok := runtime.Caller(1); ok {
-				f := filepath.Base(file)
-				s += fmt.Sprintf("(%s, #%d)", f, line)
-			}
-			h.invalmsghdlr(w, r, s)
-			return nil
-		}
-		apitems = apitems[1:]
-	}
-	if len(apitems) < n {
-		s := fmt.Sprintf("Invalid API request: num elements %d (expecting at least %d [%v])", len(apitems), n, apitems)
+func (h *httprunner) checkRESTItems(w http.ResponseWriter, r *http.Request, itemsAfter int, splitAfter bool, items ...string) ([]string, error) {
+	items, err := cmn.MatchRESTItems(r.URL.Path, itemsAfter, splitAfter, items...)
+	if err != nil {
+		s := err.Error()
 		if _, file, line, ok := runtime.Caller(1); ok {
 			f := filepath.Base(file)
 			s += fmt.Sprintf("(%s, #%d)", f, line)
 		}
-		h.invalmsghdlr(w, r, s)
-		return nil
+		h.invalmsghdlr(w, r, s, http.StatusBadRequest)
+		return nil, errors.New(s)
 	}
-	return apitems
+
+	return items, nil
 }
 
 func (h *httprunner) readJSON(w http.ResponseWriter, r *http.Request, out interface{}) error {
@@ -435,7 +629,7 @@ func (h *httprunner) readJSON(w http.ResponseWriter, r *http.Request, out interf
 		return err
 	}
 
-	err = json.Unmarshal(b, out)
+	err = jsoniter.Unmarshal(b, out)
 	if err != nil {
 		s := fmt.Sprintf("Failed to json-unmarshal %s request, err: %v [%v]", r.Method, err, string(b))
 		if _, file, line, ok := runtime.Caller(1); ok {
@@ -467,7 +661,7 @@ func (h *httprunner) writeJSON(w http.ResponseWriter, r *http.Request, jsbytes [
 			s += fmt.Sprintf("(%s, #%d)", f, line)
 		}
 		glog.Errorln(s)
-		h.statsif.add("numerr", 1)
+		h.statsif.addErrorHTTP(r.Method, 1)
 		return
 	}
 	errstr := fmt.Sprintf("%s: Failed to write json, err: %v", tag, err)
@@ -492,11 +686,44 @@ func (h *httprunner) validatebckname(w http.ResponseWriter, r *http.Request, buc
 	return true
 }
 
-//=================
+//=========================
 //
-// commong set config
+// common http req handlers
 //
-//=================
+//==========================
+func (h *httprunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
+	var (
+		jsbytes []byte
+		err     error
+		getWhat = r.URL.Query().Get(cmn.URLParamWhat)
+	)
+	switch getWhat {
+	case cmn.GetWhatConfig:
+		jsbytes, err = jsoniter.Marshal(ctx.config)
+		cmn.Assert(err == nil, err)
+	case cmn.GetWhatSmap:
+		jsbytes, err = jsoniter.Marshal(h.smapowner.get())
+		cmn.Assert(err == nil, err)
+	case cmn.GetWhatBucketMeta:
+		jsbytes, err = jsoniter.Marshal(h.bmdowner.get())
+		cmn.Assert(err == nil, err)
+	case cmn.GetWhatSmapVote:
+		_, xx := h.xactinp.findL(cmn.ActElection)
+		vote := xx != nil
+		msg := SmapVoteMsg{VoteInProgress: vote, Smap: h.smapowner.get(), BucketMD: h.bmdowner.get()}
+		jsbytes, err = jsoniter.Marshal(msg)
+		cmn.Assert(err == nil, err)
+	case cmn.GetWhatDaemonInfo:
+		jsbytes, err = jsoniter.Marshal(h.si)
+		cmn.Assert(err == nil, err)
+	default:
+		s := fmt.Sprintf("Invalid GET /daemon request: unrecognized what=%s", getWhat)
+		h.invalmsghdlr(w, r, s)
+		return
+	}
+	h.writeJSON(w, r, jsbytes, "httpdaeget-"+getWhat)
+}
+
 func (h *httprunner) setconfig(name, value string) (errstr string) {
 	lm, hm := ctx.config.LRU.LowWM, ctx.config.LRU.HighWM
 	checkwm := false
@@ -542,12 +769,6 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 			errstr = fmt.Sprintf("Failed to parse capacity_upd_time, err: %v", err)
 		} else {
 			ctx.config.LRU.CapacityUpdTime, ctx.config.LRU.CapacityUpdTimeStr = v, value
-		}
-	case "startup_delay_time":
-		if v, err := time.ParseDuration(value); err != nil {
-			errstr = fmt.Sprintf("Failed to parse startup_delay_time, err: %v", err)
-		} else {
-			ctx.config.Rebalance.StartupDelayTime, ctx.config.Rebalance.StartupDelayTimeStr = v, value
 		}
 	case "dest_retry_time":
 		if v, err := time.ParseDuration(value); err != nil {
@@ -597,6 +818,24 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 		} else {
 			ctx.config.Rebalance.Enabled = v
 		}
+	case "replicate_on_cold_get":
+		if v, err := strconv.ParseBool(value); err != nil {
+			errstr = fmt.Sprintf("Failed to parse replicate_on_cold_get, err: %v", err)
+		} else {
+			ctx.config.Replication.ReplicateOnColdGet = v
+		}
+	case "replicate_on_put":
+		if v, err := strconv.ParseBool(value); err != nil {
+			errstr = fmt.Sprintf("Failed to parse replicate_on_put, err: %v", err)
+		} else {
+			ctx.config.Replication.ReplicateOnPut = v
+		}
+	case "replicate_on_lru_eviction":
+		if v, err := strconv.ParseBool(value); err != nil {
+			errstr = fmt.Sprintf("Failed to parse replicate_on_lru_eviction, err: %v", err)
+		} else {
+			ctx.config.Replication.ReplicateOnLRUEviction = v
+		}
 	case "validate_checksum_cold_get":
 		if v, err := strconv.ParseBool(value); err != nil {
 			errstr = fmt.Sprintf("Failed to parse validate_checksum_cold_get, err: %v", err)
@@ -622,10 +861,10 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 			ctx.config.Ver.ValidateWarmGet = v
 		}
 	case "checksum":
-		if value == ChecksumXXHash || value == ChecksumNone {
+		if value == cmn.ChecksumXXHash || value == cmn.ChecksumNone {
 			ctx.config.Cksum.Checksum = value
 		} else {
-			return fmt.Sprintf("Invalid %s type %s - expecting %s or %s", name, value, ChecksumXXHash, ChecksumNone)
+			return fmt.Sprintf("Invalid %s type %s - expecting %s or %s", name, value, cmn.ChecksumXXHash, cmn.ChecksumNone)
 		}
 	case "versioning":
 		if err := validateVersion(value); err == nil {
@@ -637,7 +876,7 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 		if v, err := strconv.ParseBool(value); err != nil {
 			errstr = fmt.Sprintf("Failed to parse fschecker_enabled, err: %v", err)
 		} else {
-			ctx.config.FSChecker.Enabled = v
+			ctx.config.FSHC.Enabled = v
 		}
 	default:
 		errstr = fmt.Sprintf("Cannot set config var %s - is readonly or unsupported", name)
@@ -658,42 +897,30 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 //
 //=================
 
-// errHTTP returns a formatted error string for an HTTP request.
-func (h *httprunner) errHTTP(r *http.Request, msg string, status int) string {
-	return http.StatusText(status) + ": " + msg + ": " + r.Method + " " + r.URL.Path
+func (h *httprunner) invalmsghdlr(w http.ResponseWriter, r *http.Request, msg string, errCode ...int) {
+	cmn.InvalidHandlerDetailed(w, r, msg, errCode...)
+	h.statsif.addErrorHTTP(r.Method, 1)
 }
 
-func (h *httprunner) invalmsghdlr(w http.ResponseWriter, r *http.Request, msg string, other ...interface{}) {
-	status := http.StatusBadRequest
-	if len(other) > 0 {
-		status = other[0].(int)
-	}
-	s := h.errHTTP(r, msg, status)
-	if _, file, line, ok := runtime.Caller(1); ok {
-		if !strings.Contains(msg, ".go, #") {
-			f := filepath.Base(file)
-			s += fmt.Sprintf("(%s, #%d)", f, line)
-		}
-	}
-	glog.Errorln(s)
-	http.Error(w, s, status)
-	h.statsif.add("numerr", 1)
-}
-
-func (h *httprunner) extractSmap(payload simplekvs) (newsmap, oldsmap *Smap, msg *ActionMsg, errstr string) {
+//=====================
+//
+// metasync Rx handlers
+//
+//=====================
+func (h *httprunner) extractSmap(payload cmn.SimpleKVs) (newsmap *smapX, msg *cmn.ActionMsg, errstr string) {
 	if _, ok := payload[smaptag]; !ok {
 		return
 	}
-	newsmap, oldsmap, msg = &Smap{}, &Smap{}, &ActionMsg{}
+	newsmap, msg = &smapX{}, &cmn.ActionMsg{}
 	smapvalue := payload[smaptag]
 	msgvalue := ""
-	if err := json.Unmarshal([]byte(smapvalue), newsmap); err != nil {
+	if err := jsoniter.Unmarshal([]byte(smapvalue), newsmap); err != nil {
 		errstr = fmt.Sprintf("Failed to unmarshal new smap, value (%+v, %T), err: %v", smapvalue, smapvalue, err)
 		return
 	}
 	if _, ok := payload[smaptag+actiontag]; ok {
 		msgvalue = payload[smaptag+actiontag]
-		if err := json.Unmarshal([]byte(msgvalue), msg); err != nil {
+		if err := jsoniter.Unmarshal([]byte(msgvalue), msg); err != nil {
 			errstr = fmt.Sprintf("Failed to unmarshal action message, value (%+v, %T), err: %v", msgvalue, msgvalue, err)
 			return
 		}
@@ -710,12 +937,12 @@ func (h *httprunner) extractSmap(payload simplekvs) (newsmap, oldsmap *Smap, msg
 		return
 	}
 	if newsmap.version() < myver {
-		if h.si != nil && localsmap.getTarget(h.si.DaemonID) == nil {
+		if h.si != nil && localsmap.GetTarget(h.si.DaemonID) == nil {
 			errstr = fmt.Sprintf("%s: Attempt to downgrade Smap v%d to v%d", h.si.DaemonID, myver, newsmap.version())
 			newsmap = nil
 			return
 		}
-		if h.si != nil && localsmap.getTarget(h.si.DaemonID) != nil {
+		if h.si != nil && localsmap.GetTarget(h.si.DaemonID) != nil {
 			glog.Errorf("target %s: receive Smap v%d < v%d local - proceeding anyway",
 				h.si.DaemonID, newsmap.version(), localsmap.version())
 		} else {
@@ -727,52 +954,24 @@ func (h *httprunner) extractSmap(payload simplekvs) (newsmap, oldsmap *Smap, msg
 	if msg.Action != "" {
 		s = ", action " + msg.Action
 	}
-	glog.Infof("receive Smap v%d (local v%d), ntargets %d%s", newsmap.version(), localsmap.version(), newsmap.countTargets(), s)
-
-	if msgvalue == "" || msg.Value == nil {
-		// synchronize with no action message and no old smap
-		return
-	}
-	// old smap
-	v1, ok1 := msg.Value.(map[string]interface{})
-	assert(ok1, fmt.Sprintf("msg (%+v, %T), msg.Value (%+v, %T)", msg, msg, msg.Value, msg.Value))
-	v2, ok2 := v1["tmap"]
-	assert(ok2)
-	tmapif, ok3 := v2.(map[string]interface{})
-	assert(ok3)
-	v4, ok4 := v1["pmap"]
-	assert(ok4)
-	pmapif, ok5 := v4.(map[string]interface{})
-	assert(ok5)
-	versionf := v1["version"].(float64)
-
-	oldsmap.init(len(tmapif), len(pmapif))
-
-	// partial restore of the old smap - keeping only the respective DaemonIDs and version
-	for sid := range tmapif {
-		oldsmap.Tmap[sid] = &daemonInfo{}
-	}
-	for pid := range pmapif {
-		oldsmap.Pmap[pid] = &daemonInfo{}
-	}
-	oldsmap.Version = int64(versionf)
+	glog.Infof("receive Smap v%d (local v%d), ntargets %d%s", newsmap.version(), localsmap.version(), newsmap.CountTargets(), s)
 	return
 }
 
-func (h *httprunner) extractbucketmd(payload simplekvs) (newbucketmd *bucketMD, msg *ActionMsg, errstr string) {
+func (h *httprunner) extractbucketmd(payload cmn.SimpleKVs) (newbucketmd *bucketMD, msg *cmn.ActionMsg, errstr string) {
 	if _, ok := payload[bucketmdtag]; !ok {
 		return
 	}
-	newbucketmd, msg = &bucketMD{}, &ActionMsg{}
+	newbucketmd, msg = &bucketMD{}, &cmn.ActionMsg{}
 	bmdvalue := payload[bucketmdtag]
 	msgvalue := ""
-	if err := json.Unmarshal([]byte(bmdvalue), newbucketmd); err != nil {
+	if err := jsoniter.Unmarshal([]byte(bmdvalue), newbucketmd); err != nil {
 		errstr = fmt.Sprintf("Failed to unmarshal new bucket-metadata, value (%+v, %T), err: %v", bmdvalue, bmdvalue, err)
 		return
 	}
 	if _, ok := payload[bucketmdtag+actiontag]; ok {
 		msgvalue = payload[bucketmdtag+actiontag]
-		if err := json.Unmarshal([]byte(msgvalue), msg); err != nil {
+		if err := jsoniter.Unmarshal([]byte(msgvalue), msg); err != nil {
 			errstr = fmt.Sprintf("Failed to unmarshal action message, value (%+v, %T), err: %v", msgvalue, msgvalue, err)
 			return
 		}
@@ -787,42 +986,37 @@ func (h *httprunner) extractbucketmd(payload simplekvs) (newbucketmd *bucketMD, 
 	return
 }
 
-// URLPath returns a HTTP URL path by joining all segments with "/"
-func URLPath(segments ...string) string {
-	return path.Join("/", path.Join(segments...))
-}
-
-// broadcast sends a http call to all servers in parallel, wait until all calls are returned
-// note: 'u' has only the path and query part, host portion will be set by this function.
-func (h *httprunner) broadcast(path string, query url.Values, method string, body []byte,
-	servers []*daemonInfo, timeout ...time.Duration) chan callResult {
-	var (
-		ch = make(chan callResult, len(servers))
-		wg = &sync.WaitGroup{}
-	)
-
-	for _, s := range servers {
-		wg.Add(1)
-		go func(di *daemonInfo, wg *sync.WaitGroup) {
-			defer wg.Done()
-
-			var u url.URL
-			if ctx.config.Net.HTTP.UseHTTPS {
-				u.Scheme = "https"
-			} else {
-				u.Scheme = "http"
-			}
-			u.Host = di.NodeIPAddr + ":" + di.DaemonPort
-			u.Path = path
-			u.RawQuery = query.Encode() // golang handles query == nil
-			res := h.call(nil, di, u.String(), method, body, timeout...)
-			ch <- res
-		}(s, wg)
+func (h *httprunner) extractRevokedTokenList(payload cmn.SimpleKVs) (*TokenList, string) {
+	bytes, ok := payload[tokentag]
+	if !ok {
+		return nil, ""
 	}
 
-	wg.Wait()
-	close(ch)
-	return ch
+	msg := cmn.ActionMsg{}
+	if _, ok := payload[tokentag+actiontag]; ok {
+		msgvalue := payload[tokentag+actiontag]
+		if err := jsoniter.Unmarshal([]byte(msgvalue), &msg); err != nil {
+			errstr := fmt.Sprintf(
+				"Failed to unmarshal action message, value (%+v, %T), err: %v",
+				msgvalue, msgvalue, err)
+			return nil, errstr
+		}
+	}
+
+	tokenList := &TokenList{}
+	if err := jsoniter.Unmarshal([]byte(bytes), tokenList); err != nil {
+		return nil, fmt.Sprintf(
+			"Failed to unmarshal blocked token list, value (%+v, %T), err: %v",
+			bytes, bytes, err)
+	}
+
+	s := ""
+	if msg.Action != "" {
+		s = ", action " + msg.Action
+	}
+	glog.Infof("received TokenList ntokens %d%s", len(tokenList.Tokens), s)
+
+	return tokenList, ""
 }
 
 // ================================== Background =========================================
@@ -855,15 +1049,15 @@ func (h *httprunner) broadcast(path string, query url.Values, method string, bod
 // - but only if those are defined and different from the previously tried.
 //
 // ================================== Background =========================================
-func (h *httprunner) join(isproxy bool, extra string) (res callResult) {
+func (h *httprunner) join(isproxy bool, query url.Values) (res callResult) {
 	url, psi := h.getPrimaryURLAndSI()
-	res = h.registerToURL(url, psi, 0, isproxy, extra)
+	res = h.registerToURL(url, psi, defaultTimeout, isproxy, query, false)
 	if res.err == nil {
 		return
 	}
 	if ctx.config.Proxy.DiscoveryURL != "" && ctx.config.Proxy.DiscoveryURL != url {
 		glog.Errorf("%s: (register => %s: %v - retrying => %s...)", h.si.DaemonID, url, res.err, ctx.config.Proxy.DiscoveryURL)
-		resAlt := h.registerToURL(ctx.config.Proxy.DiscoveryURL, psi, 0, isproxy, extra)
+		resAlt := h.registerToURL(ctx.config.Proxy.DiscoveryURL, psi, defaultTimeout, isproxy, query, false)
 		if resAlt.err == nil {
 			res = resAlt
 			return
@@ -872,7 +1066,7 @@ func (h *httprunner) join(isproxy bool, extra string) (res callResult) {
 	if ctx.config.Proxy.OriginalURL != "" && ctx.config.Proxy.OriginalURL != url &&
 		ctx.config.Proxy.OriginalURL != ctx.config.Proxy.DiscoveryURL {
 		glog.Errorf("%s: (register => %s: %v - retrying => %s...)", h.si.DaemonID, url, res.err, ctx.config.Proxy.OriginalURL)
-		resAlt := h.registerToURL(ctx.config.Proxy.OriginalURL, psi, 0, isproxy, extra)
+		resAlt := h.registerToURL(ctx.config.Proxy.OriginalURL, psi, defaultTimeout, isproxy, query, false)
 		if resAlt.err == nil {
 			res = resAlt
 			return
@@ -881,43 +1075,39 @@ func (h *httprunner) join(isproxy bool, extra string) (res callResult) {
 	return
 }
 
-func (h *httprunner) registerToURL(url string, psi *daemonInfo, timeout time.Duration, isproxy bool, extra string) (res callResult) {
-	info, err := json.Marshal(h.si)
-	assert(err == nil, err)
+func (h *httprunner) registerToURL(url string, psi *cluster.Snode, timeout time.Duration, isproxy bool, query url.Values,
+	keepalive bool) (res callResult) {
+	info, err := jsoniter.Marshal(h.si)
+	cmn.Assert(err == nil, err)
 
-	f := func(inurl string, isproxy bool, timeout time.Duration, extra string) (outurl string) {
-		if isproxy {
-			outurl = inurl + URLPath(Rversion, Rcluster, Rproxy)
-		} else {
-			outurl = inurl + URLPath(Rversion, Rcluster)
-		}
-		if timeout > 0 { // keepalive
-			outurl += URLPath(Rkeepalive)
-		}
-		if extra != "" {
-			outurl += "?" + extra
-		}
-		return
+	path := cmn.URLPath(cmn.Version, cmn.Cluster)
+	if isproxy {
+		path += cmn.URLPath(cmn.Proxy)
 	}
-	regurl := f(url, isproxy, timeout, extra)
+	if keepalive {
+		path += cmn.URLPath(cmn.Keepalive)
+	}
+
+	callArgs := callArgs{
+		si: psi,
+		req: reqArgs{
+			method: http.MethodPost,
+			base:   url,
+			path:   path,
+			query:  query,
+			body:   info,
+		},
+		timeout: timeout,
+	}
 	for rcount := 0; rcount < 2; rcount++ {
-		if timeout > 0 {
-			res = h.call(nil, psi, regurl, http.MethodPost, info, timeout)
-		} else {
-			res = h.call(nil, psi, regurl, http.MethodPost, info)
-		}
+		res = h.call(callArgs)
 		if res.err == nil {
 			return
 		}
-		if res.newPrimaryURL != "" {
-			glog.Errorf("%s: (register => %s: %v - retrying => %s...)", h.si.DaemonID, regurl, res.err, url)
-			regurl = f(res.newPrimaryURL, isproxy, timeout, extra)
-			continue
-		}
-		if IsErrConnectionRefused(res.err) {
-			glog.Errorf("%s: (register => %s: connection refused)", h.si.DaemonID, regurl)
+		if cmn.IsErrConnectionRefused(res.err) {
+			glog.Errorf("%s: (register => %s: connection refused)", h.si.DaemonID, path)
 		} else {
-			glog.Errorf("%s: (register => %s: %v)", h.si.DaemonID, regurl, res.err)
+			glog.Errorf("%s: (register => %s: %v)", h.si.DaemonID, path, res.err)
 		}
 		break
 	}
@@ -928,16 +1118,33 @@ func (h *httprunner) registerToURL(url string, psi *daemonInfo, timeout time.Dur
 // if Smap is not yet synced, use the primary proxy from the config
 // smap lock is acquired to avoid race between this function and other smap access (for example,
 // receiving smap during metasync)
-func (h *httprunner) getPrimaryURLAndSI() (url string, proxysi *daemonInfo) {
+func (h *httprunner) getPrimaryURLAndSI() (url string, proxysi *cluster.Snode) {
 	smap := h.smapowner.get()
 	if smap == nil || smap.ProxySI == nil {
 		url, proxysi = ctx.config.Proxy.PrimaryURL, nil
 		return
 	}
 	if smap.ProxySI.DaemonID != "" {
-		url, proxysi = smap.ProxySI.DirectURL, smap.ProxySI
+		url, proxysi = smap.ProxySI.PublicNet.DirectURL, smap.ProxySI
 		return
 	}
 	url, proxysi = ctx.config.Proxy.PrimaryURL, smap.ProxySI
 	return
+}
+
+//
+// StatsD client using 8125 (default) StatsD port - https://github.com/etsy/statsd
+//
+func (h *httprunner) initStatsD(daemonStr string) (err error) {
+	suffix := strings.Replace(h.si.DaemonID, ":", "_", -1)
+	h.statsdC, err = statsd.New("localhost", 8125, daemonStr+"."+suffix)
+	if err != nil {
+		glog.Infoln("Failed to connect to StatsD daemon")
+	}
+	return
+}
+
+func isReplicationPUT(r *http.Request) (isreplica bool, replicasrc string) {
+	replicasrc = r.Header.Get(cmn.HeaderDFCReplicationSrc)
+	return replicasrc != "", replicasrc
 }

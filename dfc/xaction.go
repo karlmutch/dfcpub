@@ -1,10 +1,8 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
 //
-// xaction: Extended Action aka Transaction
+// extended action aka xaction
 //
 package dfc
 
@@ -16,84 +14,46 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
 )
 
-type xactInterface interface {
-	getid() int64
-	getkind() string
-	getStartTime() time.Time
-	getEndTime() time.Time
-	tostring() string
-	abort()
-	finished() bool
-}
+const timeStampFormat = "15:04:05.000000"
 
 type xactInProgress struct {
-	xactinp []xactInterface
+	xactinp []cmn.XactInterface
 	lock    *sync.Mutex
 }
 
-type xactBase struct {
-	id    int64
-	stime time.Time
-	etime time.Time
-	kind  string
-	abrt  chan struct{}
-}
-
 type xactRebalance struct {
-	xactBase
+	cmn.XactBase
 	curversion   int64
 	targetrunner *targetrunner
+	runnerCnt    int
+	confirmCh    chan struct{}
+}
+
+type xactLocalRebalance struct {
+	cmn.XactBase
+	targetRunner *targetrunner
+	runnerCnt    int
+	confirmCh    chan struct{}
 }
 
 type xactLRU struct {
-	xactBase
+	cmn.XactBase
 	targetrunner *targetrunner
 }
 
 type xactElection struct {
-	xactBase
+	cmn.XactBase
 	proxyrunner *proxyrunner
 	vr          *VoteRecord
 }
 
-//===================
-//
-// xactBase
-//
-//===================
-func newxactBase(id int64, kind string) *xactBase {
-	return &xactBase{id: id, stime: time.Now(), kind: kind, abrt: make(chan struct{}, 1)}
-}
-
-func (xact *xactBase) getid() int64 {
-	return xact.id
-}
-
-func (xact *xactBase) getkind() string {
-	return xact.kind
-}
-
-func (xact *xactBase) getStartTime() time.Time {
-	return xact.stime
-}
-
-func (xact *xactBase) getEndTime() time.Time {
-	return xact.etime
-}
-
-func (xact *xactBase) tostring() string { assert(false, "must be implemented"); return "" }
-
-func (xact *xactBase) abort() {
-	xact.etime = time.Now()
-	var e struct{}
-	xact.abrt <- e
-	close(xact.abrt)
-}
-
-func (xact *xactBase) finished() bool {
-	return !xact.etime.IsZero()
+type xactRechecksum struct {
+	cmn.XactBase
+	targetrunner *targetrunner
+	bucket       string
 }
 
 //===================
@@ -103,7 +63,7 @@ func (xact *xactBase) finished() bool {
 //===================
 
 func newxactinp() *xactInProgress {
-	q := make([]xactInterface, 4)
+	q := make([]cmn.XactInterface, 4)
 	qq := &xactInProgress{xactinp: q[0:0]}
 	qq.lock = &sync.Mutex{}
 	return qq
@@ -117,15 +77,15 @@ func (q *xactInProgress) uniqueid() int64 {
 		}
 		id = (time.Now().UTC().UnixNano() + id) & 0xffff
 	}
-	assert(false)
+	cmn.Assert(false)
 	return 0
 }
 
-func (q *xactInProgress) add(xact xactInterface) {
+func (q *xactInProgress) add(xact cmn.XactInterface) {
 	q.xactinp = append(q.xactinp, xact)
 }
 
-func (q *xactInProgress) findU(by interface{}) (idx int, xact xactInterface) {
+func (q *xactInProgress) findU(by interface{}) (idx int, xact cmn.XactInterface) {
 	var id int64
 	var kind string
 	switch by.(type) {
@@ -134,24 +94,34 @@ func (q *xactInProgress) findU(by interface{}) (idx int, xact xactInterface) {
 	case string:
 		kind = by.(string)
 	default:
-		assert(false, fmt.Sprintf("unexpected find() arg: %#v", by))
+		cmn.Assert(false, fmt.Sprintf("unexpected find() arg: %#v", by))
 	}
 	for i, xact := range q.xactinp {
-		if id != 0 && xact.getid() == id {
+		if id != 0 && xact.ID() == id {
 			return i, xact
 		}
-		if kind != "" && xact.getkind() == kind {
+		if kind != "" && xact.Kind() == kind {
 			return i, xact
 		}
 	}
 	return -1, nil
 }
 
-func (q *xactInProgress) findL(by interface{}) (idx int, xact xactInterface) {
+func (q *xactInProgress) findL(by interface{}) (idx int, xact cmn.XactInterface) {
 	q.lock.Lock()
 	idx, xact = q.findU(by)
 	q.lock.Unlock()
 	return
+}
+
+func (q *xactInProgress) findUAll(kind string) []cmn.XactInterface {
+	xacts := make([]cmn.XactInterface, 0)
+	for _, xact := range q.xactinp {
+		if xact.Kind() == kind {
+			xacts = append(xacts, xact)
+		}
+	}
+	return xacts
 }
 
 func (q *xactInProgress) del(by interface{}) {
@@ -171,28 +141,37 @@ func (q *xactInProgress) del(by interface{}) {
 	q.lock.Unlock()
 }
 
-func (q *xactInProgress) renewRebalance(curversion int64, t *targetrunner) *xactRebalance {
+func (q *xactInProgress) renewRebalance(curversion int64, t *targetrunner, runnerCnt int) *xactRebalance {
 	q.lock.Lock()
-	_, xx := q.findU(ActRebalance)
+	_, xx := q.findU(cmn.ActGlobalReb)
 	if xx != nil {
 		xreb := xx.(*xactRebalance)
-		if !xreb.finished() {
+		if !xreb.Finished() {
 			if xreb.curversion > curversion {
-				glog.Errorf("%s version is greater than curversion %d", xreb.tostring(), curversion)
+				glog.Errorf("%s version is greater than curversion %d", xreb, curversion)
 				q.lock.Unlock()
 				return nil
 			}
 			if xreb.curversion == curversion {
-				glog.Infof("%s already running, nothing to do", xreb.tostring())
+				glog.Infof("%s already running, nothing to do", xreb)
 				q.lock.Unlock()
 				return nil
 			}
 			xreb.abort()
+			for i := 0; i < xreb.runnerCnt; i++ {
+				<-xreb.confirmCh
+			}
+			close(xreb.confirmCh)
 		}
 	}
 	id := q.uniqueid()
-	xreb := &xactRebalance{xactBase: *newxactBase(id, ActRebalance), curversion: curversion}
-	xreb.targetrunner = t
+	xreb := &xactRebalance{
+		XactBase:     *cmn.NewXactBase(id, cmn.ActGlobalReb),
+		curversion:   curversion,
+		targetrunner: t,
+		runnerCnt:    runnerCnt,
+		confirmCh:    make(chan struct{}, runnerCnt),
+	}
 	q.add(xreb)
 	q.lock.Unlock()
 	return xreb
@@ -200,8 +179,12 @@ func (q *xactInProgress) renewRebalance(curversion int64, t *targetrunner) *xact
 
 // persistent mark indicating rebalancing in progress
 func (q *xactInProgress) rebalanceInProgress() (pmarker string) {
-	pmarker = filepath.Join(ctx.config.Confdir, rebinpname)
-	return
+	return filepath.Join(ctx.config.Confdir, rebinpname)
+}
+
+// persistent mark indicating rebalancing in progress
+func (q *xactInProgress) localRebalanceInProgress() (pmarker string) {
+	return filepath.Join(ctx.config.Confdir, reblocinpname)
 }
 
 func (q *xactInProgress) isAbortedOrRunningRebalance() (aborted, running bool) {
@@ -212,10 +195,10 @@ func (q *xactInProgress) isAbortedOrRunningRebalance() (aborted, running bool) {
 	}
 
 	q.lock.Lock()
-	_, xx := q.findU(ActRebalance)
+	_, xx := q.findU(cmn.ActGlobalReb)
 	if xx != nil {
 		xreb := xx.(*xactRebalance)
-		if !xreb.finished() {
+		if !xreb.Finished() {
 			running = true
 		}
 	}
@@ -223,17 +206,61 @@ func (q *xactInProgress) isAbortedOrRunningRebalance() (aborted, running bool) {
 	return
 }
 
+func (q *xactInProgress) isAbortedOrRunningLocalRebalance() (aborted, running bool) {
+	pmarker := q.localRebalanceInProgress()
+	_, err := os.Stat(pmarker)
+	if err == nil {
+		aborted = true
+	}
+
+	q.lock.Lock()
+	_, xx := q.findU(cmn.ActLocalReb)
+	if xx != nil {
+		xreb := xx.(*xactLocalRebalance)
+		if !xreb.Finished() {
+			running = true
+		}
+	}
+	q.lock.Unlock()
+	return
+}
+
+func (q *xactInProgress) renewLocalRebalance(t *targetrunner, runnerCnt int) *xactLocalRebalance {
+	q.lock.Lock()
+	_, xx := q.findU(cmn.ActLocalReb)
+	if xx != nil {
+		xLocalReb := xx.(*xactLocalRebalance)
+		if !xLocalReb.Finished() {
+			xLocalReb.abort()
+			for i := 0; i < xLocalReb.runnerCnt; i++ {
+				<-xLocalReb.confirmCh
+			}
+			close(xLocalReb.confirmCh)
+		}
+	}
+	id := q.uniqueid()
+	xLocalReb := &xactLocalRebalance{
+		XactBase:     *cmn.NewXactBase(id, cmn.ActLocalReb),
+		targetRunner: t,
+		runnerCnt:    runnerCnt,
+		confirmCh:    make(chan struct{}, runnerCnt),
+	}
+	q.add(xLocalReb)
+	q.lock.Unlock()
+	return xLocalReb
+}
+
 func (q *xactInProgress) renewLRU(t *targetrunner) *xactLRU {
 	q.lock.Lock()
-	_, xx := q.findU(ActLRU)
+	_, xx := q.findU(cmn.ActLRU)
 	if xx != nil {
 		xlru := xx.(*xactLRU)
-		glog.Infof("%s already running, nothing to do", xlru.tostring())
+		glog.Infof("%s already running, nothing to do", xlru)
 		q.lock.Unlock()
 		return nil
 	}
 	id := q.uniqueid()
-	xlru := &xactLRU{xactBase: *newxactBase(id, ActLRU)}
+	xlru := &xactLRU{XactBase: *cmn.NewXactBase(id, cmn.ActLRU)}
 	xlru.targetrunner = t
 	q.add(xlru)
 	q.lock.Unlock()
@@ -242,16 +269,16 @@ func (q *xactInProgress) renewLRU(t *targetrunner) *xactLRU {
 
 func (q *xactInProgress) renewElection(p *proxyrunner, vr *VoteRecord) *xactElection {
 	q.lock.Lock()
-	_, xx := q.findU(ActElection)
+	_, xx := q.findU(cmn.ActElection)
 	if xx != nil {
 		xele := xx.(*xactElection)
-		glog.Infof("%s already running, nothing to do", xele.tostring())
+		glog.Infof("%s already running, nothing to do", xele)
 		q.lock.Unlock()
 		return nil
 	}
 	id := q.uniqueid()
 	xele := &xactElection{
-		xactBase:    *newxactBase(id, ActElection),
+		XactBase:    *cmn.NewXactBase(id, cmn.ActElection),
 		proxyrunner: p,
 		vr:          vr,
 	}
@@ -260,11 +287,32 @@ func (q *xactInProgress) renewElection(p *proxyrunner, vr *VoteRecord) *xactElec
 	return xele
 }
 
+func (q *xactInProgress) renewRechecksum(t *targetrunner, bucket string) *xactRechecksum {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
+	for _, xx := range q.findUAll(cmn.ActRechecksum) {
+		xrcksum := xx.(*xactRechecksum)
+		if xrcksum.bucket == bucket {
+			glog.Infof("%s already running for bucket %s, nothing to do", xrcksum, bucket)
+			return nil
+		}
+	}
+	id := q.uniqueid()
+	xrcksum := &xactRechecksum{
+		XactBase:     *cmn.NewXactBase(id, cmn.ActRechecksum),
+		targetrunner: t,
+		bucket:       bucket,
+	}
+	q.add(xrcksum)
+	return xrcksum
+}
+
 func (q *xactInProgress) abortAll() (sleep bool) {
 	q.lock.Lock()
 	for _, xact := range q.xactinp {
-		if !xact.finished() {
-			xact.abort()
+		if !xact.Finished() {
+			xact.Abort()
 			sleep = true
 		}
 	}
@@ -277,13 +325,13 @@ func (q *xactInProgress) abortAll() (sleep bool) {
 // xactLRU
 //
 //===================
-func (xact *xactLRU) tostring() string {
-	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, xact.stime.Format("15:04:05.000000"))
+func (xact *xactLRU) String() string {
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), xact.StartTime().Format(timeStampFormat))
 	}
-	d := xact.etime.Sub(xact.stime)
-	return fmt.Sprintf("xaction %s:%d %v finished %v (duration %v)", xact.kind, xact.id,
-		xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
+	d := xact.EndTime().Sub(xact.StartTime())
+	return fmt.Sprintf("xaction %s:%d %v finished %v (duration %v)", xact.Kind(), xact.ID(),
+		xact.StartTime().Format(timeStampFormat), xact.EndTime().Format(timeStampFormat), d)
 }
 
 //===================
@@ -291,18 +339,37 @@ func (xact *xactLRU) tostring() string {
 // xactRebalance
 //
 //===================
-func (xact *xactRebalance) tostring() string {
-	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d v%d started %v", xact.kind, xact.id, xact.curversion, xact.stime.Format("15:04:05.000000"))
+func (xact *xactRebalance) String() string {
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d v%d started %v", xact.Kind(), xact.ID(), xact.curversion, xact.StartTime().Format(timeStampFormat))
 	}
-	d := xact.etime.Sub(xact.stime)
+	d := xact.EndTime().Sub(xact.StartTime())
 	return fmt.Sprintf("xaction %s:%d v%d started %v finished %v (duration %v)",
-		xact.kind, xact.id, xact.curversion, xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
+		xact.Kind(), xact.ID(), xact.curversion, xact.StartTime().Format(timeStampFormat), xact.EndTime().Format(timeStampFormat), d)
 }
 
 func (xact *xactRebalance) abort() {
-	xact.xactBase.abort()
-	glog.Infof("ABORT: " + xact.tostring())
+	xact.XactBase.Abort()
+	glog.Infof("ABORT: " + xact.String())
+}
+
+//===================
+//
+// xactLocalRebalance
+//
+//===================
+func (xact *xactLocalRebalance) String() string {
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), xact.StartTime().Format(timeStampFormat))
+	}
+	d := xact.EndTime().Sub(xact.StartTime())
+	return fmt.Sprintf("xaction %s:%d started %v finished %v (duration %v)",
+		xact.Kind(), xact.ID(), xact.StartTime().Format(timeStampFormat), xact.EndTime().Format(timeStampFormat), d)
+}
+
+func (xact *xactLocalRebalance) abort() {
+	xact.XactBase.Abort()
+	glog.Infof("ABORT: " + xact.String())
 }
 
 //==============
@@ -310,16 +377,35 @@ func (xact *xactRebalance) abort() {
 // xactElection
 //
 //==============
-func (xact *xactElection) tostring() string {
-	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, xact.stime.Format("15:04:05.000000"))
+func (xact *xactElection) String() string {
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), xact.StartTime().Format(timeStampFormat))
 	}
-	d := xact.etime.Sub(xact.stime)
-	return fmt.Sprintf("xaction %s:%d started %v finished %v (duration %v)", xact.kind, xact.id,
-		xact.stime.Format("15:04:05.000000"), xact.etime.Format("15:04:05.000000"), d)
+	d := xact.EndTime().Sub(xact.StartTime())
+	return fmt.Sprintf("xaction %s:%d started %v finished %v (duration %v)", xact.Kind(), xact.ID(),
+		xact.StartTime().Format(timeStampFormat), xact.EndTime().Format(timeStampFormat), d)
 }
 
 func (xact *xactElection) abort() {
-	xact.xactBase.abort()
-	glog.Infof("ABORT: " + xact.tostring())
+	xact.XactBase.Abort()
+	glog.Infof("ABORT: " + xact.String())
+}
+
+//===================
+//
+// xactRechecksum
+//
+//===================
+func (xact *xactRechecksum) String() string {
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), xact.StartTime().Format(timeStampFormat))
+	}
+	d := xact.EndTime().Sub(xact.StartTime())
+	return fmt.Sprintf("xaction %s:%d started %v finished %v (duration %v)", xact.Kind(), xact.ID(),
+		xact.StartTime().Format(timeStampFormat), xact.EndTime().Format(timeStampFormat), d)
+}
+
+func (xact *xactRechecksum) abort() {
+	xact.XactBase.Abort()
+	glog.Infof("ABORT: " + xact.String())
 }

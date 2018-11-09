@@ -1,13 +1,12 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -16,13 +15,20 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/json-iterator/go"
 )
 
 const (
 	prefetchChanSize = 200
 	defaultDeadline  = 0
 	defaultWait      = false
-	maxPrefetchPages = 10 // FIXME: Pagination for PREFETCH
+
+	//list range message keys
+	rangePrefix = "prefix"
+	rangeRegex  = "regex"
+	rangeKey    = "range"
 )
 
 type filesWithDeadline struct {
@@ -34,79 +40,47 @@ type filesWithDeadline struct {
 }
 
 type xactPrefetch struct {
-	xactBase
+	cmn.XactBase
 	targetrunner *targetrunner
 }
 
-type xactDeleteEvict struct {
-	xactBase
+type xactEvictDelete struct {
+	cmn.XactBase
 	targetrunner *targetrunner
 }
 
-//===========================
-//
-// Generic List/Range Methods
-//
-//===========================
+type listf func(ct context.Context, objects []string, bucket string, deadline time.Duration, done chan struct{}) error
 
-func (t *targetrunner) getListFromRangeCloud(ct context.Context, bucket string, msg *GetMsg) (bucketList *BucketList, err error) {
-	bucketList = &BucketList{Entries: make([]*BucketEntry, 0)}
-	for i := 0; i < maxPrefetchPages; i++ {
-		jsbytes, errstr, errcode := getcloudif().listbucket(ct, bucket, msg)
-		if errstr != "" {
-			return nil, fmt.Errorf("Error listing cloud bucket %s: %d(%s)", bucket, errcode, errstr)
-		}
-		reslist := &BucketList{}
-		if err := json.Unmarshal(jsbytes, reslist); err != nil {
-			return nil, fmt.Errorf("Error unmarshalling BucketList: %v", err)
-		}
-		bucketList.Entries = append(bucketList.Entries, reslist.Entries...)
-		if reslist.PageMarker == "" {
-			break
-		} else if i == maxPrefetchPages-1 {
-			glog.Warningf("Did not prefetch all keys (More than %d pages)", maxPrefetchPages)
-		}
-		msg.GetPageMarker = reslist.PageMarker
+func getCloudBucketPage(ct context.Context, bucket string, msg *cmn.GetMsg) (bucketList *cmn.BucketList, err error) {
+	jsbytes, errstr, errcode := getcloudif().listbucket(ct, bucket, msg)
+	if errstr != "" {
+		return nil, fmt.Errorf("Error listing cloud bucket %s: %d(%s)", bucket, errcode, errstr)
 	}
-
+	bucketList = &cmn.BucketList{}
+	if err := jsoniter.Unmarshal(jsbytes, bucketList); err != nil {
+		return nil, fmt.Errorf("Error unmarshalling BucketList: %v", err)
+	}
 	return
 }
 
-func (t *targetrunner) getListFromRange(ct context.Context, bucket, prefix, regex string, min, max int64) ([]string, error) {
-	msg := &GetMsg{GetPrefix: prefix}
-	var (
-		fullbucketlist *BucketList
-		err            error
-	)
-	islocal := t.bmdowner.get().islocal(bucket)
-	if islocal {
-		fullbucketlist, err = t.prepareLocalObjectList(bucket, msg)
-	} else {
-		fullbucketlist, err = t.getListFromRangeCloud(ct, bucket, msg)
+func (t *targetrunner) getOpFromActionMsg(action string) listf {
+	switch action {
+	case cmn.ActPrefetch:
+		return t.addPrefetchList
+	case cmn.ActEvict:
+		return t.doListEvict
+	case cmn.ActDelete:
+		return t.doListDelete
+	default:
+		return nil
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	objs := make([]string, 0)
-	re, err := regexp.Compile(regex)
-	if err != nil {
-		return nil, fmt.Errorf("Could not compile regex: %v", err)
-	}
-	for _, be := range fullbucketlist.Entries {
-		if !acceptRegexRange(be.Name, prefix, re, min, max) {
-			continue
-		}
-		if si, errstr := HrwTarget(bucket, be.Name, t.smapowner.get()); si == nil || si.DaemonID == t.si.DaemonID {
-			if errstr != "" {
-				return nil, fmt.Errorf(errstr)
-			}
-			objs = append(objs, be.Name)
-		}
-	}
-
-	return objs, nil
 }
+
+//======================
+//
+// Regex Matching Method
+//
+//======================
 
 func acceptRegexRange(name, prefix string, regex *regexp.Regexp, min, max int64) bool {
 	oname := strings.TrimPrefix(name, prefix)
@@ -127,115 +101,19 @@ func acceptRegexRange(name, prefix string, regex *regexp.Regexp, min, max int64)
 	return false
 }
 
-type listf func(ct context.Context, objects []string, bucket string, deadline time.Duration, done chan struct{}) error
-type rangef func(ct context.Context, bucket, prefix, regex string, min, max int64, deadline time.Duration, done chan struct{}) error
-
-func (t *targetrunner) listOperation(w http.ResponseWriter, r *http.Request, listMsg *ListMsg, operation listf) {
-	apitems := t.restAPIItems(r.URL.Path, 5)
-	if apitems = t.checkRestAPI(w, r, apitems, 1, Rversion, Rbuckets); apitems == nil {
-		return
-	}
-	bucket := apitems[0]
-	objs := make([]string, 0)
-	for _, obj := range listMsg.Objnames {
-		si, errstr := HrwTarget(bucket, obj, t.smapowner.get())
-		if errstr != "" {
-			t.invalmsghdlr(w, r, errstr)
-			return
-		}
-		if si.DaemonID == t.si.DaemonID {
-			objs = append(objs, obj)
-		}
-	}
-	if len(objs) != 0 {
-		var done chan struct{}
-		if listMsg.Wait {
-			done = make(chan struct{}, 1)
-		}
-
-		// Asynchronously perform operation
-		go func() {
-			if err := operation(t.contextWithAuth(r), objs, bucket, listMsg.Deadline, done); err != nil {
-				glog.Errorf("Error performing list operation: %v", err)
-				t.statsif.add("numerr", 1)
-			}
-		}()
-
-		if listMsg.Wait {
-			<-done
-			close(done)
-		}
-	}
-}
-
-func (t *targetrunner) rangeOperation(w http.ResponseWriter, r *http.Request, rangeMsg *RangeMsg, operation rangef) {
-	var err error
-	apitems := t.restAPIItems(r.URL.Path, 5)
-	if apitems = t.checkRestAPI(w, r, apitems, 1, Rversion, Rbuckets); apitems == nil {
-		return
-	}
-	bucket := apitems[0]
-	min, max, err := parseRange(rangeMsg.Range)
-	if err != nil {
-		s := fmt.Sprintf("Error parsing range string (%s): %v", rangeMsg.Range, err)
-		t.invalmsghdlr(w, r, s)
-	}
-
-	var done chan struct{}
-	if rangeMsg.Wait {
-		done = make(chan struct{}, 1)
-	}
-
-	// Asynchronously perform operation
-	go func() {
-		if err := operation(t.contextWithAuth(r), bucket, rangeMsg.Prefix, rangeMsg.Regex,
-			min, max, rangeMsg.Deadline, done); err != nil {
-			glog.Errorf("Error performing range operation: %v", err)
-			t.statsif.add("numerr", 1)
-		}
-	}()
-
-	if rangeMsg.Wait {
-		<-done
-		close(done)
-	}
-}
-
-//============
+//=============
 //
 // Delete/Evict
 //
 //=============
 
-func (t *targetrunner) deleteList(w http.ResponseWriter, r *http.Request, deleteMsg *ListMsg) {
-	t.listOperation(w, r, deleteMsg, t.doListDelete)
-}
-
-func (t *targetrunner) evictList(w http.ResponseWriter, r *http.Request, evictMsg *ListMsg) {
-	t.listOperation(w, r, evictMsg, t.doListEvict)
-}
-
-func (t *targetrunner) deleteRange(w http.ResponseWriter, r *http.Request, deleteRangeMsg *RangeMsg) {
-	t.rangeOperation(w, r, deleteRangeMsg, t.doRangeDelete)
-}
-
-func (t *targetrunner) evictRange(w http.ResponseWriter, r *http.Request, evictMsg *RangeMsg) {
-	t.rangeOperation(w, r, evictMsg, t.doRangeEvict)
-}
-
 func (t *targetrunner) doListEvictDelete(ct context.Context, evict bool, objs []string, bucket string, deadline time.Duration, done chan struct{}) error {
-	var xdel *xactDeleteEvict
-	if evict {
-		xdel = t.xactinp.newEvict()
-	} else {
-		xdel = t.xactinp.newDelete()
-	}
+	xdel := t.xactinp.newEvictDelete(evict)
 	defer func() {
 		if done != nil {
-			var v struct{}
-			done <- v
+			done <- struct{}{}
 		}
-		t.xactinp.del(xdel.id)
+		t.xactinp.del(xdel.ID())
 	}()
 
 	var absdeadline time.Time
@@ -246,10 +124,11 @@ func (t *targetrunner) doListEvictDelete(ct context.Context, evict bool, objs []
 
 	for _, objname := range objs {
 		select {
-		case <-xdel.abrt:
+		case <-xdel.ChanAbort():
 			return nil
 		default:
 		}
+		// skip when deadline has expired
 		if !absdeadline.IsZero() && time.Now().After(absdeadline) {
 			continue
 		}
@@ -262,17 +141,6 @@ func (t *targetrunner) doListEvictDelete(ct context.Context, evict bool, objs []
 	return nil
 }
 
-func (t *targetrunner) doRangeEvictDelete(ct context.Context, evict bool, bucket, prefix, regex string, min, max int64,
-	deadline time.Duration, done chan struct{}) error {
-
-	objs, err := t.getListFromRange(ct, bucket, prefix, regex, min, max)
-	if err != nil {
-		return err
-	}
-
-	return t.doListEvictDelete(ct, evict, objs, bucket, deadline, done)
-}
-
 func (t *targetrunner) doListDelete(ct context.Context, objs []string, bucket string, deadline time.Duration, done chan struct{}) error {
 	return t.doListEvictDelete(ct, false /* evict */, objs, bucket, deadline, done)
 }
@@ -281,40 +149,29 @@ func (t *targetrunner) doListEvict(ct context.Context, objs []string, bucket str
 	return t.doListEvictDelete(ct, true /* evict */, objs, bucket, deadline, done)
 }
 
-func (t *targetrunner) doRangeDelete(ct context.Context, bucket, prefix, regex string, min, max int64,
-	deadline time.Duration, done chan struct{}) error {
-	return t.doRangeEvictDelete(ct, false /* evict */, bucket, prefix, regex, min, max, deadline, done)
-}
-func (t *targetrunner) doRangeEvict(ct context.Context, bucket, prefix, regex string, min, max int64,
-	deadline time.Duration, done chan struct{}) error {
-	return t.doRangeEvictDelete(ct, true /* evict */, bucket, prefix, regex, min, max, deadline, done)
-}
-
-func (q *xactInProgress) newDelete() *xactDeleteEvict {
+// Creates and returns a new extended action after appending it to an array of extended actions in progress
+func (q *xactInProgress) newEvictDelete(evict bool) *xactEvictDelete {
 	q.lock.Lock()
 	defer q.lock.Unlock()
+
+	xact := cmn.ActDelete
+	if evict {
+		xact = cmn.ActEvict
+	}
+
 	id := q.uniqueid()
-	xpre := &xactDeleteEvict{xactBase: *newxactBase(id, ActDelete)}
+	xpre := &xactEvictDelete{XactBase: *cmn.NewXactBase(id, xact)}
 	q.add(xpre)
 	return xpre
 }
 
-func (q *xactInProgress) newEvict() *xactDeleteEvict {
-	q.lock.Lock()
-	defer q.lock.Unlock()
-	id := q.uniqueid()
-	xpre := &xactDeleteEvict{xactBase: *newxactBase(id, ActEvict)}
-	q.add(xpre)
-	return xpre
-}
-
-func (xact *xactDeleteEvict) tostring() string {
-	start := xact.stime.Sub(xact.targetrunner.starttime())
-	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, start)
+func (xact *xactEvictDelete) tostring() string {
+	start := xact.StartTime().Sub(xact.targetrunner.starttime())
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), start)
 	}
 	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.kind, xact.id, start, fin)
+	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.Kind(), xact.ID(), start, fin)
 }
 
 //=========
@@ -322,14 +179,6 @@ func (xact *xactDeleteEvict) tostring() string {
 // Prefetch
 //
 //=========
-
-func (t *targetrunner) prefetchList(w http.ResponseWriter, r *http.Request, prefetchMsg *ListMsg) {
-	t.listOperation(w, r, prefetchMsg, t.addPrefetchList)
-}
-
-func (t *targetrunner) prefetchRange(w http.ResponseWriter, r *http.Request, prefetchRangeMsg *RangeMsg) {
-	t.rangeOperation(w, r, prefetchRangeMsg, t.addPrefetchRange)
-}
 
 func (t *targetrunner) doPrefetch() {
 	xpre := t.xactinp.renewPrefetch(t)
@@ -350,8 +199,7 @@ loop:
 
 			// Signal completion of prefetch
 			if fwd.done != nil {
-				var v struct{}
-				fwd.done <- v
+				fwd.done <- struct{}{}
 			}
 		default:
 			// When there is nothing left to fetch, the prefetch routine ends
@@ -360,8 +208,8 @@ loop:
 		}
 	}
 
-	xpre.etime = time.Now()
-	t.xactinp.del(xpre.id)
+	xpre.EndTime(time.Now())
+	t.xactinp.del(xpre.ID())
 }
 
 func (t *targetrunner) prefetchMissing(ct context.Context, objname, bucket string) {
@@ -372,7 +220,11 @@ func (t *targetrunner) prefetchMissing(ct context.Context, objname, bucket strin
 	)
 	versioncfg := &ctx.config.Ver
 	islocal := t.bmdowner.get().islocal(bucket)
-	fqn := t.fqn(bucket, objname, islocal)
+	fqn, errstr := cluster.FQN(bucket, objname, islocal)
+	if errstr != "" {
+		glog.Error(errstr)
+		return
+	}
 	//
 	// NOTE: lockless
 	//
@@ -399,11 +251,11 @@ func (t *targetrunner) prefetchMissing(ct context.Context, objname, bucket strin
 	if glog.V(4) {
 		glog.Infof("PREFETCH: %s/%s", bucket, objname)
 	}
-	t.statsif.add("numprefetch", 1)
-	t.statsif.add("bytesprefetched", props.size)
+	t.statsif.add(statPrefetchCount, 1)
+	t.statsif.add(statPrefetchSize, props.size)
 	if vchanged {
-		t.statsif.add("bytesvchanged", props.size)
-		t.statsif.add("numvchanged", 1)
+		t.statsif.add(statVerChangeSize, props.size)
+		t.statsif.add(statVerChangeCount, 1)
 	}
 }
 
@@ -421,43 +273,29 @@ func (t *targetrunner) addPrefetchList(ct context.Context, objs []string, bucket
 	return nil
 }
 
-func (t *targetrunner) addPrefetchRange(ct context.Context, bucket, prefix, regex string,
-	min, max int64, deadline time.Duration, done chan struct{}) error {
-	if t.bmdowner.get().islocal(bucket) {
-		return fmt.Errorf("Cannot prefetch from a local bucket: %s", bucket)
-	}
-
-	objs, err := t.getListFromRange(ct, bucket, prefix, regex, min, max)
-	if err != nil {
-		return err
-	}
-
-	return t.addPrefetchList(ct, objs, bucket, deadline, done)
-}
-
 func (q *xactInProgress) renewPrefetch(t *targetrunner) *xactPrefetch {
 	q.lock.Lock()
 	defer q.lock.Unlock()
-	_, xx := q.findU(ActPrefetch)
+	_, xx := q.findU(cmn.ActPrefetch)
 	if xx != nil {
 		xpre := xx.(*xactPrefetch)
 		glog.Infof("%s already running, nothing to do", xpre.tostring())
 		return nil
 	}
 	id := q.uniqueid()
-	xpre := &xactPrefetch{xactBase: *newxactBase(id, ActPrefetch)}
+	xpre := &xactPrefetch{XactBase: *cmn.NewXactBase(id, cmn.ActPrefetch)}
 	xpre.targetrunner = t
 	q.add(xpre)
 	return xpre
 }
 
 func (xact *xactPrefetch) tostring() string {
-	start := xact.stime.Sub(xact.targetrunner.starttime())
-	if !xact.finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.kind, xact.id, start)
+	start := xact.StartTime().Sub(xact.targetrunner.starttime())
+	if !xact.Finished() {
+		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), start)
 	}
 	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.kind, xact.id, start, fin)
+	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.Kind(), xact.ID(), start, fin)
 }
 
 //================
@@ -466,39 +304,51 @@ func (xact *xactPrefetch) tostring() string {
 //
 //================
 
-func parseRangeListMsgBase(jsmap map[string]interface{}) (pmb *RangeListMsgBase, errstr string) {
-	const s = "Error parsing PrefetchMsgBase:"
-	pmb = &RangeListMsgBase{Deadline: defaultDeadline, Wait: defaultWait}
-	if v, ok := jsmap["deadline"]; ok {
-		deadline, err := time.ParseDuration(v.(string))
-		if err != nil {
-			return pmb, fmt.Sprintf("%s (Deadline: %v, %T, %v)", s, v, v, err)
-		}
-		pmb.Deadline = deadline
+func unmarshalMsgValue(jsmap map[string]interface{}, key string) (val string, errstr string) {
+	v, ok := jsmap[key]
+	if !ok {
+		errstr = fmt.Sprintf("no %s field in map", key)
+		return
 	}
-	if v, ok := jsmap["wait"]; ok {
-		wait, ok := v.(bool)
-		if !ok {
-			return pmb, fmt.Sprintf("%s (Wait: %v, %T)", s, v, v)
-		}
-		pmb.Wait = wait
+	if val, ok = v.(string); !ok {
+		errstr = fmt.Sprintf("value ((%+v, %T) corresponding to key (%s) in map is not of string type", v, v, key)
 	}
 	return
 }
 
-func parseListMsg(jsmap map[string]interface{}) (pm *ListMsg, errstr string) {
-	const s = "Error parsing PrefetchMsg: "
-	pmb, errstr := parseRangeListMsgBase(jsmap)
+func parseBaseMsg(jsmap map[string]interface{}) (pbm *cmn.ListRangeMsgBase, errstr string) {
+	const s = "Error parsing BaseMsg:"
+	pbm = &cmn.ListRangeMsgBase{Deadline: defaultDeadline, Wait: defaultWait}
+	if v, ok := jsmap["deadline"]; ok {
+		deadline, err := time.ParseDuration(v.(string))
+		if err != nil {
+			return pbm, fmt.Sprintf("%s (Deadline: %v, %T, %v)", s, v, v, err)
+		}
+		pbm.Deadline = deadline
+	}
+	if v, ok := jsmap["wait"]; ok {
+		wait, ok := v.(bool)
+		if !ok {
+			return pbm, fmt.Sprintf("%s (Wait: %v, %T)", s, v, v)
+		}
+		pbm.Wait = wait
+	}
+	return
+}
+
+func parseListMsg(jsmap map[string]interface{}) (pm *cmn.ListMsg, errstr string) {
+	const s = "Error parsing ListMsg: "
+	pbm, errstr := parseBaseMsg(jsmap)
 	if errstr != "" {
 		return
 	}
-	pm = &ListMsg{RangeListMsgBase: *pmb}
+	pm = &cmn.ListMsg{ListRangeMsgBase: *pbm}
 	v, ok := jsmap["objnames"]
 	if !ok {
 		return pm, s + "No objnames field"
 	}
 	if objnames, ok := v.([]interface{}); ok {
-		pm.Objnames = make([]string, 0)
+		pm.Objnames = make([]string, 0, len(objnames))
 		for _, obj := range objnames {
 			objname, ok := obj.(string)
 			if !ok {
@@ -512,42 +362,32 @@ func parseListMsg(jsmap map[string]interface{}) (pm *ListMsg, errstr string) {
 	return
 }
 
-func parseRangeMsg(jsmap map[string]interface{}) (pm *RangeMsg, errstr string) {
-	const s = "Error parsing PrefetchRangeMsg:"
-	pmb, errstr := parseRangeListMsgBase(jsmap)
+func parseRangeMsg(jsmap map[string]interface{}) (pm *cmn.RangeMsg, errstr string) {
+	const s = "Error parsing RangeMsg: %s"
+	pbm, errstr := parseBaseMsg(jsmap)
 	if errstr != "" {
 		return
 	}
-	pm = &RangeMsg{RangeListMsgBase: *pmb}
-	v, ok := jsmap["prefix"]
-	if !ok {
-		return pm, s + " no prefix"
-	}
-	if prefix, ok := v.(string); ok {
-		pm.Prefix = prefix
-	} else {
-		return pm, fmt.Sprintf("%s couldn't parse prefix (%v, %T)", s, v, v)
-	}
+	pm = &cmn.RangeMsg{ListRangeMsgBase: *pbm}
 
-	v, ok = jsmap["regex"]
-	if !ok {
-		return pm, s + " no regex"
+	prefix, errstr := unmarshalMsgValue(jsmap, rangePrefix)
+	if errstr != "" {
+		return pm, fmt.Sprintf(s, errstr)
 	}
-	if regex, ok := v.(string); ok {
-		pm.Regex = regex
-	} else {
-		return pm, fmt.Sprintf("%s couldn't parse regex (%v, %T)", s, v, v)
-	}
+	pm.Prefix = prefix
 
-	v, ok = jsmap["range"]
-	if !ok {
-		return pm, s + " no range"
+	regex, errstr := unmarshalMsgValue(jsmap, rangeRegex)
+	if errstr != "" {
+		return pm, fmt.Sprintf(s, errstr)
 	}
-	if rng, ok := v.(string); ok {
-		pm.Range = rng
-	} else {
-		return pm, fmt.Sprintf("%s couldn't parse range (%v, %T)", s, v, v)
+	pm.Regex = regex
+
+	r, errstr := unmarshalMsgValue(jsmap, rangeKey)
+	if errstr != "" {
+		return pm, fmt.Sprintf(s, errstr)
 	}
+	pm.Range = r
+
 	return
 }
 
@@ -578,4 +418,144 @@ func parseRange(rangestr string) (min, max int64, err error) {
 		max = 0
 	}
 	return
+}
+
+//=======================================================================
+//
+// Method called by target to execute 1) prefetch, 2) evict, or 3) delete
+//
+//=======================================================================
+
+func (t *targetrunner) listRangeOperation(r *http.Request, apitems []string, msg cmn.ActionMsg) error {
+	operation := t.getOpFromActionMsg(msg.Action)
+	if operation == nil {
+		return fmt.Errorf("Invalid Operation")
+	}
+
+	detail := fmt.Sprintf(" (%s, %s, %T)", msg.Action, msg.Name, msg.Value)
+	jsmap, ok := msg.Value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid cmn.ActionMsg.Value format" + detail)
+	}
+	if _, ok := jsmap["objnames"]; !ok {
+		// Parse map into RangeMsg, convert to and process ListMsg page-by-page
+		rangeMsg, errstr := parseRangeMsg(jsmap)
+		if errstr != "" {
+			return fmt.Errorf(errstr + detail)
+		}
+		return t.iterateBucketListPages(r, apitems, rangeMsg, operation)
+	}
+	// Parse map into ListMsg
+	listMsg, errstr := parseListMsg(jsmap)
+	if errstr != "" {
+		return fmt.Errorf(errstr + detail)
+	}
+	return t.listOperation(r, apitems, listMsg, operation)
+}
+
+func (t *targetrunner) listOperation(r *http.Request, apitems []string, listMsg *cmn.ListMsg, f listf) error {
+	var err error
+	bucket := apitems[0]
+	objs := make([]string, 0, len(listMsg.Objnames))
+	for _, obj := range listMsg.Objnames {
+		si, errstr := hrwTarget(bucket, obj, t.smapowner.get())
+		if errstr != "" {
+			return fmt.Errorf(errstr)
+		}
+		if si.DaemonID == t.si.DaemonID {
+			objs = append(objs, obj)
+		}
+	}
+
+	if len(objs) != 0 {
+		done := make(chan struct{}, 1)
+		defer close(done)
+
+		errCh := make(chan error)
+		defer close(errCh)
+
+		// Asynchronously perform function
+		go func() {
+			err := f(t.contextWithAuth(r), objs, bucket, listMsg.Deadline, done)
+			if err != nil {
+				glog.Errorf("Error performing list function: %v", err)
+				t.statsif.add(statErrListCount, 1)
+			}
+			errCh <- err
+		}()
+
+		if listMsg.Wait {
+			<-done
+			err = <-errCh
+		}
+	}
+	return err
+}
+
+func (t *targetrunner) iterateBucketListPages(r *http.Request, apitems []string, rangeMsg *cmn.RangeMsg, operation listf) error {
+	var (
+		bucketListPage *cmn.BucketList
+		err            error
+		bucket         = apitems[0]
+		prefix         = rangeMsg.Prefix
+		ct             = t.contextWithAuth(r)
+		msg            = &cmn.GetMsg{GetPrefix: prefix, GetProps: cmn.GetPropsStatus}
+		islocal        = t.bmdowner.get().islocal(bucket)
+	)
+
+	min, max, err := parseRange(rangeMsg.Range)
+	if err != nil {
+		return fmt.Errorf("Error parsing range string (%s): %v", rangeMsg.Range, err)
+	}
+
+	re, err := regexp.Compile(rangeMsg.Regex)
+	if err != nil {
+		return fmt.Errorf("Could not compile regex: %v", err)
+	}
+
+	for {
+		if islocal {
+			bucketListPage, err = t.prepareLocalObjectList(bucket, msg)
+		} else {
+			bucketListPage, err = getCloudBucketPage(ct, bucket, msg)
+		}
+		if err != nil {
+			return err
+		}
+		if len(bucketListPage.Entries) == 0 {
+			break
+		}
+
+		matchingEntries := make([]string, 0, len(bucketListPage.Entries))
+		for _, be := range bucketListPage.Entries {
+			if be.Status != cmn.ObjStatusOK {
+				continue
+			}
+			if !acceptRegexRange(be.Name, prefix, re, min, max) {
+				continue
+			}
+			matchingEntries = append(matchingEntries, be.Name)
+		}
+
+		if len(matchingEntries) != 0 {
+			// Create a ListMsg with a single page of BucketList containing BucketEntries
+			listMsg := &cmn.ListMsg{
+				ListRangeMsgBase: rangeMsg.ListRangeMsgBase,
+				Objnames:         matchingEntries,
+			}
+
+			// Call listrange function with paged chunk of entries
+			if err := t.listOperation(r, apitems, listMsg, operation); err != nil {
+				return err
+			}
+		}
+		// Stop when the last page of BucketList is reached
+		if bucketListPage.PageMarker == "" {
+			break
+		}
+
+		// Update PageMarker for the next request
+		msg.GetPageMarker = bucketListPage.PageMarker
+	}
+	return nil
 }

@@ -14,6 +14,10 @@
 #	this will generate dfc_cov.html file under /tmp/dfc
 # 3. view the result
 #	open /tmp/dfc/dfc_cov.html in a browser
+#
+# To deploy DFC as a next tier cluster to the *already running*
+# DFC cluster set DEPLOY_AS_NEXT_TIER=1.
+#
 ############################################
 
 isCommandAvailable () {
@@ -31,13 +35,24 @@ isCommandAvailable "df" "--version"
 
 export GOOGLE_CLOUD_PROJECT="involuted-forge-189016"
 USE_HTTPS=false
-PORT=${PORT:-8080}
+if [ "$DEPLOY_AS_NEXT_TIER" == "" ]
+then
+	PORT=${PORT:-8080}
+	PORT_INTRA=${PORT_INTRA:-9080}
+	PORT_REPL=${PORT_REPL:-10080}
+	NEXT_TIER=
+else
+	PORT=${PORT:-11080}
+	PORT_INTRA=${PORT_INTRA:-12080}
+	PORT_REPL=${PORT_REPL:-13080}
+	NEXT_TIER="_next"
+fi
 PROXYURL="http://localhost:$PORT"
 if $USE_HTTPS; then
 	PROXYURL="https://localhost:$PORT"
 fi
 LOGLEVEL="3" # Verbosity: 0 (minimal) to 4 (max)
-LOGROOT="/tmp/dfc"
+LOGROOT="/tmp/dfc$NEXT_TIER"
 #### Authentication setup #########
 SECRETKEY="${SECRETKEY:-aBitLongSecretKey}"
 AUTHENABLED="${AUTHENABLED:-false}"
@@ -50,14 +65,14 @@ NON_ELECTABLE=false
 # existence of each fspath is checked at runtime
 #
 ###################################
-CONFDIR="$HOME/.dfc"
+CONFDIR="$HOME/.dfc$NEXT_TIER"
 TESTFSPATHCOUNT=1
 
 if lsof -Pi :$PORT -sTCP:LISTEN -t >/dev/null; then
 	echo "Error: TCP port $PORT is not open (check if DFC is already running)"
 	exit 1
 fi
-TMPF=$(mktemp /tmp/dfc.XXXXXXXXX)
+TMPF=$(mktemp /tmp/dfc$NEXT_TIER.XXXXXXXXX)
 touch $TMPF;
 OS=$(uname -s)
 case $OS in
@@ -128,6 +143,7 @@ fi
 mkdir -p $CONFDIR
 
 # Not really used for local testing but to keep config.sh quiet
+GRAPHITE_PORT=2003
 GRAPHITE_SERVER="127.0.0.1"
 CONFFILE_COLLECTD=$CONFDIR/collectd.conf
 CONFFILE_STATSD=$CONFDIR/statsd.conf
@@ -138,16 +154,18 @@ CONFFILE_STATSD=$CONFDIR/statsd.conf
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 for (( c=$START; c<=$END; c++ ))
 do
-	CONFDIR="$HOME/.dfc$c"
+	CONFDIR="$HOME/.dfc$NEXT_TIER$c"
 	mkdir -p $CONFDIR
 	CONFFILE="$CONFDIR/dfc.json"
 	LOGDIR="$LOGROOT/$c/log"
 	source $DIR/config.sh
 	((PORT++))
+	((PORT_INTRA++))
+	((PORT_REPL++))
 done
 
 # conf file for authn
-CONFDIR="$HOME/.dfc"
+CONFDIR="$HOME/.dfc$NEXT_TIER"
 CONFFILE="$CONFDIR/authn.json"
 LOGDIR="$LOGROOT/authn/log"
 source $DIR/authn.sh
@@ -180,7 +198,7 @@ fi
 # run proxy and storage targets
 for (( c=$START; c<=$END; c++ ))
 do
-	CONFDIR="$HOME/.dfc$c"
+	CONFDIR="$HOME/.dfc$NEXT_TIER$c"
 	CONFFILE="$CONFDIR/dfc.json"
 
 	PROXY_PARAM="-config=$CONFFILE -role=proxy -ntargets=$servcount $1 $2"
@@ -214,7 +232,7 @@ do
 done
 
 if [[ $AUTHENABLED = "true" ]]; then
-	CONFDIR="$HOME/.dfc"
+	CONFDIR="$HOME/.dfc$NEXT_TIER"
 	CONFFILE="$CONFDIR/authn.json"
 	set -x
 	$GOPATH/bin/authn -config=$CONFFILE &

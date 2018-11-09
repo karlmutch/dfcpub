@@ -1,16 +1,20 @@
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  */
-
 package dfc
 
 import (
-	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/json-iterator/go"
 )
+
+const httpProto = "http"
 
 type (
 	discoverServerHandler func(sv int64, lv int64) *httptest.Server
@@ -27,7 +31,7 @@ type (
 // newDiscoverServerPrimary returns a proxy runner after initializing the fields that are needed by this test
 func newDiscoverServerPrimary() *proxyrunner {
 	p := proxyrunner{}
-	p.si = &daemonInfo{DaemonID: "primary"}
+	p.si = newSnode("primary", httpProto, &net.TCPAddr{}, &net.TCPAddr{}, &net.TCPAddr{})
 	p.smapowner = &smapowner{}
 	p.httpclientLongTimeout = &http.Client{}
 	ctx.config.KeepaliveTracker.Proxy.Name = "heartbeat"
@@ -43,10 +47,10 @@ func discoverServerDefaultHandler(sv int64, lv int64) *httptest.Server {
 		func(w http.ResponseWriter, r *http.Request) {
 			msg := SmapVoteMsg{
 				VoteInProgress: false,
-				Smap:           &Smap{Version: smapVersion},
-				BucketMD:       &bucketMD{Version: bmdVersion},
+				Smap:           &smapX{cluster.Smap{Version: smapVersion}},
+				BucketMD:       &bucketMD{cluster.BMD{Version: bmdVersion}, ""},
 			}
-			b, _ := json.Marshal(msg)
+			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
 		},
 	))
@@ -62,10 +66,10 @@ func discoverServerVoteOnceHandler(sv int64, lv int64) *httptest.Server {
 		cnt++
 		msg := SmapVoteMsg{
 			VoteInProgress: cnt == 1,
-			Smap:           &Smap{Version: smapVersion},
-			BucketMD:       &bucketMD{Version: bmdVersion},
+			Smap:           &smapX{cluster.Smap{Version: smapVersion}},
+			BucketMD:       &bucketMD{cluster.BMD{Version: bmdVersion}, ""},
 		}
-		b, _ := json.Marshal(msg)
+		b, _ := jsoniter.Marshal(msg)
 		w.Write(b)
 	}
 
@@ -83,10 +87,10 @@ func discoverServerFailTwiceHandler(sv int64, lv int64) *httptest.Server {
 		if cnt > 2 {
 			msg := SmapVoteMsg{
 				VoteInProgress: false,
-				Smap:           &Smap{Version: smapVersion},
-				BucketMD:       &bucketMD{Version: bmdVersion},
+				Smap:           &smapX{cluster.Smap{Version: smapVersion}},
+				BucketMD:       &bucketMD{cluster.BMD{Version: bmdVersion}, ""},
 			}
-			b, _ := json.Marshal(msg)
+			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
 		} else {
 			http.Error(w, "retry", http.StatusUnavailableForLegalReasons)
@@ -111,10 +115,10 @@ func discoverServerVoteInProgressHandler(sv int64, lv int64) *httptest.Server {
 		func(w http.ResponseWriter, r *http.Request) {
 			msg := SmapVoteMsg{
 				VoteInProgress: true,
-				Smap:           &Smap{Version: 12345},
-				BucketMD:       &bucketMD{Version: 67890},
+				Smap:           &smapX{cluster.Smap{Version: 12345}},
+				BucketMD:       &bucketMD{cluster.BMD{Version: 67890}, ""},
 			}
-			b, _ := json.Marshal(msg)
+			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
 		},
 	))
@@ -244,11 +248,12 @@ func TestDiscoverServers(t *testing.T) {
 		discoverSmap := newSmap()
 		for _, s := range tc.servers {
 			ts := s.httpHandler(s.smapVersion, s.bmdVersion)
-			ip, port := getServerIPAndPort(ts.URL)
+			addrInfo := serverTCPAddr(ts.URL)
+			daemon := newSnode(s.id, httpProto, addrInfo, &net.TCPAddr{}, &net.TCPAddr{})
 			if s.isProxy {
-				discoverSmap.addProxy(&daemonInfo{DaemonID: s.id, NodeIPAddr: ip, DaemonPort: port})
+				discoverSmap.addProxy(daemon)
 			} else {
-				discoverSmap.addTarget(&daemonInfo{DaemonID: s.id, NodeIPAddr: ip, DaemonPort: port})
+				discoverSmap.addTarget(daemon)
 			}
 		}
 		primary.smapowner.put(discoverSmap)

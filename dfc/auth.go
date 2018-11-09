@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/dgrijalva/jwt-go"
 )
 
@@ -47,14 +48,15 @@ const (
 type (
 	// TokenList is a list of tokens pushed by authn
 	TokenList struct {
-		Tokens []string `json:"tokens"`
+		Tokens  []string `json:"tokens"`
+		Version int64    `json:"version"`
 	}
 
 	authRec struct {
 		userID  string
 		issued  time.Time
 		expires time.Time
-		creds   simplekvs
+		creds   cmn.SimpleKVs
 	}
 
 	authList map[string]*authRec
@@ -66,6 +68,7 @@ type (
 		// list of invalid tokens(revoked or of deleted users)
 		// Authn sends these tokens to primary for broadcasting
 		revokedTokens map[string]bool
+		version       int64
 	}
 )
 
@@ -108,7 +111,7 @@ func decryptToken(tokenStr string) (*authRec, error) {
 	if rec.expires, err = time.Parse(time.RFC822, expireStr); err != nil {
 		return nil, invalTokenErr
 	}
-	rec.creds = make(simplekvs, 0)
+	rec.creds = make(cmn.SimpleKVs, 0)
 	if cc, ok := claims["creds"].(map[string]interface{}); ok {
 		for key, value := range cc {
 			if asStr, ok := value.(string); ok {
@@ -118,7 +121,7 @@ func decryptToken(tokenStr string) (*authRec, error) {
 			}
 		}
 	} else {
-		glog.Info("Token for %s does not contain credentials", rec.userID)
+		glog.Infof("Token for %s does not contain credentials", rec.userID)
 	}
 
 	return rec, nil
@@ -141,13 +144,13 @@ func getStringFromContext(ct context.Context, fieldName contextID) string {
 }
 
 // Retreives a userCreds from context or nil if nothing found
-func userCredsFromContext(ct context.Context) simplekvs {
+func userCredsFromContext(ct context.Context) cmn.SimpleKVs {
 	userIf := ct.Value(ctxUserCreds)
 	if userIf == nil {
 		return nil
 	}
 
-	if userCreds, ok := userIf.(simplekvs); ok {
+	if userCreds, ok := userIf.(cmn.SimpleKVs); ok {
 		return userCreds
 	}
 
@@ -162,6 +165,18 @@ func (a *authManager) updateRevokedList(tokens *TokenList) {
 	}
 
 	a.Lock()
+	if tokens.Version == 0 {
+		// a user manually revoked a token
+		a.version++
+	} else if tokens.Version > a.version {
+		a.version = tokens.Version
+	} else {
+		glog.Errorf("Current token list v%d is greater than received v%d",
+			a.version, tokens.Version)
+		a.Unlock()
+		return
+	}
+
 	for _, token := range tokens.Tokens {
 		a.revokedTokens[token] = true
 		delete(a.tokens, token)
@@ -222,4 +237,41 @@ func (a *authManager) extractTokenData(token string) (*authRec, error) {
 	}
 
 	return auth, nil
+}
+
+func (a *authManager) revokedTokenList() *TokenList {
+	a.Lock()
+	tlist := &TokenList{
+		Tokens:  make([]string, len(a.revokedTokens)),
+		Version: a.version,
+	}
+
+	idx := 0
+	for token := range a.revokedTokens {
+		tlist.Tokens[idx] = token
+		idx++
+	}
+
+	a.Unlock()
+	return tlist
+}
+
+var _ revs = &TokenList{}
+
+func (t *TokenList) tag() string {
+	return tokentag
+}
+
+//
+// metasync interface impl-s
+//
+
+// as a revs:
+// token list doesn't need versioning: receivers keep adding received tokens to their internal lists
+func (t *TokenList) version() int64 {
+	return t.Version
+}
+
+func (t *TokenList) marshal() ([]byte, error) {
+	return jsonCompat.Marshal(t)
 }

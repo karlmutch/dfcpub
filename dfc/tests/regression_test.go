@@ -10,11 +10,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
-	_ "net/http/pprof" // profile
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,9 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/api"
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
-	"github.com/NVIDIA/dfcpub/pkg/client/readers"
+	"github.com/NVIDIA/dfcpub/memsys"
+	"github.com/NVIDIA/dfcpub/tutils"
+	"github.com/json-iterator/go"
 )
 
 type Test struct {
@@ -44,7 +47,6 @@ type regressionTestData struct {
 const (
 	rootDir = "/tmp/dfc"
 
-	RestAPIDaemonSuffix   = "/" + dfc.Rversion + "/" + dfc.Rdaemon
 	TestLocalBucketName   = "TESTLOCALBUCKET"
 	RenameLocalBucketName = "renamebucket"
 	RenameDir             = rootDir + "/rename"
@@ -53,61 +55,57 @@ const (
 )
 
 var (
-	RenameMsg        = dfc.ActionMsg{Action: dfc.ActRename}
+	RenameMsg        = cmn.ActionMsg{Action: cmn.ActRename}
 	HighWaterMark    = uint32(80)
 	LowWaterMark     = uint32(60)
 	UpdTime          = time.Second * 20
 	configRegression = map[string]string{
-		"stats_time":         fmt.Sprintf("%v", UpdTime),
-		"dont_evict_time":    fmt.Sprintf("%v", UpdTime),
-		"capacity_upd_time":  fmt.Sprintf("%v", UpdTime),
-		"startup_delay_time": fmt.Sprintf("%v", UpdTime),
-		"lowwm":              fmt.Sprintf("%d", LowWaterMark),
-		"highwm":             fmt.Sprintf("%d", HighWaterMark),
-		"lru_enabled":        "true",
+		"stats_time":        fmt.Sprintf("%v", UpdTime),
+		"dont_evict_time":   fmt.Sprintf("%v", UpdTime),
+		"capacity_upd_time": fmt.Sprintf("%v", UpdTime),
+		"lowwm":             fmt.Sprintf("%d", LowWaterMark),
+		"highwm":            fmt.Sprintf("%d", HighWaterMark),
+		"lru_enabled":       "true",
 	}
-	httpclient = &http.Client{}
 )
 
 func TestLocalListBucketGetTargetURL(t *testing.T) {
 	const (
 		num      = 1000
-		filesize = uint64(1024)
+		filesize = 1024
 		seed     = int64(111)
 		bucket   = TestLocalBucketName
 	)
 	var (
 		filenameCh = make(chan string, num)
-		errch      = make(chan error, num)
-		sgl        *dfc.SGLIO
+		errCh      = make(chan error, num)
+		sgl        *memsys.SGL
 		targets    = make(map[string]struct{})
+		proxyURL   = getPrimaryURL(t, proxyURLRO)
 	)
 
-	smap, err := client.GetClusterMap(proxyurl)
-	checkFatal(err, t)
+	smap, err := tutils.GetClusterMap(proxyURL)
+	tutils.CheckFatal(err, t)
 	if len(smap.Tmap) == 1 {
-		tlogln("Warning: more than 1 target should deployed for best utility of this test.")
+		tutils.Logln("Warning: more than 1 target should deployed for best utility of this test.")
 	}
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(filesize)
+		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
 
-	err = client.CreateLocalBucket(proxyurl, bucket)
-	checkFatal(err, t)
+	createFreshLocalBucket(t, proxyURL, bucket)
+	defer destroyLocalBucket(t, proxyURL, bucket)
 
-	defer func() {
-		err = client.DestroyLocalBucket(proxyurl, bucket)
-		checkFatal(err, t)
-	}()
+	putRandObjs(proxyURL, seed, filesize, num, bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	selectErr(errCh, "put", t, true)
+	close(filenameCh)
+	close(errCh)
 
-	putRandomFiles(seed, filesize, num, bucket, t, nil, errch, filenameCh, SmokeDir, SmokeStr, true, sgl)
-	selectErr(errch, "put", t, true)
-
-	msg := &dfc.GetMsg{GetPageSize: int(pagesize), GetProps: dfc.GetTargetURL}
-	bl, err := client.ListBucket(proxyurl, bucket, msg, num)
-	checkFatal(err, t)
+	msg := &cmn.GetMsg{GetPageSize: int(pagesize), GetProps: cmn.GetTargetURL}
+	bl, err := tutils.ListBucket(proxyURL, bucket, msg, num)
+	tutils.CheckFatal(err, t)
 
 	if len(bl.Entries) != num {
 		t.Errorf("Expected %d bucket list entries, found %d\n", num, len(bl.Entries))
@@ -120,8 +118,8 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 		if _, ok := targets[e.TargetURL]; !ok {
 			targets[e.TargetURL] = struct{}{}
 		}
-		l, _, err := client.Get(e.TargetURL, bucket, e.Name, nil, nil, false, false)
-		checkFatal(err, t)
+		l, _, err := tutils.Get(e.TargetURL, bucket, e.Name, nil, nil, false, false)
+		tutils.CheckFatal(err, t)
 		if uint64(l) != filesize {
 			t.Errorf("Expected filesize: %d, actual filesize: %d\n", filesize, l)
 		}
@@ -133,8 +131,8 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 
 	// Ensure no target URLs are returned when the property is not requested
 	msg.GetProps = ""
-	bl, err = client.ListBucket(proxyurl, bucket, msg, num)
-	checkFatal(err, t)
+	bl, err = tutils.ListBucket(proxyURL, bucket, msg, num)
+	tutils.CheckFatal(err, t)
 
 	if len(bl.Entries) != num {
 		t.Errorf("Expected %d bucket list entries, found %d\n", num, len(bl.Entries))
@@ -150,53 +148,54 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 func TestCloudListBucketGetTargetURL(t *testing.T) {
 	const (
 		numberOfFiles = 100
-		fileSize      = uint64(1024)
+		fileSize      = 1024
 		seed          = int64(111)
 	)
 
+	proxyURL := getPrimaryURL(t, proxyURLRO)
 	random := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
-	prefix := client.FastRandomFilename(random, 32)
+	prefix := tutils.FastRandomFilename(random, 32)
 
 	var (
 		fileNameCh = make(chan string, numberOfFiles)
-		errorCh    = make(chan error, numberOfFiles)
-		sgl        *dfc.SGLIO
+		errCh      = make(chan error, numberOfFiles)
+		sgl        *memsys.SGL
 		bucketName = clibucket
 		targets    = make(map[string]struct{})
 	)
 
-	isCloud := isCloudBucket(t, proxyurl, clibucket)
-	if !isCloud {
-		t.Skip("TestCloudListBucketGetTargetURL test is for cloud buckets only")
+	if !isCloudBucket(t, proxyURL, clibucket) {
+		t.Skip("TestCloudListBucketGetTargetURL requires a cloud bucket")
 	}
 
-	clusterMap, err := client.GetClusterMap(proxyurl)
-	checkFatal(err, t)
+	clusterMap, err := tutils.GetClusterMap(proxyURL)
+	tutils.CheckFatal(err, t)
 	if len(clusterMap.Tmap) == 1 {
-		tlogln("Warning: more than 1 target should deployed for best utility of this test.")
+		tutils.Logln("Warning: more than 1 target should deployed for best utility of this test.")
 	}
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(fileSize)
+		sgl = tutils.Mem2.NewSGL(fileSize)
 		defer sgl.Free()
 	}
-
-	putRandomFiles(seed, fileSize, numberOfFiles, bucketName, t, nil, errorCh, fileNameCh, SmokeDir, prefix, true, sgl)
-	selectErr(errorCh, "put", t, true)
+	putRandObjs(proxyURL, seed, fileSize, numberOfFiles, bucketName, errCh, fileNameCh, SmokeDir, prefix, true, sgl)
+	selectErr(errCh, "put", t, true)
+	close(fileNameCh)
+	close(errCh)
 	defer func() {
 		files := make([]string, numberOfFiles)
 		for i := 0; i < numberOfFiles; i++ {
 			files[i] = prefix + "/" + <-fileNameCh
 		}
-		err := client.DeleteList(proxyurl, bucketName, files, true, 0)
+		err := tutils.DeleteList(proxyURL, bucketName, files, true, 0)
 		if err != nil {
 			t.Error("Unable to delete files during cleanup from cloud bucket.")
 		}
 	}()
 
-	listBucketMsg := &dfc.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize), GetProps: dfc.GetTargetURL}
-	bucketList, err := client.ListBucket(proxyurl, bucketName, listBucketMsg, 0)
-	checkFatal(err, t)
+	listBucketMsg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize), GetProps: cmn.GetTargetURL}
+	bucketList, err := tutils.ListBucket(proxyURL, bucketName, listBucketMsg, 0)
+	tutils.CheckFatal(err, t)
 
 	if len(bucketList.Entries) != numberOfFiles {
 		t.Errorf("Number of entries in bucket list [%d] must be equal to [%d].\n",
@@ -210,9 +209,9 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 		if _, ok := targets[object.TargetURL]; !ok {
 			targets[object.TargetURL] = struct{}{}
 		}
-		objectSize, _, err := client.Get(object.TargetURL, bucketName, object.Name,
+		objectSize, _, err := tutils.Get(object.TargetURL, bucketName, object.Name,
 			nil, nil, false, false)
-		checkFatal(err, t)
+		tutils.CheckFatal(err, t)
 		if uint64(objectSize) != fileSize {
 			t.Errorf("Expected fileSize: %d, actual fileSize: %d\n", fileSize, objectSize)
 		}
@@ -226,8 +225,8 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 
 	// Ensure no target URLs are returned when the property is not requested
 	listBucketMsg.GetProps = ""
-	bucketList, err = client.ListBucket(proxyurl, bucketName, listBucketMsg, 0)
-	checkFatal(err, t)
+	bucketList, err = tutils.ListBucket(proxyURL, bucketName, listBucketMsg, 0)
+	tutils.CheckFatal(err, t)
 
 	if len(bucketList.Entries) != numberOfFiles {
 		t.Errorf("Expected %d bucket list entries, found %d\n", numberOfFiles, len(bucketList.Entries))
@@ -244,31 +243,29 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 // 2. Corrupt the file
 // 3. GET file
 func TestGetCorruptFileAfterPut(t *testing.T) {
+	const filesize = 1024
 	var (
 		num        = 2
 		filenameCh = make(chan string, num)
-		errch      = make(chan error, 100)
-		sgl        *dfc.SGLIO
-		filesize   = uint64(1024)
+		errCh      = make(chan error, 100)
+		sgl        *memsys.SGL
 		seed       = int64(111)
 		fqn        string
+		proxyURL   = getPrimaryURL(t, proxyURLRO)
 	)
 	bucket := TestLocalBucketName
-	err := client.CreateLocalBucket(proxyurl, bucket)
-	checkFatal(err, t)
-
-	defer func() {
-		err = client.DestroyLocalBucket(proxyurl, bucket)
-		checkFatal(err, t)
-	}()
+	createFreshLocalBucket(t, proxyURL, bucket)
+	defer destroyLocalBucket(t, proxyURL, bucket)
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(filesize)
+		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
 
-	putRandomFiles(seed, filesize, num, bucket, t, nil, errch, filenameCh, SmokeDir, SmokeStr, true, sgl)
-	selectErr(errch, "put", t, false)
+	putRandObjs(proxyURL, seed, filesize, num, bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	selectErr(errCh, "put", t, false)
+	close(filenameCh)
+	close(errCh)
 
 	// Test corrupting the file contents
 	// Note: The following tests can only work when running on a local setup(targets are co-located with
@@ -286,10 +283,10 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 
 	fName = <-filenameCh
 	filepath.Walk(rootDir, fsWalkFunc)
-	tlogf("Corrupting file data[%s]: %s\n", fName, fqn)
-	err = ioutil.WriteFile(fqn, []byte("this file has been corrupted"), 0644)
-	checkFatal(err, t)
-	_, _, err = client.Get(proxyurl, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
+	tutils.Logf("Corrupting file data[%s]: %s\n", fName, fqn)
+	err := ioutil.WriteFile(fqn, []byte("this file has been corrupted"), 0644)
+	tutils.CheckFatal(err, t)
+	_, _, err = tutils.Get(proxyURL, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
 	if err == nil {
 		t.Error("Error is nil, expected non-nil error on a a GET for an object with corrupted contents")
 	}
@@ -297,11 +294,11 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 	// Test corrupting the file xattr
 	fName = <-filenameCh
 	filepath.Walk(rootDir, fsWalkFunc)
-	tlogf("Corrupting file xattr[%s]: %s\n", fName, fqn)
-	if errstr := dfc.Setxattr(fqn, dfc.XattrXXHashVal, []byte("01234abcde")); errstr != "" {
+	tutils.Logf("Corrupting file xattr[%s]: %s\n", fName, fqn)
+	if errstr := dfc.Setxattr(fqn, cmn.XattrXXHashVal, []byte("01234abcde")); errstr != "" {
 		t.Error(errstr)
 	}
-	_, _, err = client.Get(proxyurl, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
+	_, _, err = tutils.Get(proxyURL, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
 	if err == nil {
 		t.Error("Error is nil, expected non-nil error on a GET for an object with corrupted xattr")
 	}
@@ -309,66 +306,62 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 
 func TestRegressionLocalBuckets(t *testing.T) {
 	bucket := TestLocalBucketName
-	err := client.CreateLocalBucket(proxyurl, bucket)
-	checkFatal(err, t)
-
-	defer func() {
-		err = client.DestroyLocalBucket(proxyurl, bucket)
-		checkFatal(err, t)
-	}()
-	doBucketRegressionTest(t, regressionTestData{bucket: bucket})
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	createFreshLocalBucket(t, proxyURL, bucket)
+	defer destroyLocalBucket(t, proxyURL, bucket)
+	doBucketRegressionTest(t, proxyURL, regressionTestData{bucket: bucket})
 
 }
 
 func TestRenameLocalBuckets(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
+	proxyURL := getPrimaryURL(t, proxyURLRO)
 	bucket := TestLocalBucketName
 	renamedBucket := bucket + "_renamed"
-	err := client.CreateLocalBucket(proxyurl, bucket)
-	checkFatal(err, t)
+	createFreshLocalBucket(t, proxyURL, bucket)
+	destroyLocalBucket(t, proxyURL, renamedBucket)
+	defer destroyLocalBucket(t, proxyURL, renamedBucket)
 
-	defer func() {
-		err = client.DestroyLocalBucket(proxyurl, renamedBucket)
-		checkFatal(err, t)
-	}()
+	b, err := api.GetBucketNames(tutils.HTTPClient, proxyURL, true)
+	tutils.CheckFatal(err, t)
 
-	b, err := client.ListBuckets(proxyurl, true)
-	checkFatal(err, t)
-
-	doBucketRegressionTest(t, regressionTestData{
+	doBucketRegressionTest(t, proxyURL, regressionTestData{
 		bucket: bucket, renamedBucket: renamedBucket, numLocalBuckets: len(b.Local), rename: true,
 	})
 }
 
 func TestListObjects(t *testing.T) {
+	const fileSize = 1024
 	var (
-		numFiles        = 20
-		prefix          = "regressionList"
-		fileSize uint64 = 1024
-		bucket          = clibucket
-		seed            = baseseed + 101
-		errch           = make(chan error, numFiles*5)
-		filesput        = make(chan string, numfiles)
-		dir             = DeleteDir
-		sgl      *dfc.SGLIO
+		numFiles   = 20
+		prefix     = "regressionList"
+		bucket     = clibucket
+		seed       = baseseed + 101
+		errCh      = make(chan error, numFiles*5)
+		filesPutCh = make(chan string, numfiles)
+		dir        = DeleteDir
+		proxyURL   = getPrimaryURL(t, proxyURLRO)
+		sgl        *memsys.SGL
 	)
 	if usingSG {
-		sgl = dfc.NewSGLIO(fileSize)
+		sgl = tutils.Mem2.NewSGL(fileSize)
 		defer sgl.Free()
 	}
-	tlogf("Create a list of %d objects", numFiles)
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+	tutils.Logf("Create a list of %d objects", numFiles)
+	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
+		defer destroyLocalBucket(t, proxyURL, clibucket)
+	}
 	fileList := make([]string, 0, numFiles)
 	for i := 0; i < numFiles; i++ {
 		fname := fmt.Sprintf("obj%d", i+1)
 		fileList = append(fileList, fname)
 	}
-	fillWithRandomData(seed, fileSize, fileList, bucket, t, errch, filesput, dir, prefix, !testing.Verbose(), sgl)
-	close(filesput)
-	selectErr(errch, "list - put", t, true /* fatal - if PUT does not work then it makes no sense to continue */)
-
+	putRandObjsFromList(proxyURL, seed, fileSize, fileList, bucket, errCh, filesPutCh, dir, prefix, !testing.Verbose(), sgl)
+	close(filesPutCh)
+	selectErr(errCh, "list - put", t, true /* fatal - if PUT does not work then it makes no sense to continue */)
+	close(errCh)
 	type testParams struct {
 		title    string
 		prefix   string
@@ -410,9 +403,9 @@ func TestListObjects(t *testing.T) {
 	}
 
 	for idx, test := range tests {
-		tlogf("%d. %s\n    Prefix: [%s], Expected objects: %d\n", idx+1, test.title, test.prefix, test.expected)
-		msg := &dfc.GetMsg{GetPageSize: test.pageSize, GetPrefix: test.prefix}
-		reslist, err := listObjects(t, msg, bucket, test.limit)
+		tutils.Logf("%d. %s\n    Prefix: [%s], Expected objects: %d\n", idx+1, test.title, test.prefix, test.expected)
+		msg := &cmn.GetMsg{GetPageSize: test.pageSize, GetPrefix: test.prefix}
+		reslist, err := listObjects(t, proxyURL, msg, bucket, test.limit)
 		if err != nil {
 			t.Error(err)
 			continue
@@ -424,44 +417,36 @@ func TestListObjects(t *testing.T) {
 	}
 
 	if usingFile {
-		for name := range filesput {
+		for name := range filesPutCh {
 			os.Remove(dir + "/" + name)
-		}
-	}
-
-	if created {
-		if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-			t.Errorf("Failed to delete local bucket: %v", err)
 		}
 	}
 }
 
 func TestRenameObjects(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
 	var (
-		injson    []byte
-		err       error
-		numPuts   = 10
-		filesput  = make(chan string, numPuts)
-		errch     = make(chan error, numPuts)
-		basenames = make([]string, 0, numPuts) // basenames
-		bnewnames = make([]string, 0, numPuts) // new basenames
-		sgl       *dfc.SGLIO
+		injson     []byte
+		err        error
+		numPuts    = 10
+		filesPutCh = make(chan string, numPuts)
+		errCh      = make(chan error, numPuts)
+		basenames  = make([]string, 0, numPuts) // basenames
+		bnewnames  = make([]string, 0, numPuts) // new basenames
+		sgl        *memsys.SGL
+		proxyURL   = getPrimaryURL(t, proxyURLRO)
 	)
 
-	err = client.CreateLocalBucket(proxyurl, RenameLocalBucketName)
-	if err != nil {
-		t.Fatal(err)
-	}
+	createFreshLocalBucket(t, proxyURL, RenameLocalBucketName)
 
 	defer func() {
 		// cleanup
 		wg := &sync.WaitGroup{}
 		for _, fname := range bnewnames {
 			wg.Add(1)
-			go client.Del(proxyurl, RenameLocalBucketName, RenameStr+"/"+fname, wg, errch, !testing.Verbose())
+			go tutils.Del(proxyURL, RenameLocalBucketName, RenameStr+"/"+fname, wg, errCh, !testing.Verbose())
 		}
 
 		if usingFile {
@@ -474,28 +459,27 @@ func TestRenameObjects(t *testing.T) {
 		}
 
 		wg.Wait()
-		selectErr(errch, "delete", t, false)
-		close(errch)
-		err = client.DestroyLocalBucket(proxyurl, RenameLocalBucketName)
-		checkFatal(err, t)
+		selectErr(errCh, "delete", t, false)
+		close(errCh)
+		destroyLocalBucket(t, proxyURL, RenameLocalBucketName)
 	}()
 
 	time.Sleep(time.Second * 5)
 
-	if err = dfc.CreateDir(RenameDir); err != nil {
+	if err = cmn.CreateDir(RenameDir); err != nil {
 		t.Errorf("Error creating dir: %v", err)
 	}
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(1024 * 1024)
+		sgl = tutils.Mem2.NewSGL(1024 * 1024)
 		defer sgl.Free()
 	}
 
-	putRandomFiles(baseseed+1, 0, numPuts, RenameLocalBucketName, t, nil, nil, filesput, RenameDir,
+	putRandObjs(proxyURL, baseseed+1, 0, numPuts, RenameLocalBucketName, errCh, filesPutCh, RenameDir,
 		RenameStr, !testing.Verbose(), sgl)
-	selectErr(errch, "put", t, false)
-	close(filesput)
-	for fname := range filesput {
+	selectErr(errCh, "put", t, false)
+	close(filesPutCh)
+	for fname := range filesPutCh {
 		basenames = append(basenames, fname)
 	}
 
@@ -503,113 +487,95 @@ func TestRenameObjects(t *testing.T) {
 	for _, fname := range basenames {
 		RenameMsg.Name = RenameStr + "/" + fname + ".renamed" // objname
 		bnewnames = append(bnewnames, fname+".renamed")       // base name
-		injson, err = json.Marshal(RenameMsg)
+		injson, err = jsoniter.Marshal(RenameMsg)
 		if err != nil {
 			t.Fatalf("Failed to marshal RenameMsg: %v", err)
 		}
 
-		err := client.HTTPRequest("POST",
-			proxyurl+"/"+dfc.Rversion+"/"+dfc.Robjects+"/"+RenameLocalBucketName+"/"+RenameStr+"/"+fname,
-			bytes.NewBuffer(injson))
-		if err != nil {
+		url := proxyURL + cmn.URLPath(cmn.Version, cmn.Objects, RenameLocalBucketName, RenameStr, fname)
+		if err := tutils.HTTPRequest(http.MethodPost, url, tutils.NewBytesReader(injson)); err != nil {
 			t.Fatalf("Failed to send request, err = %v", err)
 		}
 
-		tlogln(fmt.Sprintf("Rename %s/%s => %s", RenameStr, fname, RenameMsg.Name))
+		tutils.Logln(fmt.Sprintf("Rename %s/%s => %s", RenameStr, fname, RenameMsg.Name))
 	}
 
 	// get renamed objects
 	waitProgressBar("Rename/move: ", time.Second*5)
 	for _, fname := range bnewnames {
-		client.Get(proxyurl, RenameLocalBucketName, RenameStr+"/"+fname, nil,
-			errch, !testing.Verbose(), false /* validate */)
+		tutils.Get(proxyURL, RenameLocalBucketName, RenameStr+"/"+fname, nil,
+			errCh, !testing.Verbose(), false /* validate */)
 	}
-	selectErr(errch, "get", t, false)
+	selectErr(errCh, "get", t, false)
 }
 
 func TestObjectPrefix(t *testing.T) {
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
+		defer destroyLocalBucket(t, proxyURL, clibucket)
+	}
 
 	prefixFileNumber = numfiles
-	prefixCreateFiles(t)
-	prefixLookup(t)
-	prefixCleanup(t)
-
-	if created {
-		if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-			t.Errorf("Failed to delete local bucket: %v", err)
-		}
-	}
+	prefixCreateFiles(t, proxyURL)
+	prefixLookup(t, proxyURL)
+	prefixCleanup(t, proxyURL)
 }
 
 func TestObjectsVersions(t *testing.T) {
-	propsMainTest(t, dfc.VersionAll)
+	propsMainTest(t, cmn.VersionAll)
 }
 
 func TestRegressionCloudBuckets(t *testing.T) {
-	isCloud := isCloudBucket(t, proxyurl, clibucket)
-	if !isCloud {
-		t.Skip("TestRegressionCloudBuckets test is for cloud buckets only")
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	if !isCloudBucket(t, proxyURL, clibucket) {
+		t.Skip("TestRegressionCloudBuckets requires a cloud bucket")
 	}
 
-	doBucketRegressionTest(t, regressionTestData{bucket: clibucket})
+	doBucketRegressionTest(t, proxyURL, regressionTestData{bucket: clibucket})
 }
 
 func TestRebalance(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
+	const filesize = 1024 * 128
 	var (
 		sid             string
 		targetDirectURL string
 		numPuts         = 40
-		filesput        = make(chan string, numPuts)
-		errch           = make(chan error, 100)
+		filesPutCh      = make(chan string, numPuts)
+		errCh           = make(chan error, 100)
 		wg              = &sync.WaitGroup{}
-		sgl             *dfc.SGLIO
-		filesize        = uint64(1024 * 128)
+		sgl             *memsys.SGL
+		proxyURL        = getPrimaryURL(t, proxyURLRO)
 	)
 	filesSentOrig := make(map[string]int64)
 	bytesSentOrig := make(map[string]int64)
 	filesRecvOrig := make(map[string]int64)
 	bytesRecvOrig := make(map[string]int64)
-	stats := getClusterStats(httpclient, t)
+	stats := getClusterStats(t, proxyURL)
 	for k, v := range stats.Target {
 		bytesSentOrig[k], filesSentOrig[k], bytesRecvOrig[k], filesRecvOrig[k] =
-			v.Core.Numsentbytes, v.Core.Numsentfiles, v.Core.Numrecvbytes, v.Core.Numrecvfiles
+			v.Core.Tracker["tx.size"].Value, v.Core.Tracker["tx.n"].Value,
+			v.Core.Tracker["rx.size"].Value, v.Core.Tracker["rx.n"].Value
 	}
-
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
 
 	//
 	// step 1. config
 	//
-	oconfig := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
-	orebconfig := oconfig["rebalance_conf"].(map[string]interface{})
-	defer func() {
-		setConfig("startup_delay_time", orebconfig["startup_delay_time"].(string), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-
-		if created {
-			if err := client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-				t.Errorf("Failed to delete local bucket: %v", err)
-			}
-		}
-	}()
+	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
+		defer destroyLocalBucket(t, proxyURL, clibucket)
+	}
 
 	//
 	// cluster-wide reduce startup_delay_time
 	//
-	startupdelaytimestr := "20s"
-	setConfig("startup_delay_time", startupdelaytimestr, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t) // NOTE: 1 second
-	if t.Failed() {
-		return
-	}
 	waitProgressBar("Rebalance: ", time.Second*10)
 
 	//
 	// step 2. unregister random target
 	//
-	smap := getClusterMap(t)
+	smap := getClusterMap(t, proxyURL)
 	l := len(smap.Tmap)
 	if l < 2 {
 		t.Fatalf("Must have 2 or more targets in the cluster, have only %d", l)
@@ -617,30 +583,30 @@ func TestRebalance(t *testing.T) {
 	for sid = range smap.Tmap {
 		break
 	}
-	targetDirectURL = smap.Tmap[sid].DirectURL
+	targetDirectURL = smap.Tmap[sid].PublicNet.DirectURL
 
-	err := client.UnregisterTarget(proxyurl, sid)
-	checkFatal(err, t)
-	tlogf("Unregistered %s: cluster size = %d (targets)\n", sid, l-1)
+	err := tutils.UnregisterTarget(proxyURL, sid)
+	tutils.CheckFatal(err, t)
+	tutils.Logf("Unregistered %s: cluster size = %d (targets)\n", sid, l-1)
 	//
 	// step 3. put random files => (cluster - 1)
 	//
 	if usingSG {
-		sgl = dfc.NewSGLIO(filesize)
+		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
-	putRandomFiles(baseseed, filesize, numPuts, clibucket, t, nil, errch, filesput, SmokeDir,
+	putRandObjs(proxyURL, baseseed, filesize, numPuts, clibucket, errCh, filesPutCh, SmokeDir,
 		SmokeStr, !testing.Verbose(), sgl)
-	selectErr(errch, "put", t, false)
+	selectErr(errCh, "put", t, false)
 
 	//
 	// step 4. register back
 	//
-	err = client.RegisterTarget(sid, targetDirectURL, smap)
-	checkFatal(err, t)
+	err = tutils.RegisterTarget(sid, targetDirectURL, smap)
+	tutils.CheckFatal(err, t)
 	for i := 0; i < 25; i++ {
 		time.Sleep(time.Second)
-		smap = getClusterMap(t)
+		smap = getClusterMap(t, proxyURL)
 		if len(smap.Tmap) == l {
 			break
 		}
@@ -649,28 +615,28 @@ func TestRebalance(t *testing.T) {
 		t.Errorf("Re-registration timed out: target %s, original num targets %d\n", sid, l)
 		return
 	}
-	tlogf("Re-registered %s: the cluster is now back to %d targets\n", sid, l)
+	tutils.Logf("Re-registered %s: the cluster is now back to %d targets\n", sid, l)
 	//
 	// step 5. wait for rebalance to run its course
 	//
-	waitForRebalanceToComplete(t)
+	waitForRebalanceToComplete(t, proxyURL)
 	//
 	// step 6. statistics
 	//
-	stats = getClusterStats(httpclient, t)
+	stats = getClusterStats(t, proxyURL)
 	var bsent, fsent, brecv, frecv int64
 	for k, v := range stats.Target {
-		bsent += v.Core.Numsentbytes - bytesSentOrig[k]
-		fsent += v.Core.Numsentfiles - filesSentOrig[k]
-		brecv += v.Core.Numrecvbytes - bytesRecvOrig[k]
-		frecv += v.Core.Numrecvfiles - filesRecvOrig[k]
+		bsent += v.Core.Tracker["tx.size"].Value - bytesSentOrig[k]
+		fsent += v.Core.Tracker["tx.n"].Value - filesSentOrig[k]
+		brecv += v.Core.Tracker["rx.size"].Value - bytesRecvOrig[k]
+		frecv += v.Core.Tracker["rx.n"].Value - filesRecvOrig[k]
 	}
 
 	//
 	// step 7. cleanup
 	//
-	close(filesput) // to exit for-range
-	for fname := range filesput {
+	close(filesPutCh) // to exit for-range
+	for fname := range filesPutCh {
 		if usingFile {
 			err := os.Remove(SmokeDir + "/" + fname)
 			if err != nil {
@@ -679,23 +645,24 @@ func TestRebalance(t *testing.T) {
 		}
 
 		wg.Add(1)
-		go client.Del(proxyurl, clibucket, "smoke/"+fname, wg, errch, !testing.Verbose())
+		go tutils.Del(proxyURL, clibucket, "smoke/"+fname, wg, errCh, !testing.Verbose())
 	}
 	wg.Wait()
-	selectErr(errch, "delete", t, abortonerr)
-	close(errch)
+	selectErr(errCh, "delete", t, abortonerr)
+	close(errCh)
 	if !t.Failed() && testing.Verbose() {
-		fmt.Printf("Rebalance: sent     %.2f MB in %d files\n", float64(bsent)/1000/1000, fsent)
-		fmt.Printf("           received %.2f MB in %d files\n", float64(brecv)/1000/1000, frecv)
+		tutils.Logf("Rebalance: sent     %.2f MB in %d files\n", float64(bsent)/1000/1000, fsent)
+		tutils.Logf("           received %.2f MB in %d files\n", float64(brecv)/1000/1000, frecv)
 	}
 }
 
 func TestGetClusterStats(t *testing.T) {
-	smap := getClusterMap(t)
-	stats := getClusterStats(httpclient, t)
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	smap := getClusterMap(t, proxyURL)
+	stats := getClusterStats(t, proxyURL)
 
 	for k, v := range stats.Target {
-		tdstats := getDaemonStats(httpclient, t, smap.Tmap[k].DirectURL)
+		tdstats := getDaemonStats(t, smap.Tmap[k].PublicNet.DirectURL)
 		tdcapstats := tdstats["capacity"].(map[string]interface{})
 		dcapstats := v.Capacity
 		for fspath, fstats := range dcapstats {
@@ -725,18 +692,17 @@ func TestGetClusterStats(t *testing.T) {
 }
 
 func TestConfig(t *testing.T) {
-	oconfig := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	oconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
 	olruconfig := oconfig["lru_config"].(map[string]interface{})
-	orebconfig := oconfig["rebalance_conf"].(map[string]interface{})
 	operiodic := oconfig["periodic"].(map[string]interface{})
 
 	for k, v := range configRegression {
-		setConfig(k, v, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig(k, v, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 
-	nconfig := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
+	nconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
 	nlruconfig := nconfig["lru_config"].(map[string]interface{})
-	nrebconfig := nconfig["rebalance_conf"].(map[string]interface{})
 	nperiodic := nconfig["periodic"].(map[string]interface{})
 
 	if nperiodic["stats_time"] != configRegression["stats_time"] {
@@ -744,28 +710,21 @@ func TestConfig(t *testing.T) {
 			nperiodic["stats_time"], configRegression["stats_time"])
 	} else {
 		o := operiodic["stats_time"].(string)
-		setConfig("stats_time", o, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("stats_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 	if nlruconfig["dont_evict_time"] != configRegression["dont_evict_time"] {
 		t.Errorf("DontEvictTime was not set properly: %v, should be: %v",
 			nlruconfig["dont_evict_time"], configRegression["dont_evict_time"])
 	} else {
 		o := olruconfig["dont_evict_time"].(string)
-		setConfig("dont_evict_time", o, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("dont_evict_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 	if nlruconfig["capacity_upd_time"] != configRegression["capacity_upd_time"] {
 		t.Errorf("CapacityUpdTime was not set properly: %v, should be: %v",
 			nlruconfig["capacity_upd_time"], configRegression["capacity_upd_time"])
 	} else {
 		o := olruconfig["capacity_upd_time"].(string)
-		setConfig("capacity_upd_time", o, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-	}
-	if nrebconfig["startup_delay_time"] != configRegression["startup_delay_time"] {
-		t.Errorf("StartupDelayTime was not set properly: %v, should be: %v",
-			nrebconfig["startup_delay_time"], configRegression["startup_delay_time"])
-	} else {
-		o := orebconfig["startup_delay_time"].(string)
-		setConfig("startup_delay_time", o, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("capacity_upd_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 	if hw, err := strconv.Atoi(configRegression["highwm"]); err != nil {
 		t.Fatalf("Error parsing HighWM: %v", err)
@@ -774,7 +733,7 @@ func TestConfig(t *testing.T) {
 			nlruconfig["highwm"], hw)
 	} else {
 		o := olruconfig["highwm"].(float64)
-		setConfig("highwm", strconv.Itoa(int(o)), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("highwm", strconv.Itoa(int(o)), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 	if lw, err := strconv.Atoi(configRegression["lowwm"]); err != nil {
 		t.Fatalf("Error parsing LowWM: %v", err)
@@ -783,7 +742,7 @@ func TestConfig(t *testing.T) {
 			nlruconfig["lowwm"], lw)
 	} else {
 		o := olruconfig["lowwm"].(float64)
-		setConfig("lowwm", strconv.Itoa(int(o)), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("lowwm", strconv.Itoa(int(o)), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 	if pt, err := strconv.ParseBool(configRegression["lru_enabled"]); err != nil {
 		t.Fatalf("Error parsing LRUEnabled: %v", err)
@@ -792,66 +751,66 @@ func TestConfig(t *testing.T) {
 			nlruconfig["lru_enabled"], pt)
 	} else {
 		o := olruconfig["lru_enabled"].(bool)
-		setConfig("lru_enabled", strconv.FormatBool(o), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("lru_enabled", strconv.FormatBool(o), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	}
 }
 
 func TestLRU(t *testing.T) {
 	var (
-		errch   = make(chan error, 100)
-		usedpct = uint32(100)
+		errCh    = make(chan error, 100)
+		usedpct  = 100
+		proxyURL = getPrimaryURL(t, proxyURLRO)
 	)
-	isCloud := isCloudBucket(t, proxyurl, clibucket)
-	if !isCloud {
-		t.Skip("TestLRU test is for cloud buckets only")
+	if !isCloudBucket(t, proxyURL, clibucket) {
+		t.Skip("TestLRU test requires a cloud bucket")
 	}
 
-	getRandomFiles(0, 20, clibucket, "", t, nil, errch)
+	getRandomFiles(proxyURL, 0, 20, clibucket, "", t, nil, errCh)
 	// The error could be no object in the bucket. In that case, consider it as not an error;
 	// this test will be skipped
-	if len(errch) != 0 {
+	if len(errCh) != 0 {
 		t.Logf("LRU: need a cloud bucket with at least 20 objects")
-		t.Skip()
+		t.Skip("skipping - cannot test LRU.")
 	}
 
 	//
 	// remember targets' watermarks
 	//
-	smap := getClusterMap(t)
+	smap := getClusterMap(t, proxyURL)
 	lwms := make(map[string]interface{})
 	hwms := make(map[string]interface{})
 	bytesEvictedOrig := make(map[string]int64)
 	filesEvictedOrig := make(map[string]int64)
 	for k, di := range smap.Tmap {
-		cfg := getConfig(di.DirectURL+RestAPIDaemonSuffix, httpclient, t)
+		cfg := getConfig(di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
 		lrucfg := cfg["lru_config"].(map[string]interface{})
 		lwms[k] = lrucfg["lowwm"]
 		hwms[k] = lrucfg["highwm"]
 	}
 	// add a few more
-	getRandomFiles(0, 3, clibucket, "", t, nil, errch)
-	selectErr(errch, "get", t, true)
+	getRandomFiles(proxyURL, 0, 3, clibucket, "", t, nil, errCh)
+	selectErr(errCh, "get", t, true)
 	//
 	// find out min usage %% across all targets
 	//
-	stats := getClusterStats(httpclient, t)
+	stats := getClusterStats(t, proxyURL)
 	for k, v := range stats.Target {
-		bytesEvictedOrig[k], filesEvictedOrig[k] = v.Core.Bytesevicted, v.Core.Filesevicted
+		bytesEvictedOrig[k], filesEvictedOrig[k] = v.Core.Tracker["lru.evict.size"].Value, v.Core.Tracker["lru.evict.n"].Value
 		for _, c := range v.Capacity {
-			usedpct = min(usedpct, c.Usedpct)
+			usedpct = cmn.Min(usedpct, int(c.Usedpct))
 		}
 	}
-	tlogf("LRU: current min space usage in the cluster: %d%%\n", usedpct)
+	tutils.Logf("LRU: current min space usage in the cluster: %d%%\n", usedpct)
 	var (
 		lowwm  = usedpct - 5
 		highwm = usedpct - 1
 	)
 	if int(lowwm) < 10 {
 		t.Logf("The current space usage is too low (%d) for the LRU to be tested", lowwm)
-		t.Skip()
+		t.Skip("skipping - cannot test LRU.")
 		return
 	}
-	oconfig := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
+	oconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
 	if t.Failed() {
 		return
 	}
@@ -861,13 +820,13 @@ func TestLRU(t *testing.T) {
 	olruconfig := oconfig["lru_config"].(map[string]interface{})
 	operiodic := oconfig["periodic"].(map[string]interface{})
 	defer func() {
-		setConfig("dont_evict_time", olruconfig["dont_evict_time"].(string), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-		setConfig("capacity_upd_time", olruconfig["capacity_upd_time"].(string), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-		setConfig("highwm", fmt.Sprint(olruconfig["highwm"]), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-		setConfig("lowwm", fmt.Sprint(olruconfig["lowwm"]), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		setConfig("dont_evict_time", olruconfig["dont_evict_time"].(string), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setConfig("capacity_upd_time", olruconfig["capacity_upd_time"].(string), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setConfig("highwm", fmt.Sprint(olruconfig["highwm"]), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setConfig("lowwm", fmt.Sprint(olruconfig["lowwm"]), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 		for k, di := range smap.Tmap {
-			setConfig("highwm", fmt.Sprint(hwms[k]), di.DirectURL+RestAPIDaemonSuffix, httpclient, t)
-			setConfig("lowwm", fmt.Sprint(lwms[k]), di.DirectURL+RestAPIDaemonSuffix, httpclient, t)
+			setConfig("highwm", fmt.Sprint(hwms[k]), di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
+			setConfig("lowwm", fmt.Sprint(lwms[k]), di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
 		}
 	}()
 	//
@@ -879,31 +838,31 @@ func TestLRU(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse stats_time: %v", err)
 	}
-	setConfig("dont_evict_time", dontevicttimestr, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-	setConfig("capacity_upd_time", capacityupdtimestr, proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+	setConfig("dont_evict_time", dontevicttimestr, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	setConfig("capacity_upd_time", capacityupdtimestr, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	if t.Failed() {
 		return
 	}
-	setConfig("lowwm", fmt.Sprint(lowwm), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+	setConfig("lowwm", fmt.Sprint(lowwm), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	if t.Failed() {
 		return
 	}
-	setConfig("highwm", fmt.Sprint(highwm), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+	setConfig("highwm", fmt.Sprint(highwm), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
 	if t.Failed() {
 		return
 	}
 	waitProgressBar("LRU: ", sleeptime/2)
-	getRandomFiles(0, 1, clibucket, "", t, nil, errch)
+	getRandomFiles(proxyURL, 0, 1, clibucket, "", t, nil, errCh)
 	waitProgressBar("LRU: ", sleeptime/2)
 	//
 	// results
 	//
-	stats = getClusterStats(httpclient, t)
+	stats = getClusterStats(t, proxyURL)
 	testFsPaths := oconfig["test_fspaths"].(map[string]interface{})
 	for k, v := range stats.Target {
-		bytes := v.Core.Bytesevicted - bytesEvictedOrig[k]
-		tlogf("Target %s: evicted %d files - %.2f MB (%dB) total\n",
-			k, v.Core.Filesevicted-filesEvictedOrig[k], float64(bytes)/1000/1000, bytes)
+		bytes := v.Core.Tracker["lru.evict.size"].Value - bytesEvictedOrig[k]
+		tutils.Logf("Target %s: evicted %d files - %.2f MB (%dB) total\n",
+			k, v.Core.Tracker["lru.evict.n"].Value-filesEvictedOrig[k], float64(bytes)/1000/1000, bytes)
 		//
 		// testingFSPpaths() - cannot reliably verify space utilization by tmpfs
 		//
@@ -911,7 +870,7 @@ func TestLRU(t *testing.T) {
 			continue
 		}
 		for mpath, c := range v.Capacity {
-			if c.Usedpct < lowwm-1 || c.Usedpct > lowwm+1 {
+			if c.Usedpct < uint32(lowwm)-1 || c.Usedpct > uint32(lowwm)+1 {
 				t.Errorf("Target %s failed to reach lwm %d%%: mpath %s, used space %d%%", k, lowwm, mpath, c.Usedpct)
 			}
 		}
@@ -920,32 +879,32 @@ func TestLRU(t *testing.T) {
 
 func TestPrefetchList(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
 	var (
 		toprefetch    = make(chan string, numfiles)
 		netprefetches = int64(0)
+		proxyURL      = getPrimaryURL(t, proxyURLRO)
 	)
 
-	isCloud := isCloudBucket(t, proxyurl, clibucket)
-	if !isCloud {
+	if !isCloudBucket(t, proxyURL, clibucket) {
 		t.Skipf("Cannot prefetch from local bucket %s", clibucket)
 	}
 
 	// 1. Get initial number of prefetches
-	smap := getClusterMap(t)
+	smap := getClusterMap(t, proxyURL)
 	for _, v := range smap.Tmap {
-		stats := getDaemonStats(httpclient, t, v.DirectURL)
+		stats := getDaemonStats(t, v.PublicNet.DirectURL)
 		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["numprefetch"].(json.Number).Int64()
+		npf, err := corestats["pre.n"].(json.Number).Int64()
 		if err != nil {
-			t.Fatalf("Could not decode target stats: numprefetch")
+			t.Fatalf("Could not decode target stats: pre.n")
 		}
 		netprefetches -= npf
 	}
 
 	// 2. Get keys to prefetch
-	n := int64(getMatchingKeys(match, clibucket, []chan string{toprefetch}, nil, t))
+	n := int64(getMatchingKeys(proxyURL, match, clibucket, []chan string{toprefetch}, nil, t))
 	close(toprefetch) // to exit for-range
 	files := make([]string, 0)
 	for i := range toprefetch {
@@ -953,23 +912,23 @@ func TestPrefetchList(t *testing.T) {
 	}
 
 	// 3. Evict those objects from the cache and prefetch them
-	tlogf("Evicting and Prefetching %d objects\n", len(files))
-	err := client.EvictList(proxyurl, clibucket, files, true, 0)
+	tutils.Logf("Evicting and Prefetching %d objects\n", len(files))
+	err := tutils.EvictList(proxyURL, clibucket, files, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
-	err = client.PrefetchList(proxyurl, clibucket, files, true, 0)
+	err = tutils.PrefetchList(proxyURL, clibucket, files, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// 5. Ensure that all the prefetches occurred.
 	for _, v := range smap.Tmap {
-		stats := getDaemonStats(httpclient, t, v.DirectURL)
+		stats := getDaemonStats(t, v.PublicNet.DirectURL)
 		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["numprefetch"].(json.Number).Int64()
+		npf, err := corestats["pre.n"].(json.Number).Int64()
 		if err != nil {
-			t.Fatalf("Could not decode target stats: numprefetch")
+			t.Fatalf("Could not decode target stats: pre.n")
 		}
 		netprefetches += npf
 	}
@@ -980,73 +939,74 @@ func TestPrefetchList(t *testing.T) {
 
 func TestDeleteList(t *testing.T) {
 	var (
-		err    error
-		prefix = ListRangeStr + "/tstf-"
-		wg     = &sync.WaitGroup{}
-		errch  = make(chan error, numfiles)
-		files  = make([]string, 0)
+		err      error
+		prefix   = ListRangeStr + "/tstf-"
+		wg       = &sync.WaitGroup{}
+		errCh    = make(chan error, numfiles)
+		files    = make([]string, 0, numfiles)
+		proxyURL = getPrimaryURL(t, proxyURLRO)
 	)
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
+		defer destroyLocalBucket(t, proxyURL, clibucket)
+	}
 
-	// 1. Put files to delete:
+	// 1. Put files to delete
 	for i := 0; i < numfiles; i++ {
-		r, err := readers.NewRandReader(fileSize, true /* withHash */)
-		checkFatal(err, t)
+		r, err := tutils.NewRandReader(fileSize, true /* withHash */)
+		tutils.CheckFatal(err, t)
 
 		keyname := fmt.Sprintf("%s%d", prefix, i)
 
 		wg.Add(1)
-		go client.PutAsync(wg, proxyurl, r, clibucket, keyname, errch, !testing.Verbose())
+		go tutils.PutAsync(wg, proxyURL, r, clibucket, keyname, errCh, true)
 		files = append(files, keyname)
 
 	}
 	wg.Wait()
-	selectErr(errch, "put", t, true)
+	selectErr(errCh, "put", t, true)
+	tutils.Logf("PUT done.\n")
 
 	// 2. Delete the objects
-	err = client.DeleteList(proxyurl, clibucket, files, true, 0)
+	err = tutils.DeleteList(proxyURL, clibucket, files, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
 
-	// 3. Check to see that all the files have been deleted.
-	msg := &dfc.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err := client.ListBucket(proxyurl, clibucket, msg, 0)
+	// 3. Check to see that all the files have been deleted
+	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
+	bktlst, err := tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != 0 {
 		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
-	}
-
-	if created {
-		if err = client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-			t.Errorf("Failed to delete local bucket: %v", err)
-		}
 	}
 }
 
 func TestPrefetchRange(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
 	var (
-		netprefetches = int64(0)
-		err           error
-		rmin, rmax    int64
-		re            *regexp.Regexp
+		netprefetches  = int64(0)
+		err            error
+		rmin, rmax     int64
+		re             *regexp.Regexp
+		proxyURL       = getPrimaryURL(t, proxyURLRO)
+		prefetchPrefix = "regressionList/obj"
+		prefetchRegex  = "\\d*"
 	)
 
-	isCloud := isCloudBucket(t, proxyurl, clibucket)
-	if !isCloud {
+	if !isCloudBucket(t, proxyURL, clibucket) {
 		t.Skipf("Cannot prefetch from local bucket %s", clibucket)
 	}
 
 	// 1. Get initial number of prefetches
-	smap := getClusterMap(t)
+	smap := getClusterMap(t, proxyURL)
 	for _, v := range smap.Tmap {
-		stats := getDaemonStats(httpclient, t, v.DirectURL)
+		stats := getDaemonStats(t, v.PublicNet.DirectURL)
 		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["numprefetch"].(json.Number).Int64()
+		npf, err := corestats["pre.n"].(json.Number).Int64()
 		if err != nil {
-			t.Fatalf("Could not decode target stats: numprefetch")
+			t.Fatalf("Could not decode target stats: pre.n")
 		}
 		netprefetches -= npf
 	}
@@ -1066,8 +1026,8 @@ func TestPrefetchRange(t *testing.T) {
 	if re, err = regexp.Compile(prefetchRegex); err != nil {
 		t.Errorf("Error compiling regex: %v", err)
 	}
-	msg := &dfc.GetMsg{GetPrefix: prefetchPrefix, GetPageSize: int(pagesize)}
-	objsToFilter := testListBucket(t, clibucket, msg, 0)
+	msg := &cmn.GetMsg{GetPrefix: prefetchPrefix, GetPageSize: int(pagesize)}
+	objsToFilter := testListBucket(t, proxyURL, clibucket, msg, 0)
 	files := make([]string, 0)
 	if objsToFilter != nil {
 		for _, be := range objsToFilter.Entries {
@@ -1085,24 +1045,24 @@ func TestPrefetchRange(t *testing.T) {
 		}
 	}
 
-	// 4. Evict those objects from the cache, and then prefetch them.
-	tlogf("Evicting and Prefetching %d objects\n", len(files))
-	err = client.EvictRange(proxyurl, clibucket, prefetchPrefix, prefetchRegex, prefetchRange, true, 0)
+	// 4. Evict those objects from the cache, and then prefetch them
+	tutils.Logf("Evicting and Prefetching %d objects\n", len(files))
+	err = tutils.EvictRange(proxyURL, clibucket, prefetchPrefix, prefetchRegex, prefetchRange, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
-	err = client.PrefetchRange(proxyurl, clibucket, prefetchPrefix, prefetchRegex, prefetchRange, true, 0)
+	err = tutils.PrefetchRange(proxyURL, clibucket, prefetchPrefix, prefetchRegex, prefetchRange, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
 
-	// 5. Ensure that all the prefetches occurred.
+	// 5. Ensure that all the prefetches occurred
 	for _, v := range smap.Tmap {
-		stats := getDaemonStats(httpclient, t, v.DirectURL)
+		stats := getDaemonStats(t, v.PublicNet.DirectURL)
 		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["numprefetch"].(json.Number).Int64()
+		npf, err := corestats["pre.n"].(json.Number).Int64()
 		if err != nil {
-			t.Fatalf("Could not decode target stats: numprefetch")
+			t.Fatalf("Could not decode target stats: pre.n")
 		}
 		netprefetches += npf
 	}
@@ -1123,36 +1083,40 @@ func TestDeleteRange(t *testing.T) {
 		bigrange       = fmt.Sprintf("0:%d", numfiles)
 		regex          = "\\d?\\d"
 		wg             = &sync.WaitGroup{}
-		errch          = make(chan error, numfiles)
+		errCh          = make(chan error, numfiles)
+		proxyURL       = getPrimaryURL(t, proxyURLRO)
 	)
 
-	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
+	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
+		defer destroyLocalBucket(t, proxyURL, clibucket)
+	}
 
-	// 1. Put files to delete:
+	// 1. Put files to delete
 	for i := 0; i < numfiles; i++ {
-		r, err := readers.NewRandReader(fileSize, true /* withHash */)
-		checkFatal(err, t)
+		r, err := tutils.NewRandReader(fileSize, true /* withHash */)
+		tutils.CheckFatal(err, t)
 
 		wg.Add(1)
-		go client.PutAsync(wg, proxyurl, r, clibucket, fmt.Sprintf("%s%d", prefix, i), errch,
-			!testing.Verbose())
+		go tutils.PutAsync(wg, proxyURL, r, clibucket, fmt.Sprintf("%s%d", prefix, i), errCh, true)
 	}
 	wg.Wait()
-	selectErr(errch, "put", t, true)
+	selectErr(errCh, "put", t, true)
+	tutils.Logf("PUT done.\n")
 
-	// 2. Delete the small range of objects:
-	err = client.DeleteRange(proxyurl, clibucket, prefix, regex, smallrange, true, 0)
+	// 2. Delete the small range of objects
+	err = tutils.DeleteRange(proxyURL, clibucket, prefix, regex, smallrange, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// 3. Check to see that the correct files have been deleted
-	msg := &dfc.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err := client.ListBucket(proxyurl, clibucket, msg, 0)
+	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
+	bktlst, err := tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != numfiles-smallrangesize {
 		t.Errorf("Incorrect number of remaining files: %d, should be %d", len(bktlst.Entries), numfiles-smallrangesize)
 	}
-	filemap := make(map[string]*dfc.BucketEntry)
+	filemap := make(map[string]*cmn.BucketEntry)
 	for _, entry := range bktlst.Entries {
 		filemap[entry.Name] = entry
 	}
@@ -1166,31 +1130,124 @@ func TestDeleteRange(t *testing.T) {
 		}
 	}
 
-	// 4. Delete the big range of objects:
-	err = client.DeleteRange(proxyurl, clibucket, prefix, regex, bigrange, true, 0)
+	// 4. Delete the big range of objects
+	err = tutils.DeleteRange(proxyURL, clibucket, prefix, regex, bigrange, true, 0)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// 5. Check to see that all the files have been deleted
-	bktlst, err = client.ListBucket(proxyurl, clibucket, msg, 0)
+	bktlst, err = tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	tutils.CheckFatal(err, t)
+	if len(bktlst.Entries) != 0 {
+		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
+	}
+}
+
+// Testing only local bucket objects since generally not concerned with cloud bucket object deletion
+func TestStressDeleteRange(t *testing.T) {
+	if testing.Short() {
+		t.Skip(skipping)
+	}
+	const (
+		numFiles   = 20000 // FIXME: must divide by 10 and by the numReaders
+		numReaders = 200
+	)
+	var (
+		err          error
+		prefix       = ListRangeStr + "/tstf-"
+		wg           = &sync.WaitGroup{}
+		errCh        = make(chan error, numFiles)
+		proxyURL     = getPrimaryURL(t, proxyURLRO)
+		regex        = "\\d*"
+		tenth        = numFiles / 10
+		partial_rnge = fmt.Sprintf("%d:%d", 0, numFiles-tenth-1) // TODO: partial range with non-zero left boundary
+		rnge         = fmt.Sprintf("0:%d", numFiles)
+		readersList  [numReaders]tutils.Reader
+	)
+
+	createFreshLocalBucket(t, proxyURL, TestLocalBucketName)
+
+	// 1. PUT
+	for i := 0; i < numReaders; i++ {
+		random := rand.New(rand.NewSource(int64(i)))
+		size := random.Int63n(cmn.KiB*128) + cmn.KiB/3
+		tutils.CheckFatal(err, t)
+		reader, err := tutils.NewRandReader(size, true /* withHash */)
+		tutils.CheckFatal(err, t)
+		readersList[i] = reader
+		wg.Add(1)
+
+		go func(i int, reader tutils.Reader) {
+			for j := 0; j < numFiles/numReaders; j++ {
+				objname := fmt.Sprintf("%s%d", prefix, i*numFiles/numReaders+j)
+				err := tutils.Put(proxyURL, reader, TestLocalBucketName, objname, true)
+				if err != nil {
+					errCh <- err
+				}
+				reader.Seek(0, io.SeekStart)
+			}
+			wg.Done()
+			tutils.Progress(i, 99)
+		}(i, reader)
+	}
+	wg.Wait()
+	selectErr(errCh, "put", t, true)
+
+	// 2. Delete a range of objects
+	tutils.Logf("Deleting objects in range: %s\n", partial_rnge)
+	err = tutils.DeleteRange(proxyURL, TestLocalBucketName, prefix, regex, partial_rnge, true, 0)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// 3. Check to see that correct objects have been deleted
+	expectedRemaining := tenth
+	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
+	bktlst, err := tutils.ListBucket(proxyURL, TestLocalBucketName, msg, 0)
+	tutils.CheckFatal(err, t)
+	if len(bktlst.Entries) != expectedRemaining {
+		t.Errorf("Incorrect number of remaining objects: %d, expected: %d", len(bktlst.Entries), expectedRemaining)
+	}
+
+	filemap := make(map[string]*cmn.BucketEntry)
+	for _, entry := range bktlst.Entries {
+		filemap[entry.Name] = entry
+	}
+	for i := 0; i < numFiles; i++ {
+		objname := fmt.Sprintf("%s%d", prefix, i)
+		_, ok := filemap[objname]
+		if ok && i < numFiles-tenth {
+			t.Errorf("%s exists (expected to be deleted)", objname)
+		} else if !ok && i >= numFiles-tenth {
+			t.Errorf("%s does not exist", objname)
+		}
+	}
+
+	// 4. Delete the entire range of objects
+	tutils.Logf("Deleting objects in range: %s\n", rnge)
+	err = tutils.DeleteRange(proxyURL, TestLocalBucketName, prefix, regex, rnge, true, 0)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// 5. Check to see that all files have been deleted
+	msg = &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
+	bktlst, err = tutils.ListBucket(proxyURL, TestLocalBucketName, msg, 0)
+	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != 0 {
 		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
 	}
 
-	if created {
-		if err = client.DestroyLocalBucket(proxyurl, clibucket); err != nil {
-			t.Errorf("Failed to delete local bucket: %v", err)
-		}
-	}
+	destroyLocalBucket(t, proxyURL, TestLocalBucketName)
 }
 
-func doRenameRegressionTest(t *testing.T, rtd regressionTestData, numPuts int, filesput chan string) {
-	err := client.RenameLocalBucket(proxyurl, rtd.bucket, rtd.renamedBucket)
-	checkFatal(err, t)
+func doRenameRegressionTest(t *testing.T, proxyURL string, rtd regressionTestData, numPuts int, filesPutCh chan string) {
+	err := api.RenameLocalBucket(tutils.HTTPClient, proxyURL, rtd.bucket, rtd.renamedBucket)
+	tutils.CheckFatal(err, t)
 
-	buckets, err := client.ListBuckets(proxyurl, true)
-	checkFatal(err, t)
+	buckets, err := api.GetBucketNames(tutils.HTTPClient, proxyURL, true)
+	tutils.CheckFatal(err, t)
 
 	if len(buckets.Local) != rtd.numLocalBuckets {
 		t.Fatalf("wrong number of local buckets (names) before and after rename (before: %d. after: %d)",
@@ -1210,11 +1267,11 @@ func doRenameRegressionTest(t *testing.T, rtd regressionTestData, numPuts int, f
 		t.Fatalf("renamed local bucket %s does not exist after rename", rtd.renamedBucket)
 	}
 
-	objs, err := client.ListObjects(proxyurl, rtd.renamedBucket, "", numPuts+1)
-	checkFatal(err, t)
+	objs, err := tutils.ListObjects(proxyURL, rtd.renamedBucket, "", numPuts+1)
+	tutils.CheckFatal(err, t)
 
 	if len(objs) != numPuts {
-		for name := range filesput {
+		for name := range filesPutCh {
 			found := false
 			for _, n := range objs {
 				if strings.Contains(n, name) || strings.Contains(name, n) {
@@ -1223,7 +1280,7 @@ func doRenameRegressionTest(t *testing.T, rtd regressionTestData, numPuts int, f
 				}
 			}
 			if !found {
-				tlogf("not found: %s\n", name)
+				tutils.Logf("not found: %s\n", name)
 			}
 		}
 		t.Fatalf("wrong number of objects in the bucket %s renamed as %s (before: %d. after: %d)",
@@ -1231,36 +1288,34 @@ func doRenameRegressionTest(t *testing.T, rtd regressionTestData, numPuts int, f
 	}
 }
 
-func doBucketRegressionTest(t *testing.T, rtd regressionTestData) {
+func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestData) {
+	const filesize = 1024
 	var (
-		numPuts  = 64
-		filesput = make(chan string, numPuts)
-		errch    = make(chan error, 100)
-		wg       = &sync.WaitGroup{}
-		sgl      *dfc.SGLIO
-		filesize = uint64(1024)
-		bucket   = rtd.bucket
+		numPuts    = 64
+		filesPutCh = make(chan string, numPuts)
+		errCh      = make(chan error, 100)
+		wg         = &sync.WaitGroup{}
+		sgl        *memsys.SGL
+		bucket     = rtd.bucket
 	)
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(filesize)
+		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
-
-	putRandomFiles(baseseed+2, filesize, numPuts, bucket, t, nil, errch, filesput, SmokeDir,
+	putRandObjs(proxyURL, baseseed+2, filesize, numPuts, bucket, errCh, filesPutCh, SmokeDir,
 		SmokeStr, !testing.Verbose(), sgl)
-	close(filesput)
-	selectErr(errch, "put", t, true)
-
+	close(filesPutCh)
+	selectErr(errCh, "put", t, true)
 	if rtd.rename {
-		doRenameRegressionTest(t, rtd, numPuts, filesput)
-		tlogf("\nRenamed %s(numobjs=%d) => %s\n", bucket, numPuts, rtd.renamedBucket)
+		doRenameRegressionTest(t, proxyURL, rtd, numPuts, filesPutCh)
+		tutils.Logf("\nRenamed %s(numobjs=%d) => %s\n", bucket, numPuts, rtd.renamedBucket)
 		bucket = rtd.renamedBucket
 	}
 
-	getRandomFiles(0, numPuts, bucket, SmokeStr+"/", t, nil, errch)
-	selectErr(errch, "get", t, false)
-	for fname := range filesput {
+	getRandomFiles(proxyURL, 0, numPuts, bucket, SmokeStr+"/", t, nil, errCh)
+	selectErr(errCh, "get", t, false)
+	for fname := range filesPutCh {
 		if usingFile {
 			err := os.Remove(SmokeDir + "/" + fname)
 			if err != nil {
@@ -1269,11 +1324,11 @@ func doBucketRegressionTest(t *testing.T, rtd regressionTestData) {
 		}
 
 		wg.Add(1)
-		go client.Del(proxyurl, bucket, "smoke/"+fname, wg, errch, !testing.Verbose())
+		go tutils.Del(proxyURL, bucket, "smoke/"+fname, wg, errCh, !testing.Verbose())
 	}
 	wg.Wait()
-	selectErr(errch, "delete", t, abortonerr)
-	close(errch)
+	selectErr(errCh, "delete", t, abortonerr)
+	close(errCh)
 }
 
 //========
@@ -1282,14 +1337,15 @@ func doBucketRegressionTest(t *testing.T, rtd regressionTestData) {
 //
 //========
 
-func waitForRebalanceToComplete(t *testing.T) {
+func waitForRebalanceToComplete(t *testing.T, proxyURL string) {
+	time.Sleep(dfc.NeighborRebalanceStartDelay)
 OUTER:
 	for {
 		// Wait before querying so the rebalance statistics are populated.
 		time.Sleep(time.Second * 3)
-		tlogln("Waiting for rebalance to complete.")
+		tutils.Logln("Waiting for rebalance to complete.")
 
-		rebalanceStats, err := client.GetXactionRebalance(proxyurl)
+		rebalanceStats, err := getXactionRebalance(proxyURL)
 		if err != nil {
 			t.Fatalf("Unable to get rebalance stats. Error: [%v]", err)
 		}
@@ -1298,7 +1354,7 @@ OUTER:
 		for _, targetStats := range rebalanceStats.TargetStats {
 			if len(targetStats.Xactions) > 0 {
 				for _, xaction := range targetStats.Xactions {
-					if xaction.Status != dfc.XactionStatusCompleted {
+					if xaction.Status != cmn.XactionStatusCompleted {
 						continue OUTER
 					}
 				}
@@ -1312,18 +1368,34 @@ OUTER:
 	}
 }
 
+func getXactionRebalance(proxyURL string) (dfc.RebalanceStats, error) {
+	var rebalanceStats dfc.RebalanceStats
+	responseBytes, err := tutils.GetXactionResponse(proxyURL, cmn.XactionRebalance)
+	if err != nil {
+		return rebalanceStats, err
+	}
+
+	err = json.Unmarshal(responseBytes, &rebalanceStats)
+	if err != nil {
+		return rebalanceStats,
+			fmt.Errorf("Failed to unmarshal rebalance stats: %v", err)
+	}
+
+	return rebalanceStats, nil
+}
+
 func waitProgressBar(prefix string, wait time.Duration) {
-	const tickerStep = time.Second * 5
+	const tickerStep = time.Second * 1
 
 	ticker := time.NewTicker(tickerStep)
-	tlogf(prefix)
+	tutils.Logf(prefix)
 	idx := 1
 waitloop:
 	for range ticker.C {
 		elapsed := tickerStep * time.Duration(idx)
-		tlogf("----%d%%", (elapsed * 100 / wait))
+		tutils.Logf("----%d%%", (elapsed * 100 / wait))
 		if elapsed >= wait {
-			tlogln("")
+			tutils.Logln("")
 			break waitloop
 		}
 		idx++
@@ -1331,15 +1403,14 @@ waitloop:
 	ticker.Stop()
 }
 
-func getClusterStats(httpclient *http.Client, t *testing.T) (stats dfc.ClusterStats) {
-	q := getWhatRawQuery(dfc.GetWhatStats)
-	url := fmt.Sprintf("%s?%s", proxyurl+dfc.URLPath(dfc.Rversion, dfc.Rcluster), q)
-	resp, err := httpclient.Get(url)
-	defer func() {
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
+func getClusterStats(t *testing.T, proxyURL string) (stats dfc.ClusterStats) {
+	q := tutils.GetWhatRawQuery(cmn.GetWhatStats, "")
+	url := fmt.Sprintf("%s?%s", proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), q)
+	resp, err := tutils.BaseHTTPClient.Get(url)
+	if err != nil {
+		t.Fatalf("Failed to perform get, err = %v", err)
+	}
+	defer resp.Body.Close()
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -1350,7 +1421,7 @@ func getClusterStats(httpclient *http.Client, t *testing.T) (stats dfc.ClusterSt
 		t.Fatalf("HTTP error = %d, message = %v", resp.StatusCode, string(b))
 	}
 
-	err = json.Unmarshal(b, &stats)
+	err = jsoniter.Unmarshal(b, &stats)
 	if err != nil {
 		t.Fatalf("Failed to unmarshal, err = %v", err)
 	}
@@ -1358,15 +1429,14 @@ func getClusterStats(httpclient *http.Client, t *testing.T) (stats dfc.ClusterSt
 	return
 }
 
-func getDaemonStats(httpclient *http.Client, t *testing.T, URL string) (stats map[string]interface{}) {
-	q := getWhatRawQuery(dfc.GetWhatStats)
-	url := fmt.Sprintf("%s?%s", URL+RestAPIDaemonSuffix, q)
-	resp, err := httpclient.Get(url)
-	defer func() {
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
+func getDaemonStats(t *testing.T, url string) (stats map[string]interface{}) {
+	q := tutils.GetWhatRawQuery(cmn.GetWhatStats, "")
+	url = fmt.Sprintf("%s?%s", url+cmn.URLPath(cmn.Version, cmn.Daemon), q)
+	resp, err := tutils.BaseHTTPClient.Get(url)
+	if err != nil {
+		t.Fatalf("Failed to perform get, err = %v", err)
+	}
+	defer resp.Body.Close()
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -1377,7 +1447,7 @@ func getDaemonStats(httpclient *http.Client, t *testing.T, URL string) (stats ma
 		t.Fatalf("HTTP error = %d, message = %s", err, string(b))
 	}
 
-	dec := json.NewDecoder(bytes.NewReader(b))
+	dec := jsoniter.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
 	// If this isn't used, json.Unmarshal converts uint32s to floats, losing precision
 	err = dec.Decode(&stats)
@@ -1388,26 +1458,20 @@ func getDaemonStats(httpclient *http.Client, t *testing.T, URL string) (stats ma
 	return
 }
 
-func getClusterMap(t *testing.T) dfc.Smap {
-	smap, err := client.GetClusterMap(proxyurl)
-	checkFatal(err, t)
+func getClusterMap(t *testing.T, URL string) cluster.Smap {
+	smap, err := tutils.GetClusterMap(URL)
+	tutils.CheckFatal(err, t)
 	return smap
 }
 
-func getConfig(URL string, httpclient *http.Client, t *testing.T) (dfcfg map[string]interface{}) {
-	q := getWhatRawQuery(dfc.GetWhatConfig)
+func getConfig(URL string, t *testing.T) (dfcfg map[string]interface{}) {
+	q := tutils.GetWhatRawQuery(cmn.GetWhatConfig, "")
 	url := fmt.Sprintf("%s?%s", URL, q)
-	resp, err := httpclient.Get(url)
-	defer func() {
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
-
+	resp, err := tutils.BaseHTTPClient.Get(url)
 	if err != nil {
-		t.Errorf("Get configuration, err = %v", err)
-		return
+		t.Fatalf("Failed to perform get, err = %v", err)
 	}
+	defer resp.Body.Close()
 
 	var b []byte
 	b, err = ioutil.ReadAll(resp.Body)
@@ -1422,7 +1486,7 @@ func getConfig(URL string, httpclient *http.Client, t *testing.T) (dfcfg map[str
 		return
 	}
 
-	err = json.Unmarshal(b, &dfcfg)
+	err = jsoniter.Unmarshal(b, &dfcfg)
 	if err != nil {
 		t.Errorf("Failed to unmarshal config: %v", err)
 	}
@@ -1430,48 +1494,32 @@ func getConfig(URL string, httpclient *http.Client, t *testing.T) (dfcfg map[str
 	return
 }
 
-func setConfig(name, value, URL string, httpclient *http.Client, t *testing.T) {
-	SetConfigMsg := dfc.ActionMsg{Action: dfc.ActSetConfig,
+func setConfig(name, value, URL string, t *testing.T) {
+	SetConfigMsg := cmn.ActionMsg{Action: cmn.ActSetConfig,
 		Name:  name,
 		Value: value,
 	}
 
-	injson, err := json.Marshal(SetConfigMsg)
+	injson, err := jsoniter.Marshal(SetConfigMsg)
 	if err != nil {
 		t.Errorf("Failed to marshal SetConfig Message: %v", err)
 		return
 	}
-	req, err := http.NewRequest("PUT", URL, bytes.NewBuffer(injson))
+	req, err := http.NewRequest(http.MethodPut, URL, bytes.NewBuffer(injson))
 	if err != nil {
 		t.Errorf("Failed to create request: %v", err)
 		return
 	}
-	r, err := httpclient.Do(req)
-	defer func() {
-		if r != nil {
-			r.Body.Close()
-		}
-	}()
+	r, err := tutils.BaseHTTPClient.Do(req)
 	if err != nil {
-		t.Errorf("Failed to execute SetConfig request: %v", err)
-		return
+		t.Fatalf("Failed to perform request, err = %v", err)
 	}
+	defer r.Body.Close()
 }
 
-//
-// FIXME: extract the most basic utility functions (such as the ones below)
-//        into a separate file within the dfc_test module
-//
-func min(a, b uint32) uint32 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func selectErr(errch chan error, verb string, t *testing.T, errisfatal bool) {
+func selectErr(errCh chan error, verb string, t *testing.T, errisfatal bool) {
 	select {
-	case err := <-errch:
+	case err := <-errCh:
 		if errisfatal {
 			t.Fatalf("Failed to %s files: %v", verb, err)
 		} else {
@@ -1479,30 +1527,4 @@ func selectErr(errch chan error, verb string, t *testing.T, errisfatal bool) {
 		}
 	default:
 	}
-}
-
-func tlogf(msg string, args ...interface{}) {
-	if testing.Verbose() {
-		fmt.Fprintf(os.Stdout, msg, args...)
-	}
-}
-
-func tlogln(msg string) {
-	tlogf(msg + "\n")
-}
-
-func stringInSlice(str string, values []string) bool {
-	for _, v := range values {
-		if str == v {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getWhatRawQuery(getWhat string) string {
-	q := url.Values{}
-	q.Add(dfc.URLParamWhat, getWhat)
-	return q.Encode()
 }

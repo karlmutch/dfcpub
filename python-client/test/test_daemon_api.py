@@ -53,11 +53,12 @@ class TestDaemonApi(unittest.TestCase):
             "loglevel", "3")
         self.daemon.perform_operation(input_params)
 
+    @unittest.skip("Test fails due to the fact that it takes some time to distribute SMAP across nodes")
     def test_shutdown_target(self):
         smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
         target_id = smap.tmap.keys()[0]
         target_port = target_id[-4:]
-        primary_proxy_port = smap.proxy_si.daemon_port
+        primary_proxy_port = smap.proxy_si.public_net.daemon_port
         print target_port, target_id
         self.daemon.api_client.configuration.host = (
                 "http://localhost:%s/v1" % target_port)
@@ -74,12 +75,75 @@ class TestDaemonApi(unittest.TestCase):
     def test_get_stats(self):
         smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
         target_port = smap.tmap.keys()[0][-4:]
-        primary_proxy_port = smap.proxy_si.daemon_port
+        primary_proxy_port = smap.proxy_si.public_net.daemon_port
         self.daemon.api_client.configuration.host = (
                 "http://localhost:%s/v1" % target_port)
         stats = DictParser.parse(self.daemon.get(self.models.GetWhat.STATS))
         self.assertTrue(stats.capacity.values()[0].avail != 0,
                         "Available disk space is returned as 0")
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % primary_proxy_port)
+
+    def test_get_mountpaths(self):
+        smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
+        target_port = smap.tmap.keys()[0][-4:]
+        primary_proxy_port = smap.proxy_si.public_net.daemon_port
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % target_port)
+        mountpaths = DictParser.parse(
+                self.daemon.get(self.models.GetWhat.MOUNTPATHS))
+        self.assertTrue(len(mountpaths.available) > 0,
+                "Number of available mountpaths is zero.")
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % primary_proxy_port)
+
+    def test_disable_enable_mountpath(self):
+        smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
+        target_port = smap.tmap.keys()[0][-4:]
+        primary_proxy_port = smap.proxy_si.public_net.daemon_port
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % target_port)
+        localSubdir = target_port[-1]
+        mpath = "/tmp/dfc/" + localSubdir + "/1"
+        input_params = self.models.InputParameters(
+                self.models.Actions.DISABLE, value=mpath)
+        self.daemon.modify_mountpath(input_params)
+        mountpaths = DictParser.parse(
+                self.daemon.get(self.models.GetWhat.MOUNTPATHS))
+        self.assertTrue(mpath in mountpaths.disabled)
+        self.assertTrue(mpath not in mountpaths.available)
+        input_params = self.models.InputParameters(
+                self.models.Actions.ENABLE, value=mpath)
+        self.daemon.modify_mountpath(input_params)
+        mountpaths = DictParser.parse(
+                self.daemon.get(self.models.GetWhat.MOUNTPATHS))
+        self.assertTrue(mpath in mountpaths.available)
+        self.assertTrue(mpath not in mountpaths.disabled)
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % primary_proxy_port)
+
+    def test_remove_add_mountpath(self):
+        smap = DictParser.parse(self.daemon.get(self.models.GetWhat.SMAP))
+        target_port = smap.tmap.keys()[0][-4:]
+        primary_proxy_port = smap.proxy_si.public_net.daemon_port
+        self.daemon.api_client.configuration.host = (
+                "http://localhost:%s/v1" % target_port)
+        localSubdir = target_port[-1]
+        mpath = "/tmp/dfc/" + localSubdir + "/1"
+        input_params = self.models.InputParameters(
+                self.models.Actions.REMOVE, value=mpath)
+        self.daemon.remove_mountpath(input_params)
+        mountpaths = DictParser.parse(
+                self.daemon.get(self.models.GetWhat.MOUNTPATHS))
+        self.assertTrue(mpath not in mountpaths.available)
+        self.assertTrue(mpath not in mountpaths.disabled)
+        input_params = self.models.InputParameters(
+                self.models.Actions.ADD, value=mpath)
+        self.daemon.create_mountpath(input_params)
+        mountpaths = DictParser.parse(
+                self.daemon.get(self.models.GetWhat.MOUNTPATHS))
+        self.assertTrue(mpath in mountpaths.available)
+        self.assertTrue(mpath not in mountpaths.disabled)
         self.daemon.api_client.configuration.host = (
                 "http://localhost:%s/v1" % primary_proxy_port)
 

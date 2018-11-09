@@ -6,14 +6,16 @@ package dfc_test
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/memsys"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 const (
@@ -27,9 +29,9 @@ func waitForMountpathChanges(t *testing.T, target string, availLen, disabledLen 
 	var err error
 	detectStart := time.Now()
 	detectLimit := time.Now().Add(fshcDetectTimeMax)
-	var newMpaths *dfc.MountpathList
+	var newMpaths *cmn.MountpathList
 	for detectLimit.After(time.Now()) {
-		newMpaths, err = client.TargetMountpaths(target)
+		newMpaths, err = tutils.TargetMountpaths(target)
 		if err != nil {
 			t.Errorf("Failed to read target mountpaths: %v\n", err)
 			break
@@ -40,11 +42,11 @@ func waitForMountpathChanges(t *testing.T, target string, availLen, disabledLen 
 		time.Sleep(time.Millisecond * 100)
 	}
 	detectTime := time.Since(detectStart)
-	tlogf("passed %v\n", detectTime)
+	tutils.Logf("passed %v\n", detectTime)
 
 	if len(newMpaths.Disabled) == disabledLen &&
 		len(newMpaths.Available) == availLen {
-		tlogf("Check is successful in %v\n", detectTime)
+		tutils.Logf("Check is successful in %v\n", detectTime)
 		return true
 	}
 
@@ -67,18 +69,18 @@ func repairMountpath(t *testing.T, target, mpath string, availLen, disabledLen i
 	// cleanup
 	// restore original mountpath
 	os.Remove(mpath)
-	dfc.CreateDir(mpath)
+	cmn.CreateDir(mpath)
 
 	// ask fschecker to check all mountpath - it should make disabled
 	// mountpath back to available list
-	client.EnableTargetMountpath(target, mpath)
-	tlogf("Recheck mountpaths\n")
+	tutils.EnableTargetMountpath(target, mpath)
+	tutils.Logf("Recheck mountpaths\n")
 	detectStart := time.Now()
 	detectLimit := time.Now().Add(fshcDetectTimeMax)
-	var mpaths *dfc.MountpathList
+	var mpaths *cmn.MountpathList
 	// Wait for fsckeeper detects that the mountpath is accessible now
 	for detectLimit.After(time.Now()) {
-		mpaths, err = client.TargetMountpaths(target)
+		mpaths, err = tutils.TargetMountpaths(target)
 		if err != nil {
 			t.Errorf("Failed to read target mountpaths: %v\n", err)
 			break
@@ -100,18 +102,20 @@ func repairMountpath(t *testing.T, target, mpath string, availLen, disabledLen i
 	}
 }
 
-func runAsyncJob(t *testing.T, wg *sync.WaitGroup, op, mpath string, filelist []string, chfail, chstop chan struct{}, sgl *dfc.SGLIO) {
+func runAsyncJob(t *testing.T, wg *sync.WaitGroup, op, mpath string, filelist []string, chfail,
+	chstop chan struct{}, sgl *memsys.SGL, bucket string) {
+	const filesize = 64 * 1024
 	var (
 		seed     = baseseed + 300
-		filesize = uint64(64 * 1024)
 		ldir     = LocalSrcDir + "/" + fshcDir
+		proxyURL = getPrimaryURL(t, proxyURLRO)
 	)
-	tlogf("Testing mpath fail detection on %s\n", op)
+	tutils.Logf("Testing mpath fail detection on %s\n", op)
 	stopTime := time.Now().Add(fshcRunTimeMax)
 
 	for stopTime.After(time.Now()) {
-		errch := make(chan error, len(filelist))
-		filesput := make(chan string, len(filelist))
+		errCh := make(chan error, len(filelist))
+		filesPutCh := make(chan string, len(filelist))
 
 		for _, fname := range filelist {
 			select {
@@ -136,60 +140,61 @@ func runAsyncJob(t *testing.T, wg *sync.WaitGroup, op, mpath string, filelist []
 			switch op {
 			case "PUT":
 				fileList := []string{fname}
-				fillWithRandomData(seed, filesize, fileList, clibucket, t, errch, filesput, ldir, fshcDir, true, sgl)
+				putRandObjsFromList(proxyURL, seed, filesize, fileList, bucket, errCh, filesPutCh, ldir, fshcDir, true, sgl)
 				select {
-				case <-errch:
+				case <-errCh:
 					// do nothing
 				default:
 				}
 			case "GET":
-				_, _, _ = client.Get(proxyurl, clibucket, fshcDir+"/"+fname, nil, nil, true, false)
+				_, _, _ = tutils.Get(proxyURL, bucket, fshcDir+"/"+fname, nil, nil, true, false)
 				time.Sleep(time.Millisecond * 10)
 			default:
 				t.Errorf("Invalid operation: %s", op)
 			}
 		}
 
-		close(errch)
-		close(filesput)
+		close(errCh)
+		close(filesPutCh)
 	}
 
 	wg.Done()
 }
 
 func TestFSCheckerDetection(t *testing.T) {
+	const filesize = 64 * 1024
 	var (
 		err      error
-		sgl      *dfc.SGLIO
+		sgl      *memsys.SGL
 		seed     = baseseed + 300
 		numObjs  = 100
-		filesize = uint64(64 * 1024)
+		proxyURL = getPrimaryURL(t, proxyURLRO)
+		bucket   = TestLocalBucketName
 	)
 
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
 
-	if isCloudBucket(t, proxyurl, clibucket) {
-		t.Skip("test is for local buckets only")
-	}
+	createFreshLocalBucket(t, proxyURL, bucket)
+	defer destroyLocalBucket(t, proxyURL, bucket)
 
-	smap, err := client.GetClusterMap(proxyurl)
-	checkFatal(err, t)
+	smap, err := tutils.GetClusterMap(proxyURL)
+	tutils.CheckFatal(err, t)
 
 	mpList := make(map[string]string, 0)
-	allMps := make(map[string]*dfc.MountpathList, 0)
+	allMps := make(map[string]*cmn.MountpathList, 0)
 	origAvail := 0
 	for target, tinfo := range smap.Tmap {
-		tlogf("Target: %s\n", target)
-		lst, err := client.TargetMountpaths(tinfo.DirectURL)
-		checkFatal(err, t)
-		tlogf("    Mountpaths: %v\n", lst)
+		tutils.Logf("Target: %s\n", target)
+		lst, err := tutils.TargetMountpaths(tinfo.PublicNet.DirectURL)
+		tutils.CheckFatal(err, t)
+		tutils.Logf("    Mountpaths: %v\n", lst)
 
 		for _, fqn := range lst.Available {
-			mpList[fqn] = tinfo.DirectURL
+			mpList[fqn] = tinfo.PublicNet.DirectURL
 		}
-		allMps[tinfo.DirectURL] = lst
+		allMps[tinfo.PublicNet.DirectURL] = lst
 
 		origAvail += len(lst.Available)
 	}
@@ -200,31 +205,23 @@ func TestFSCheckerDetection(t *testing.T) {
 
 	// select random target and mountpath
 	failedTarget, failedMpath := "", ""
-	var failedMap *dfc.MountpathList
+	var failedMap *cmn.MountpathList
 	for m, t := range mpList {
 		failedTarget, failedMpath = t, m
 		failedMap = allMps[failedTarget]
 		break
 	}
-
-	// create a local bucket to write to
-	tlogf("Mpath %s of %s is going offline\n", failedMpath, failedTarget)
-	_ = createLocalBucketIfNotExists(t, proxyurl, clibucket)
-
-	defer func() {
-		err = client.DestroyLocalBucket(proxyurl, clibucket)
-		checkFatal(err, t)
-	}()
+	tutils.Logf("mountpath %s of %s is going offline\n", failedMpath, failedTarget)
 
 	if usingSG {
-		sgl = dfc.NewSGLIO(filesize)
+		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
 
 	// generate some filenames to PUT to them in a loop
 	generateRandomData(t, seed, numObjs)
 
-	// start PUTting in a loop for some time
+	// start PUT in a loop for some time
 	chstop := make(chan struct{})
 	chfail := make(chan struct{})
 	wg := &sync.WaitGroup{}
@@ -232,7 +229,7 @@ func TestFSCheckerDetection(t *testing.T) {
 	// Checking detection on object PUT
 	{
 		wg.Add(1)
-		go runAsyncJob(t, wg, "PUT", failedMpath, fileNames, chfail, chstop, sgl)
+		go runAsyncJob(t, wg, http.MethodPut, failedMpath, fileNames, chfail, chstop, sgl, bucket)
 		time.Sleep(time.Second * 2)
 		chfail <- struct{}{}
 		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, true); detected {
@@ -247,7 +244,7 @@ func TestFSCheckerDetection(t *testing.T) {
 	// Checking detection on object GET
 	{
 		wg.Add(1)
-		go runAsyncJob(t, wg, "GET", failedMpath, fileNames, chfail, chstop, sgl)
+		go runAsyncJob(t, wg, http.MethodGet, failedMpath, fileNames, chfail, chstop, sgl, bucket)
 		time.Sleep(time.Second * 2)
 		chfail <- struct{}{}
 		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, true); detected {
@@ -261,9 +258,9 @@ func TestFSCheckerDetection(t *testing.T) {
 
 	// reading non-existing objects should not disable mountpath
 	{
-		tlogf("Reading non-existing objects: read must fails, but mpath must be available\n")
+		tutils.Logf("Reading non-existing objects: read is expected to fail but mountpath must be available\n")
 		for n := 1; n < 10; n++ {
-			_, _, err = client.Get(proxyurl, clibucket, fmt.Sprintf("%s/%d", fshcDir, n), nil, nil, true, false)
+			_, _, err = tutils.Get(proxyURL, bucket, fmt.Sprintf("%s/%d", fshcDir, n), nil, nil, true, false)
 		}
 		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, false); detected {
 			t.Error("GETting non-existing objects should not disable mountpath")
@@ -272,32 +269,49 @@ func TestFSCheckerDetection(t *testing.T) {
 	}
 
 	// try PUT and GET with disabled FSChecker
-	tlogf("*** Testing with disabled FSHC***\n")
-	setConfig("fschecker_enabled", fmt.Sprint("false"), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
-	defer setConfig("fschecker_enabled", fmt.Sprint("true"), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+	tutils.Logf("*** Testing with disabled FSHC***\n")
+	setConfig("fschecker_enabled", fmt.Sprint("false"), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	defer setConfig("fschecker_enabled", fmt.Sprint("true"), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	// generate a short list of file to run the test (to avoid flooding the log with false errors)
+	fileList := []string{}
+	for n := 0; n < 5; n++ {
+		fileList = append(fileList, fileNames[n])
+	}
+	ldir := LocalSrcDir + "/" + fshcDir
 	{
-		wg.Add(1)
-		go runAsyncJob(t, wg, "PUT", failedMpath, fileNames, chfail, chstop, sgl)
-		time.Sleep(time.Second * 2)
-		chfail <- struct{}{}
-		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, false); detected {
-			t.Error("PUTting objects to a broken mountpath should not disable the mountpath when FSHC is disabled")
+		os.RemoveAll(failedMpath)
+
+		f, err := os.OpenFile(failedMpath, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			t.Errorf("Failed to create file: %v", err)
 		}
-		chstop <- struct{}{}
-		wg.Wait()
+		f.Close()
+		filesPutCh := make(chan string, len(fileList))
+		errCh := make(chan error, len(fileList))
+		putRandObjsFromList(proxyURL, seed, filesize, fileList, bucket, errCh, filesPutCh, ldir, fshcDir, true, sgl)
+		selectErr(errCh, "put", t, false)
+		close(filesPutCh)
+		close(errCh)
+		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, false); detected {
+			t.Error("PUT objects to a broken mountpath should not disable the mountpath when FSHC is disabled")
+		}
 
 		repairMountpath(t, failedTarget, failedMpath, len(failedMap.Available), len(failedMap.Disabled))
 	}
 	{
-		wg.Add(1)
-		go runAsyncJob(t, wg, "GET", failedMpath, fileNames, chfail, chstop, sgl)
-		time.Sleep(time.Second * 2)
-		chfail <- struct{}{}
+		os.RemoveAll(failedMpath)
+
+		f, err := os.OpenFile(failedMpath, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			t.Errorf("Failed to create file: %v", err)
+		}
+		f.Close()
+		for _, n := range fileList {
+			_, _, err = tutils.Get(proxyURL, bucket, n, nil, nil, true, false)
+		}
 		if detected := waitForMountpathChanges(t, failedTarget, len(failedMap.Available)-1, len(failedMap.Disabled)+1, false); detected {
 			t.Error("GETting objects from a broken mountpath should not disable the mountpath when FSHC is disabled")
 		}
-		chstop <- struct{}{}
-		wg.Wait()
 
 		repairMountpath(t, failedTarget, failedMpath, len(failedMap.Available), len(failedMap.Disabled))
 	}
@@ -306,30 +320,32 @@ func TestFSCheckerDetection(t *testing.T) {
 
 func TestFSCheckerEnablingMpath(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping test in short mode.")
+		t.Skip(skipping)
 	}
 
-	if isCloudBucket(t, proxyurl, clibucket) {
-		t.Skip("test is for local buckets only")
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	bucket := clibucket
+	if isCloudBucket(t, proxyURL, bucket) {
+		bucket = TestLocalBucketName
 	}
 
-	smap, err := client.GetClusterMap(proxyurl)
-	checkFatal(err, t)
+	smap, err := tutils.GetClusterMap(proxyURL)
+	tutils.CheckFatal(err, t)
 
 	mpList := make(map[string]string, 0)
-	allMps := make(map[string]*dfc.MountpathList, 0)
+	allMps := make(map[string]*cmn.MountpathList, 0)
 	origAvail := 0
 	origOff := 0
 	for target, tinfo := range smap.Tmap {
-		tlogf("Target: %s\n", target)
-		lst, err := client.TargetMountpaths(tinfo.DirectURL)
-		checkFatal(err, t)
-		tlogf("    Mountpaths: %v\n", lst)
+		tutils.Logf("Target: %s\n", target)
+		lst, err := tutils.TargetMountpaths(tinfo.PublicNet.DirectURL)
+		tutils.CheckFatal(err, t)
+		tutils.Logf("    Mountpaths: %v\n", lst)
 
 		for _, fqn := range lst.Available {
-			mpList[fqn] = tinfo.DirectURL
+			mpList[fqn] = tinfo.PublicNet.DirectURL
 		}
-		allMps[tinfo.DirectURL] = lst
+		allMps[tinfo.PublicNet.DirectURL] = lst
 
 		origAvail += len(lst.Available)
 		origOff += len(lst.Disabled)
@@ -347,15 +363,57 @@ func TestFSCheckerEnablingMpath(t *testing.T) {
 	}
 
 	// create a local bucket to write to
-	tlogf("Mpath %s of %s is going offline\n", failedMpath, failedTarget)
+	tutils.Logf("mountpath %s of %s is going offline\n", failedMpath, failedTarget)
 
-	err = client.EnableTargetMountpath(failedTarget, failedMpath)
+	err = tutils.EnableTargetMountpath(failedTarget, failedMpath)
 	if err != nil {
 		t.Errorf("Enabling available mountpath should return success, got: %v", err)
 	}
 
-	err = client.EnableTargetMountpath(failedTarget, failedMpath+"some_text")
+	err = tutils.EnableTargetMountpath(failedTarget, failedMpath+"some_text")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Errorf("Enabling non-existing mountpath should return not-found error, got: %v", err)
 	}
+}
+
+func TestFSCheckerTargetDisable(t *testing.T) {
+	proxyURL := getPrimaryURL(t, proxyURLRO)
+	smap, err := tutils.GetClusterMap(proxyURL)
+	tutils.CheckFatal(err, t)
+
+	proxyCnt := len(smap.Pmap)
+	targetCnt := len(smap.Tmap)
+	if targetCnt < 2 {
+		t.Skip("The number of targets must be at least 2")
+	}
+
+	tgtURL := ""
+	for _, tinfo := range smap.Tmap {
+		tgtURL = tinfo.PublicNet.DirectURL
+		break
+	}
+
+	oldMpaths, err := tutils.TargetMountpaths(tgtURL)
+	tutils.CheckFatal(err, t)
+	if len(oldMpaths.Available) == 0 {
+		t.Fatalf("Target %s does not have availalble mountpaths", tgtURL)
+	}
+
+	tutils.Logf("Removing all mountpaths from target: %s\n", tgtURL)
+	for _, mpath := range oldMpaths.Available {
+		err = tutils.DisableTargetMountpath(tgtURL, mpath)
+		tutils.CheckFatal(err, t)
+	}
+
+	smap, err = waitForPrimaryProxy(proxyURL, "all mpath disabled", smap.Version, false, proxyCnt, targetCnt-1)
+	tutils.CheckFatal(err, t)
+
+	tutils.Logf("Restoring target %s mountpaths\n", tgtURL)
+	for _, mpath := range oldMpaths.Available {
+		err = tutils.EnableTargetMountpath(tgtURL, mpath)
+		tutils.CheckFatal(err, t)
+	}
+
+	smap, err = waitForPrimaryProxy(proxyURL, "all mpath enabled", smap.Version, false, proxyCnt, targetCnt)
+	tutils.CheckFatal(err, t)
 }

@@ -1,8 +1,8 @@
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -13,35 +13,21 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
-)
-
-const (
-	KiB = 1024
-	MiB = 1024 * KiB
-	GiB = 1024 * MiB
-)
-
-// checksums: xattr, http header, and config
-const (
-	XattrXXHashVal  = "user.obj.dfchash"
-	XattrObjVersion = "user.obj.version"
-
-	ChecksumNone   = "none"
-	ChecksumXXHash = "xxhash"
-	ChecksumMD5    = "md5"
-
-	VersionAll   = "all"
-	VersionCloud = "cloud"
-	VersionLocal = "local"
-	VersionNone  = "none"
+	"github.com/NVIDIA/dfcpub/cmn"
 )
 
 // $CONFDIR/*
 const (
-	bucketmdbase = "bucket-metadata" // base name of the config file; not to confuse with config.Localbuckets mpath
-	mpname       = "mpaths"          // base name to persist ctx.mountpaths
-	smapname     = "smap.json"
-	rebinpname   = ".rebalancing"
+	bucketmdbase  = "bucket-metadata" // base name of the config file; not to confuse with config.Localbuckets mpath
+	mpname        = "mpaths"          // base name to persist fs.Mountpaths
+	smapname      = "smap.json"
+	rebinpname    = ".rebalancing"
+	reblocinpname = ".localrebalancing"
+)
+
+const (
+	RevProxyCloud  = "cloud"
+	RevProxyTarget = "target"
 )
 
 //==============================
@@ -50,30 +36,40 @@ const (
 //
 //==============================
 type dfconfig struct {
-	Confdir          string            `json:"confdir"`
-	CloudProvider    string            `json:"cloudprovider"`
-	CloudBuckets     string            `json:"cloud_buckets"`
-	LocalBuckets     string            `json:"local_buckets"`
-	Log              logconfig         `json:"log"`
-	Periodic         periodic          `json:"periodic"`
-	Timeout          timeoutconfig     `json:"timeout"`
-	Proxy            proxyconfig       `json:"proxyconfig"`
-	LRU              lruconfig         `json:"lru_config"`
-	Xaction          xactionConfig     `json:"xaction_config"`
-	Rebalance        rebalanceconf     `json:"rebalance_conf"`
-	Cksum            cksumconfig       `json:"cksum_config"`
-	Ver              versionconfig     `json:"version_config"`
-	FSpaths          simplekvs         `json:"fspaths"`
-	TestFSP          testfspathconf    `json:"test_fspaths"`
-	Net              netconfig         `json:"netconfig"`
-	FSChecker        fshcconf          `json:"fschecker"`
-	Auth             authconf          `json:"auth"`
-	KeepaliveTracker keepaliveTrackers `json:"keepalivetracker"`
+	Confdir          string             `json:"confdir"`
+	CloudProvider    string             `json:"cloudprovider"`
+	CloudBuckets     string             `json:"cloud_buckets"`
+	LocalBuckets     string             `json:"local_buckets"`
+	Readahead        rahconfig          `json:"readahead"`
+	Log              logconfig          `json:"log"`
+	Periodic         periodic           `json:"periodic"`
+	Timeout          timeoutconfig      `json:"timeout"`
+	Proxy            proxyconfig        `json:"proxyconfig"`
+	LRU              cmn.LRUConfig   `json:"lru_config"`
+	Xaction          xactionConfig      `json:"xaction_config"`
+	Rebalance        rebalanceconf      `json:"rebalance_conf"`
+	Replication      replicationconfig  `json:"replication"`
+	Cksum            cmn.CksumConfig `json:"cksum_config"`
+	Ver              versionconfig      `json:"version_config"`
+	FSpaths          cmn.SimpleKVs   `json:"fspaths"`
+	TestFSP          testfspathconf     `json:"test_fspaths"`
+	Net              netconfig          `json:"netconfig"`
+	FSHC             fshcconf           `json:"fshc"`
+	Auth             authconf           `json:"auth"`
+	KeepaliveTracker keepaliveTrackers  `json:"keepalivetracker"`
 }
 
 type xactionConfig struct {
 	DiskUtilLowWM  uint32 `json:"disk_util_low_wm"`  // Low watermark below which no throttling is required
 	DiskUtilHighWM uint32 `json:"disk_util_high_wm"` // High watermark above which throttling is required for longer duration
+}
+
+type rahconfig struct {
+	ObjectMem int64 `json:"rahobjectmem"`
+	TotalMem  int64 `json:"rahtotalmem"`
+	ByProxy   bool  `json:"rahbyproxy"`
+	Discard   bool  `json:"rahdiscard"`
+	Enabled   bool  `json:"rahenabled"`
 }
 
 type logconfig struct {
@@ -116,23 +112,16 @@ type proxyconfig struct {
 	DiscoveryURL string `json:"discovery_url"`
 }
 
-type lruconfig struct {
-	LowWM              uint32        `json:"lowwm"`             // capacity usage low watermark
-	HighWM             uint32        `json:"highwm"`            // capacity usage high watermark
-	AtimeCacheMax      uint64        `json:"atime_cache_max"`   // atime cache - max num entries
-	DontEvictTimeStr   string        `json:"dont_evict_time"`   // eviction is not permitted during [atime, atime + dont]
-	CapacityUpdTimeStr string        `json:"capacity_upd_time"` // min time to update capacity
-	DontEvictTime      time.Duration `json:"-"`                 // omitempty
-	CapacityUpdTime    time.Duration `json:"-"`                 // ditto
-	LRUEnabled         bool          `json:"lru_enabled"`       // LRU will only run when LRUEnabled is true
+type rebalanceconf struct {
+	DestRetryTimeStr string        `json:"dest_retry_time"`
+	DestRetryTime    time.Duration `json:"-"` //
+	Enabled          bool          `json:"rebalancing_enabled"`
 }
 
-type rebalanceconf struct {
-	StartupDelayTimeStr string        `json:"startup_delay_time"`
-	StartupDelayTime    time.Duration `json:"-"` // omitempty
-	DestRetryTimeStr    string        `json:"dest_retry_time"`
-	DestRetryTime       time.Duration `json:"-"` //
-	Enabled             bool          `json:"rebalancing_enabled"`
+type replicationconfig struct {
+	ReplicateOnColdGet     bool `json:"replicate_on_cold_get"`     // object replication on cold GET request
+	ReplicateOnPut         bool `json:"replicate_on_put"`          // object replication on PUT request
+	ReplicateOnLRUEviction bool `json:"replicate_on_lru_eviction"` // object replication on LRU eviction
 }
 
 type testfspathconf struct {
@@ -142,29 +131,32 @@ type testfspathconf struct {
 }
 
 type netconfig struct {
-	IPv4 string  `json:"ipv4"`
-	L4   l4cnf   `json:"l4"`
-	HTTP httpcnf `json:"http"`
+	IPv4             string  `json:"ipv4"`
+	IPv4IntraControl string  `json:"ipv4_intra_control"`
+	IPv4IntraData    string  `json:"ipv4_intra_data"`
+	UseIntraControl  bool    `json:"-"`
+	UseIntraData     bool    `json:"-"`
+	L4               l4cnf   `json:"l4"`
+	HTTP             httpcnf `json:"http"`
 }
 
 type l4cnf struct {
-	Proto string `json:"proto"` // tcp, udp
-	Port  string `json:"port"`  // listening port
+	Proto               string `json:"proto"` // tcp, udp
+	PortStr             string `json:"port"`  // listening port
+	Port                int    `json:"-"`
+	PortIntraControlStr string `json:"port_intra_control"` // listening port for intra control network
+	PortIntraControl    int    `json:"-"`
+	PortIntraDataStr    string `json:"port_intra_data"` // listening port for intra data network
+	PortIntraData       int    `json:"-"`
 }
 
 type httpcnf struct {
-	MaxNumTargets int    `json:"max_num_targets"`    // estimated max num targets (to count idle conns)
-	UseHTTPS      bool   `json:"use_https"`          // use HTTPS instead of HTTP
-	UseAsProxy    bool   `json:"use_as_proxy"`       // use DFC as an HTTP proxy
+	proto         string // http or https
+	RevProxy      string `json:"rproxy"`             // RevProxy* enum
 	Certificate   string `json:"server_certificate"` // HTTPS: openssl certificate
 	Key           string `json:"server_key"`         // HTTPS: openssl key
-}
-
-type cksumconfig struct {
-	Checksum                string `json:"checksum"`                   // DFC checksum: xxhash:none
-	ValidateColdGet         bool   `json:"validate_checksum_cold_get"` // MD5 (ETag) validation upon cold GET
-	ValidateWarmGet         bool   `json:"validate_checksum_warm_get"` // MD5 (ETag) validation upon warm GET
-	EnableReadRangeChecksum bool   `json:"enable_read_range_checksum"` // Return read range checksum otherwise return entire object checksum
+	MaxNumTargets int    `json:"max_num_targets"`    // estimated max num targets (to count idle conns)
+	UseHTTPS      bool   `json:"use_https"`          // use HTTPS instead of HTTP
 }
 
 type versionconfig struct {
@@ -173,9 +165,9 @@ type versionconfig struct {
 }
 
 type fshcconf struct {
-	Enabled       bool `json:"fschecker_enabled"`
-	TestFileCount int  `json:"fschecker_test_files"`  // the number of files to read and write during a test
-	ErrorLimit    int  `json:"fschecker_error_limit"` // thresholds of number of errors, exceeding any of them results in disabling a mountpath
+	Enabled       bool `json:"fshc_enabled"`
+	TestFileCount int  `json:"fshc_test_files"`  // the number of files to read and write during a test
+	ErrorLimit    int  `json:"fshc_error_limit"` // thresholds of number of errors, exceeding any of them results in disabling a mountpath
 }
 
 type authconf struct {
@@ -210,7 +202,7 @@ func initconfigparam() error {
 	if err != nil {
 		glog.Errorf("Failed to flag-set glog dir %q, err: %v", ctx.config.Log.Dir, err)
 	}
-	if err = CreateDir(ctx.config.Log.Dir); err != nil {
+	if err = cmn.CreateDir(ctx.config.Log.Dir); err != nil {
 		glog.Errorf("Failed to create log dir %q, err: %v", ctx.config.Log.Dir, err)
 		return err
 	}
@@ -219,9 +211,9 @@ func initconfigparam() error {
 	}
 	// glog rotate
 	glog.MaxSize = ctx.config.Log.MaxSize
-	if glog.MaxSize > GiB {
+	if glog.MaxSize > cmn.GiB {
 		glog.Errorf("Log.MaxSize %d exceeded 1GB, setting the default 1MB", glog.MaxSize)
-		glog.MaxSize = MiB
+		glog.MaxSize = cmn.MiB
 	}
 	// CLI override
 	if clivars.statstime != 0 {
@@ -239,17 +231,38 @@ func initconfigparam() error {
 			glog.Errorf("Failed to set log level = %s, err: %v", ctx.config.Log.Level, err)
 		}
 	}
+
+	// Set helpers
+	ctx.config.Net.HTTP.proto = "http"
+	if ctx.config.Net.HTTP.UseHTTPS {
+		ctx.config.Net.HTTP.proto = "https"
+	}
+
+	differentIPs := ctx.config.Net.IPv4 != ctx.config.Net.IPv4IntraControl
+	differentPorts := ctx.config.Net.L4.Port != ctx.config.Net.L4.PortIntraControl
+	ctx.config.Net.UseIntraControl = false
+	if ctx.config.Net.IPv4IntraControl != "" && ctx.config.Net.L4.PortIntraControl != 0 && (differentIPs || differentPorts) {
+		ctx.config.Net.UseIntraControl = true
+	}
+
+	differentIPs = ctx.config.Net.IPv4 != ctx.config.Net.IPv4IntraData
+	differentPorts = ctx.config.Net.L4.Port != ctx.config.Net.L4.PortIntraData
+	ctx.config.Net.UseIntraData = false
+	if ctx.config.Net.IPv4IntraData != "" && ctx.config.Net.L4.PortIntraData != 0 && (differentIPs || differentPorts) {
+		ctx.config.Net.UseIntraData = true
+	}
+
 	if build != "" {
 		glog.Infof("Build:  %s", build) // git rev-parse --short HEAD
 	}
-	glog.Infof("Logdir: %q Proto: %s Port: %s Verbosity: %s",
+	glog.Infof("Logdir: %q Proto: %s Port: %d Verbosity: %s",
 		ctx.config.Log.Dir, ctx.config.Net.L4.Proto, ctx.config.Net.L4.Port, ctx.config.Log.Level)
 	glog.Infof("Config: %q Role: %s StatsTime: %v", clivars.conffile, clivars.role, ctx.config.Periodic.StatsTime)
 	return err
 }
 
 func getConfig(fpath string) {
-	err := LocalLoad(fpath, &ctx.config)
+	err := cmn.LocalLoad(fpath, &ctx.config)
 	if err != nil {
 		glog.Errorf("Failed to load config %q, err: %v", fpath, err)
 		os.Exit(1)
@@ -257,7 +270,7 @@ func getConfig(fpath string) {
 }
 
 func validateVersion(version string) error {
-	versions := []string{VersionAll, VersionCloud, VersionLocal, VersionNone}
+	versions := []string{cmn.VersionAll, cmn.VersionCloud, cmn.VersionLocal, cmn.VersionNone}
 	versionValid := false
 	for _, v := range versions {
 		if v == version {
@@ -294,9 +307,6 @@ func validateconf() (err error) {
 	if ctx.config.LRU.CapacityUpdTime, err = time.ParseDuration(ctx.config.LRU.CapacityUpdTimeStr); err != nil {
 		return fmt.Errorf("Bad capacity_upd_time format %s, err: %v", ctx.config.LRU.CapacityUpdTimeStr, err)
 	}
-	if ctx.config.Rebalance.StartupDelayTime, err = time.ParseDuration(ctx.config.Rebalance.StartupDelayTimeStr); err != nil {
-		return fmt.Errorf("Bad startup_delay_time format %s, err: %v", ctx.config.Rebalance.StartupDelayTimeStr, err)
-	}
 	if ctx.config.Rebalance.DestRetryTime, err = time.ParseDuration(ctx.config.Rebalance.DestRetryTimeStr); err != nil {
 		return fmt.Errorf("Bad dest_retry_time format %s, err: %v", ctx.config.Rebalance.DestRetryTimeStr, err)
 	}
@@ -311,8 +321,8 @@ func validateconf() (err error) {
 		return fmt.Errorf("Invalid Xaction configuration %+v", ctx.config.Xaction)
 	}
 
-	if ctx.config.Cksum.Checksum != ChecksumXXHash && ctx.config.Cksum.Checksum != ChecksumNone {
-		return fmt.Errorf("Invalid checksum: %s - expecting %s or %s", ctx.config.Cksum.Checksum, ChecksumXXHash, ChecksumNone)
+	if ctx.config.Cksum.Checksum != cmn.ChecksumXXHash && ctx.config.Cksum.Checksum != cmn.ChecksumNone {
+		return fmt.Errorf("Invalid checksum: %s - expecting %s or %s", ctx.config.Cksum.Checksum, cmn.ChecksumXXHash, cmn.ChecksumNone)
 	}
 	if err := validateVersion(ctx.config.Ver.Versioning); err != nil {
 		return err
@@ -351,6 +361,55 @@ func validateconf() (err error) {
 		return fmt.Errorf("bad target keepalive tracker type %s", ctx.config.KeepaliveTracker.Target.Name)
 	}
 
+	// NETWORK
+
+	// Parse ports
+	if ctx.config.Net.L4.Port, err = parsePort(ctx.config.Net.L4.PortStr); err != nil {
+		return fmt.Errorf("Bad public port specified: %v", err)
+	}
+
+	ctx.config.Net.L4.PortIntraControl = 0
+	if ctx.config.Net.L4.PortIntraControlStr != "" {
+		if ctx.config.Net.L4.PortIntraControl, err = parsePort(ctx.config.Net.L4.PortIntraControlStr); err != nil {
+			return fmt.Errorf("Bad internal port specified: %v", err)
+		}
+	}
+	ctx.config.Net.L4.PortIntraData = 0
+	if ctx.config.Net.L4.PortIntraDataStr != "" {
+		if ctx.config.Net.L4.PortIntraData, err = parsePort(ctx.config.Net.L4.PortIntraDataStr); err != nil {
+			return fmt.Errorf("Bad replication port specified: %v", err)
+		}
+	}
+
+	ctx.config.Net.IPv4 = strings.Replace(ctx.config.Net.IPv4, " ", "", -1)
+	ctx.config.Net.IPv4IntraControl = strings.Replace(ctx.config.Net.IPv4IntraControl, " ", "", -1)
+	ctx.config.Net.IPv4IntraData = strings.Replace(ctx.config.Net.IPv4IntraData, " ", "", -1)
+
+	if overlap, addr := ipv4ListsOverlap(ctx.config.Net.IPv4, ctx.config.Net.IPv4IntraControl); overlap {
+		return fmt.Errorf(
+			"Public and internal addresses overlap: %s (public: %s; internal: %s)",
+			addr, ctx.config.Net.IPv4, ctx.config.Net.IPv4IntraControl,
+		)
+	}
+	if overlap, addr := ipv4ListsOverlap(ctx.config.Net.IPv4, ctx.config.Net.IPv4IntraData); overlap {
+		return fmt.Errorf(
+			"Public and replication addresses overlap: %s (public: %s; replication: %s)",
+			addr, ctx.config.Net.IPv4, ctx.config.Net.IPv4IntraData,
+		)
+	}
+	if overlap, addr := ipv4ListsOverlap(ctx.config.Net.IPv4IntraControl, ctx.config.Net.IPv4IntraData); overlap {
+		return fmt.Errorf(
+			"Internal and replication addresses overlap: %s (internal: %s; replication: %s)",
+			addr, ctx.config.Net.IPv4IntraControl, ctx.config.Net.IPv4IntraData,
+		)
+	}
+
+	if ctx.config.Net.HTTP.RevProxy != "" {
+		if ctx.config.Net.HTTP.RevProxy != RevProxyCloud && ctx.config.Net.HTTP.RevProxy != RevProxyTarget {
+			return fmt.Errorf("Invalid http rproxy configuration: %s (expecting: ''|%s|%s)",
+				ctx.config.Net.HTTP.RevProxy, RevProxyCloud, RevProxyTarget)
+		}
+	}
 	return nil
 }
 
@@ -387,4 +446,23 @@ func setGLogVModule(v string) error {
 // moreover, all the cluster is running on a single machine
 func testingFSPpaths() bool {
 	return ctx.config.TestFSP.Count > 0
+}
+
+// ipv4ListsOverlap checks if two comma-separated ipv4 address lists
+// contain at least one common ipv4 address
+func ipv4ListsOverlap(alist, blist string) (overlap bool, addr string) {
+	if alist == "" || blist == "" {
+		return
+	}
+	alistAddrs := strings.Split(alist, ",")
+	for _, a := range alistAddrs {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if strings.Contains(blist, a) {
+			return true, a
+		}
+	}
+	return
 }

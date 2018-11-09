@@ -8,16 +8,17 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
-	"github.com/NVIDIA/dfcpub/dfc"
-	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/cluster"
+	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/tutils"
 )
 
 type (
 	// Manages the current primary proxy URL and runs autodetection in case
 	// of primary proxy does not response
 	proxy struct {
-		URL        string    `json:"url"`
-		Smap       *dfc.Smap `json:"smap"`
+		URL        string        `json:"url"`
+		Smap       *cluster.Smap `json:"smap"`
 		configPath string
 	}
 )
@@ -31,10 +32,10 @@ type (
 // If primary proxy change is detected then the current Smap is saved
 func newProxy(configPath, defaultURL string) *proxy {
 	p := &proxy{}
-	err := dfc.LocalLoad(configPath, p)
+	err := cmn.LocalLoad(configPath, p)
 	if err != nil {
 		// first run: read the current Smap and save to local file
-		smap, err := client.GetClusterMap(defaultURL)
+		smap, err := tutils.GetClusterMap(defaultURL)
 		if err != nil {
 			glog.Errorf("Failed to get cluster map: %v", err)
 			return &proxy{configPath: configPath, URL: defaultURL}
@@ -54,7 +55,7 @@ func newProxy(configPath, defaultURL string) *proxy {
 }
 
 func (p *proxy) saveSmap() {
-	err := dfc.LocalSave(p.configPath, p)
+	err := cmn.LocalSave(p.configPath, p)
 	if err != nil {
 		glog.Errorf("Failed to save configuration: %v", err)
 	}
@@ -66,13 +67,13 @@ func (p *proxy) saveSmap() {
 //   config and saves new valid Smap
 // Returns error if the node failed to respond
 func (p *proxy) comparePrimaryURL(url string) error {
-	smap, err := client.GetClusterMap(url)
+	smap, err := tutils.GetClusterMap(url)
 	if err != nil {
 		return err
 	}
 
-	if smap.ProxySI.DirectURL != p.URL {
-		p.URL = smap.ProxySI.DirectURL
+	if smap.ProxySI.PublicNet.DirectURL != p.URL {
+		p.URL = smap.ProxySI.PublicNet.DirectURL
 		p.Smap = &smap
 		p.saveSmap()
 	}
@@ -90,19 +91,19 @@ func (p *proxy) detectPrimary() error {
 	}
 
 	for _, pinfo := range p.Smap.Pmap {
-		err := p.comparePrimaryURL(pinfo.DirectURL)
+		err := p.comparePrimaryURL(pinfo.PublicNet.DirectURL)
 		if err == nil {
 			return nil
 		}
-		glog.Errorf("Failed to get cluster map from [%s]: %v", pinfo.DirectURL, err)
+		glog.Errorf("Failed to get cluster map from [%s]: %v", pinfo.PublicNet.DirectURL, err)
 	}
 
 	for _, tinfo := range p.Smap.Tmap {
-		err := p.comparePrimaryURL(tinfo.DirectURL)
+		err := p.comparePrimaryURL(tinfo.PublicNet.DirectURL)
 		if err == nil {
 			return nil
 		}
-		glog.Errorf("Failed to get cluster map from [%s]: %v", tinfo.DirectURL, err)
+		glog.Errorf("Failed to get cluster map from [%s]: %v", tinfo.PublicNet.DirectURL, err)
 	}
 
 	return fmt.Errorf("No node has responded. Using primary URL from the config")
