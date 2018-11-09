@@ -10,16 +10,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/NVIDIA/dfcpub/dfc/statsd"
-
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/dfc/statsd"
 )
 
 const logsTotalSizeCheckTime = time.Hour * 3
@@ -29,6 +27,8 @@ const logsTotalSizeCheckTime = time.Hour * 3
 // types
 //
 //==============================
+type metric = statsd.Metric // type alias
+
 type fscapacity struct {
 	Used    uint64 `json:"used"`    // bytes
 	Avail   uint64 `json:"avail"`   // ditto
@@ -85,9 +85,8 @@ type targetCoreStats struct {
 }
 
 type statsrunner struct {
-	sync.Mutex
+	sync.RWMutex
 	namedrunner
-	statslogger
 	chsts chan struct{}
 }
 
@@ -120,18 +119,21 @@ type ClusterStatsRaw struct {
 }
 
 type iostatrunner struct {
-	sync.Mutex
+	sync.RWMutex
 	namedrunner
 	chsts       chan struct{}
 	CPUidle     string
 	metricnames []string
 	Disk        map[string]simplekvs
-	cmd         *exec.Cmd
+	process     *os.Process // running iostat process. Required so it can be killed later
+	fsdisks     map[string]StringSet
 }
+
+type StringSet map[string]struct{}
 
 type (
 	XactionStatsRetriever interface {
-		getStats([]XactionDetails) ([]byte, error)
+		getStats([]XactionDetails) []byte
 	}
 
 	XactionStats struct {
@@ -351,36 +353,27 @@ func (r *storstatsrunner) log() (runlru bool) {
 
 	// disk
 	riostat := getiostatrunner()
-	if riostat != nil {
-		riostat.Lock()
-		r.CPUidle = riostat.CPUidle
-		for dev, iometrics := range riostat.Disk {
-			// FIXME (benign) storstatsrunner and iostatrunner share the same 'metrics'
-			// e.g. when responding to http get stats, we do not currently take riostat.Lock
-			r.Disk[dev] = iometrics
-			if riostat.isZeroUtil(dev) {
-				continue // skip zeros
-			}
-			b, err := json.Marshal(r.Disk[dev])
-			if err == nil {
-				lines = append(lines, dev+": "+string(b))
-			}
-
-			var stats []statsd.Metric
-			for k, v := range iometrics {
-				stats = append(stats, statsd.Metric{
-					Type:  statsd.Gauge,
-					Name:  k,
-					Value: v,
-				})
-			}
-
-			gettarget().statsdC.Send("iostat_"+dev, stats...)
+	riostat.RLock()
+	r.CPUidle = riostat.CPUidle
+	for dev, iometrics := range riostat.Disk {
+		r.Disk[dev] = iometrics
+		if riostat.isZeroUtil(dev) {
+			continue // skip zeros
+		}
+		b, err := json.Marshal(r.Disk[dev])
+		if err == nil {
+			lines = append(lines, dev+": "+string(b))
 		}
 
-		lines = append(lines, fmt.Sprintf("CPU idle: %s%%", r.CPUidle))
-		riostat.Unlock()
+		var stats []metric
+		for k, v := range iometrics {
+			stats = append(stats, metric{statsd.Gauge, k, v})
+		}
+		gettarget().statsdC.Send("iostat_"+dev, stats...)
 	}
+	riostat.RUnlock()
+
+	lines = append(lines, fmt.Sprintf("CPU idle: %s%%", r.CPUidle))
 
 	r.Core.logged = true
 	r.Unlock()
@@ -498,8 +491,11 @@ func (r *storstatsrunner) init() {
 	// local filesystems and their cap-s
 	r.Capacity = make(map[string]*fscapacity)
 	r.fsmap = make(map[syscall.Fsid]string)
-	for mpath, mountpath := range ctx.mountpaths.Available {
-		mp1, ok := r.fsmap[mountpath.Fsid]
+
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	for _, mpathInfo := range availablePaths {
+		mpath := mpathInfo.Path
+		mp1, ok := r.fsmap[mpathInfo.Fsid]
 		if ok {
 			// the same filesystem: usage cannot be different..
 			assert(r.Capacity[mp1] != nil)
@@ -511,7 +507,7 @@ func (r *storstatsrunner) init() {
 			glog.Errorf("Failed to statfs mp %q, err: %v", mpath, err)
 			continue
 		}
-		r.fsmap[mountpath.Fsid] = mpath
+		r.fsmap[mpathInfo.Fsid] = mpath
 		r.Capacity[mpath] = &fscapacity{}
 		r.fillfscap(r.Capacity[mpath], statfs)
 	}
@@ -603,46 +599,56 @@ func (r *storstatsrunner) addL(name string, val int64) {
 	s.logged = false
 }
 
-func (p PrefetchTargetStats) getStats(allXactionDetails []XactionDetails) (
-	[]byte, error) {
-	storageStatsRunner := getstorstatsrunner()
-	storageStatsRunner.Lock()
+func (p PrefetchTargetStats) getStats(allXactionDetails []XactionDetails) []byte {
+	rstor := getstorstatsrunner()
+	rstor.RLock()
 	prefetchXactionStats := PrefetchTargetStats{
 		Xactions:           allXactionDetails,
-		NumBytesPrefetched: storageStatsRunner.Core.Numprefetch,
-		NumFilesPrefetched: storageStatsRunner.Core.Bytesprefetched,
+		NumBytesPrefetched: rstor.Core.Numprefetch,
+		NumFilesPrefetched: rstor.Core.Bytesprefetched,
 	}
-	storageStatsRunner.Unlock()
+	rstor.RUnlock()
 	jsonBytes, err := json.Marshal(prefetchXactionStats)
-	if err != nil {
-		err = fmt.Errorf(
-			"Unable to marshal prefetchXactionStats. Error: %v",
-			err)
-		return []byte{}, err
-	}
-
-	return jsonBytes, nil
+	assert(err == nil, err)
+	return jsonBytes
 }
 
-func (r RebalanceTargetStats) getStats(allXactionDetails []XactionDetails) (
-	[]byte, error) {
-	storageStatsRunner := getstorstatsrunner()
-	storageStatsRunner.Lock()
+func (r RebalanceTargetStats) getStats(allXactionDetails []XactionDetails) []byte {
+	rstor := getstorstatsrunner()
+	rstor.RLock()
 	rebalanceXactionStats := RebalanceTargetStats{
 		Xactions:     allXactionDetails,
-		NumRecvBytes: storageStatsRunner.Core.Numrecvbytes,
-		NumRecvFiles: storageStatsRunner.Core.Numrecvfiles,
-		NumSentBytes: storageStatsRunner.Core.Numsentbytes,
-		NumSentFiles: storageStatsRunner.Core.Numsentfiles,
+		NumRecvBytes: rstor.Core.Numrecvbytes,
+		NumRecvFiles: rstor.Core.Numrecvfiles,
+		NumSentBytes: rstor.Core.Numsentbytes,
+		NumSentFiles: rstor.Core.Numsentfiles,
 	}
-	storageStatsRunner.Unlock()
+	rstor.RUnlock()
 	jsonBytes, err := json.Marshal(rebalanceXactionStats)
-	if err != nil {
-		err = fmt.Errorf(
-			"Unable to marshal rebalanceXactionStats. Error: %v",
-			err)
-		return []byte{}, err
-	}
+	assert(err == nil, err)
+	return jsonBytes
+}
 
-	return jsonBytes, nil
+func getToEvict(mpath string, hwm uint32, lwm uint32) (int64, error) {
+	blocks, bavail, bsize, err := getFSStats(mpath)
+	if err != nil {
+		return -1, err
+	}
+	used := blocks - bavail
+	usedpct := used * 100 / blocks
+	glog.Infof("Blocks %d Bavail %d used %d%% hwm %d%% lwm %d%%", blocks, bavail, usedpct, hwm, lwm)
+	if usedpct < uint64(hwm) {
+		return 0, nil // 0 to evict
+	}
+	lwmblocks := blocks * uint64(lwm) / 100
+	return int64(used-lwmblocks) * bsize, nil
+}
+
+func getFSUsedPercentage(path string) (usedPercentage uint64, ok bool) {
+	totalBlocks, blocksAvailable, _, err := getFSStats(path)
+	if err != nil {
+		return
+	}
+	usedBlocks := totalBlocks - blocksAvailable
+	return usedBlocks * 100 / totalBlocks, true
 }

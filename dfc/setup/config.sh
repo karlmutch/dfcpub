@@ -37,6 +37,10 @@
 		"capacity_upd_time":	"10m",
 		"lru_enabled":  	true
 	},
+	"xaction_config":{
+	    "disk_util_low_wm":      60,
+	    "disk_util_high_wm":     80
+	},
 	"rebalance_conf": {
 		"startup_delay_time":	"3m",
 		"dest_retry_time":	"2m",
@@ -69,16 +73,15 @@
 		"http": {
 			"max_num_targets":    16,
 			"use_https":          ${USE_HTTPS},
-			"use_http2":          false,
 			"use_as_proxy":       false,
 			"server_certificate": "server.crt",
 			"server_key":         "server.key"
 		}
 	},
-	"fskeeper": {
-		"fs_check_time":         "0",
-		"offline_fs_check_time": "0",
-		"fskeeper_enabled":      false
+	"fschecker": {
+		"fschecker_enabled":      true,
+		"fschecker_test_files":   4,
+		"fschecker_error_limit":  2
 	},
 	"auth": {
 		"secret": "$SECRETKEY",
@@ -89,19 +92,13 @@
 		"proxy": {
 			"interval": "10s",
 			"name": "heartbeat",
-			"max": "20s",
 			"factor": 3
 		},
 		"target": {
 			"interval": "10s",
 			"name": "heartbeat",
-			"max": "20s",
 			"factor": 3
 		}
-	},
-	"callstats": {
-		"request_included": [ "keepalive", "metasync" ],
-		"factor": 2.5
 	}
 }
 EOL

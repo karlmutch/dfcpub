@@ -9,25 +9,25 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/fs"
 )
 
 // runners
 const (
-	xproxy        = "proxy"
-	xtarget       = "target"
-	xsignal       = "signal"
-	xproxystats   = "proxystats"
-	xstorstats    = "storstats"
-	xproxykalive  = "proxykalive"
-	xtargetkalive = "targetkalive"
-	xiostat       = "iostat"
-	xfskeeper     = "fskeeper"
-	xatime        = "atime"
-	xmetasyncer   = "metasyncer"
+	xproxy           = "proxy"
+	xtarget          = "target"
+	xsignal          = "signal"
+	xproxystats      = "proxystats"
+	xstorstats       = "storstats"
+	xproxykeepalive  = "proxykeepalive"
+	xtargetkeepalive = "targetkeepalive"
+	xiostat          = "iostat"
+	xatime           = "atime"
+	xmetasyncer      = "metasyncer"
+	xfshealthchecker = "fshealthchecker"
 )
 
 type (
@@ -40,16 +40,10 @@ type (
 		proxyurl  string
 	}
 
-	mountedFS struct {
-		sync.Mutex `json:"-"`
-		Available  map[string]*mountPath `json:"available"`
-		Offline    map[string]*mountPath `json:"offline"`
-	}
-
 	// daemon instance: proxy or storage target
 	daemon struct {
 		config     dfconfig
-		mountpaths mountedFS
+		mountpaths fs.MountedFS // for mountpath definition, see fs/mountfs.go
 		rg         *rungroup
 	}
 
@@ -64,7 +58,6 @@ type (
 		runarr []runner
 		runmap map[string]runner // redundant, named
 		errch  chan error
-		idxch  chan int
 		stpch  chan error
 	}
 
@@ -72,6 +65,7 @@ type (
 		run() error
 		stop(error)
 		setname(string)
+		getName() string
 	}
 
 	// callResult contains data returned by a server to server call
@@ -86,6 +80,7 @@ type (
 )
 
 func (r *namedrunner) setname(n string) { r.name = n }
+func (r *namedrunner) getName() string  { return r.name }
 
 //====================
 //
@@ -117,13 +112,14 @@ func (g *rungroup) run() error {
 	g.stpch = make(chan error, 1)
 	for i, r := range g.runarr {
 		go func(i int, r runner) {
-			g.errch <- r.run()
+			err := r.run()
+			glog.Warningf("Runner [%s] threw error [%v].", r.getName(), err)
+			g.errch <- err
 		}(i, r)
 	}
 
 	// wait here for (any/first) runner termination
 	err := <-g.errch
-
 	for _, r := range g.runarr {
 		r.stop(err)
 	}
@@ -174,48 +170,48 @@ func dfcinit() {
 		p.initSI()
 		ctx.rg.add(p, xproxy)
 		ctx.rg.add(&proxystatsrunner{}, xproxystats)
-		ctx.rg.add(newproxykalive(p), xproxykalive)
+		ctx.rg.add(newProxyKeepaliveRunner(p), xproxykeepalive)
 		ctx.rg.add(newmetasyncer(p), xmetasyncer)
 	} else {
 		t := &targetrunner{}
 		t.initSI()
 		ctx.rg.add(t, xtarget)
 		ctx.rg.add(&storstatsrunner{}, xstorstats)
-		ctx.rg.add(newtargetkalive(t), xtargetkalive)
-		if iostatverok() {
-			ctx.rg.add(&iostatrunner{}, xiostat)
-		}
+		ctx.rg.add(newTargetKeepaliveRunner(t), xtargetkeepalive)
 
-		if ctx.config.FSKeeper.Enabled {
-			ctx.rg.add(newFSKeeper(&ctx.config.FSKeeper,
-				&ctx.mountpaths, t.fqn2workfile), xfskeeper)
+		// iostat is required: ensure that it is installed and its version is right
+		if err := checkIostatVersion(); err != nil {
+			glog.Exit(err)
 		}
+		ctx.rg.add(newIostatRunner(), xiostat)
 
 		ctx.rg.add(&atimerunner{
-			chstop:   make(chan struct{}, 4),
-			chfqn:    make(chan string, chfqnSize),
-			atimemap: &atimemap{m: make(map[string]time.Time, atimeCacheIni)},
+			chstop:      make(chan struct{}, 4),
+			chfqn:       make(chan string, chfqnSize),
+			atimemap:    &atimemap{fsToFilesMap: make(map[string]map[string]time.Time, atimeCacheFlushThreshold)},
+			chGetAtime:  make(chan string),
+			chSendAtime: make(chan accessTimeResponse),
 		}, xatime)
 
-		// Note:
-		// Move this code from run() to here to fix a race between target run() and storage stats
-		// run() DFC's runner start doesn't have a concept of sequence, all runners are started
-		// without a clean way of making sure all fields needed by a runner are initialized.
-		// The code should be reworked to include a clean way of initializing all runnners
-		// sequentilly based on runner's dependency, so when runners' run()
-		// is called, they have all their needed fields created and initialized.
-		// Here is one example, when targetrunner.run() and storstatsrunner.run() both are running,
-		// ctx.mountpaths.Available is supposed to be filled by targetrunner when it calls startupMpaths(),
-		// but storstatsrunner.run() started to use it, resulted in the read/write race.
-		ctx.mountpaths.Available = make(map[string]*mountPath, len(ctx.config.FSpaths))
-		ctx.mountpaths.Offline = make(map[string]*mountPath, len(ctx.config.FSpaths))
-		if t.testingFSPpaths() {
+		// for mountpath definition, see fs/mountfs.go
+		if testingFSPpaths() {
 			glog.Infof("Warning: configuring %d fspaths for testing", ctx.config.TestFSP.Count)
 			t.testCachepathMounts()
 		} else {
-			t.fspath2mpath()
-			t.mpath2Fsid() // enforce FS uniqueness
+			fsPaths := make([]string, 0, len(ctx.config.FSpaths))
+			for path := range ctx.config.FSpaths {
+				fsPaths = append(fsPaths, path)
+			}
+
+			if err := ctx.mountpaths.Init(fsPaths); err != nil {
+				glog.Fatal(err)
+			}
 		}
+
+		ctx.rg.add(
+			newFSHealthChecker(&ctx.mountpaths, &ctx.config.FSChecker, t.fqn2workfile),
+			xfshealthchecker,
+		)
 	}
 	ctx.rg.add(&sigrunner{}, xsignal)
 }
@@ -258,16 +254,9 @@ func getproxystats() *proxyCoreStats {
 	return &rr.Core
 }
 
-func getproxy() *proxyrunner {
-	r := ctx.rg.runmap[xproxy]
-	rr, ok := r.(*proxyrunner)
-	assert(ok)
-	return rr
-}
-
-func getproxykalive() *proxykalive {
-	r := ctx.rg.runmap[xproxykalive]
-	rr, ok := r.(*proxykalive)
+func getproxykeepalive() *proxyKeepaliveRunner {
+	r := ctx.rg.runmap[xproxykeepalive]
+	rr, ok := r.(*proxyKeepaliveRunner)
 	assert(ok)
 	return rr
 }
@@ -279,9 +268,9 @@ func gettarget() *targetrunner {
 	return rr
 }
 
-func gettargetkalive() *targetkalive {
-	r := ctx.rg.runmap[xtargetkalive]
-	rr, ok := r.(*targetkalive)
+func gettargetkeepalive() *targetKeepaliveRunner {
+	r := ctx.rg.runmap[xtargetkeepalive]
+	rr, ok := r.(*targetKeepaliveRunner)
 	assert(ok)
 	return rr
 }
@@ -295,8 +284,8 @@ func getstorstatsrunner() *storstatsrunner {
 
 func getiostatrunner() *iostatrunner {
 	r := ctx.rg.runmap[xiostat]
-	rr, _ := r.(*iostatrunner)
-	// not asserting: a) sysstat installed? b) mac
+	rr, ok := r.(*iostatrunner)
+	assert(ok)
 	return rr
 }
 
@@ -314,19 +303,16 @@ func getcloudif() cloudif {
 	return rr.cloudif
 }
 
-func getFSKeeper() *fsKeeper {
-	if !ctx.config.FSKeeper.Enabled {
-		return nil
-	}
-	r := ctx.rg.runmap[xfskeeper]
-	rr, ok := r.(*fsKeeper)
+func getmetasyncer() *metasyncer {
+	r := ctx.rg.runmap[xmetasyncer]
+	rr, ok := r.(*metasyncer)
 	assert(ok)
 	return rr
 }
 
-func getmetasyncer() *metasyncer {
-	r := ctx.rg.runmap[xmetasyncer]
-	rr, ok := r.(*metasyncer)
+func getfshealthchecker() *fsHealthChecker {
+	r := ctx.rg.runmap[xfshealthchecker]
+	rr, ok := r.(*fsHealthChecker)
 	assert(ok)
 	return rr
 }

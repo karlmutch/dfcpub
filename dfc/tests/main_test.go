@@ -42,22 +42,6 @@ type workres struct {
 	totbytes int64
 }
 
-type reqError struct {
-	code    int
-	message string
-}
-
-func (err reqError) Error() string {
-	return err.message
-}
-
-func newReqError(msg string, code int) reqError {
-	return reqError{
-		code:    code,
-		message: msg,
-	}
-}
-
 func Test_download(t *testing.T) {
 	if err := client.Tcping(proxyurl); err != nil {
 		tlogf("%s: %v\n", proxyurl, err)
@@ -382,8 +366,8 @@ func Test_putdelete(t *testing.T) {
 		defer sgl.Free()
 	}
 
-	putRandomFiles(0, baseseed, filesize, numfiles, clibucket, t, nil, errch, filesput,
-		DeleteDir, DeleteStr, "", !testing.Verbose(), sgl)
+	putRandomFiles(baseseed, filesize, numfiles, clibucket, t, nil, errch, filesput,
+		DeleteDir, DeleteStr, !testing.Verbose(), sgl)
 	close(filesput)
 
 	// Declare one channel per worker to pass the keyname
@@ -561,8 +545,8 @@ func Test_coldgetmd5(t *testing.T) {
 		defer sgl.Free()
 	}
 
-	putRandomFiles(0, baseseed, filesize, numPuts, bucket, t, nil, errch, filesput, ldir,
-		ColdValidStr, "", true, sgl)
+	putRandomFiles(baseseed, filesize, numPuts, bucket, t, nil, errch, filesput, ldir,
+		ColdValidStr, true, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput) // to exit for-range
 	for fname := range filesput {
@@ -840,9 +824,9 @@ func getAndCopyOne(id int, t *testing.T, errch chan error, bucket, keyname, url 
 	}()
 	if hdhashtype == dfc.ChecksumXXHash {
 		xx := xxhash.New64()
-		written, errstr = dfc.ReceiveAndChecksum(file, resp.Body, nil, xx)
-		if errstr != "" {
-			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+		written, err = dfc.ReceiveAndChecksum(file, resp.Body, nil, xx)
+		if err != nil {
+			t.Errorf("Worker %2d: failed to write file, err: %v", id, err)
 			failed = true
 			return
 		}
@@ -858,9 +842,9 @@ func getAndCopyOne(id int, t *testing.T, errch chan error, bucket, keyname, url 
 		tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumXXHash, hdhash, hash)
 	} else if hdhashtype == dfc.ChecksumMD5 {
 		md5 := md5.New()
-		written, errstr = dfc.ReceiveAndChecksum(file, resp.Body, nil, md5)
-		if errstr != "" {
-			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+		written, err = dfc.ReceiveAndChecksum(file, resp.Body, nil, md5)
+		if err != nil {
+			t.Errorf("Worker %2d: failed to write file, err: %v", id, err)
 			return
 		}
 		hashInBytes := md5.Sum(nil)[:16]
@@ -877,9 +861,9 @@ func getAndCopyOne(id int, t *testing.T, errch chan error, bucket, keyname, url 
 		}
 		tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumMD5, hdhash, md5hash)
 	} else {
-		written, errstr = dfc.ReceiveAndChecksum(file, resp.Body, nil)
-		if errstr != "" {
-			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+		written, err = dfc.ReceiveAndChecksum(file, resp.Body, nil)
+		if err != nil {
+			t.Errorf("Worker %2d: failed to write file, err: %v", id, err)
 			failed = true
 			return
 		}
@@ -941,19 +925,6 @@ func testListBucket(t *testing.T, bucket string, msg *dfc.GetMsg, limit int) *df
 	return reslist
 }
 
-func emitError(r *http.Response, err error, errch chan error) {
-	if err == nil || errch == nil {
-		return
-	}
-
-	if r != nil {
-		errObj := newReqError(err.Error(), r.StatusCode)
-		errch <- errObj
-	} else {
-		errch <- err
-	}
-}
-
 // 1.	PUT file
 // 2.	Change contents of the file or change XXHash
 // 3.	GET file.
@@ -987,7 +958,7 @@ func TestChecksumValidateOnWarmGetForCloudBucket(t *testing.T) {
 	}
 
 	tlogf("Creating %d objects\n", numFiles)
-	putRandomFiles(0, seed, fileSize, numFiles, clibucket, t, nil, errorChannel, fileNameChannel, ChecksumWarmValidateDir, ChecksumWarmValidateStr, "", true, sgl)
+	putRandomFiles(seed, fileSize, numFiles, clibucket, t, nil, errorChannel, fileNameChannel, ChecksumWarmValidateDir, ChecksumWarmValidateStr, true, sgl)
 
 	fileName = <-fileNameChannel
 	filesList = append(filesList, ChecksumWarmValidateStr+"/"+fileName)
@@ -1129,7 +1100,7 @@ func TestChecksumValidateOnWarmGetForLocalBucket(t *testing.T) {
 		defer sgl.Free()
 	}
 
-	putRandomFiles(0, seed, fileSize, numFiles, bucketName, t, nil, errorChannel, fileNameChannel, ChecksumWarmValidateDir, ChecksumWarmValidateStr, "", true, sgl)
+	putRandomFiles(seed, fileSize, numFiles, bucketName, t, nil, errorChannel, fileNameChannel, ChecksumWarmValidateDir, ChecksumWarmValidateStr, true, sgl)
 	selectErr(errorChannel, "put", t, false)
 
 	// Get Current Config
@@ -1227,8 +1198,6 @@ func TestRangeRead(t *testing.T) {
 		seed            = int64(131)
 		bucketName      = clibucket
 		fileName        string
-		byteRange       int64
-		iterations      int64
 	)
 
 	if usingSG {
@@ -1237,32 +1206,33 @@ func TestRangeRead(t *testing.T) {
 	}
 
 	created := createLocalBucketIfNotExists(t, proxyurl, clibucket)
-	putRandomFiles(0, seed, fileSize, numFiles, bucketName, t, nil, errorChannel, fileNameChannel, RangeGetDir, RangeGetStr, "", false, sgl)
+	putRandomFiles(seed, fileSize, numFiles, bucketName, t, nil, errorChannel, fileNameChannel, RangeGetDir, RangeGetStr, false, sgl)
 	selectErr(errorChannel, "put", t, false)
 
 	// Get Current Config
 	config := getConfig(proxyurl+"/"+dfc.Rversion+"/"+dfc.Rdaemon, httpclient, t)
 	checksumConfig := config["cksum_config"].(map[string]interface{})
 	oldEnableReadRangeChecksum := checksumConfig["enable_read_range_checksum"].(bool)
-	if !oldEnableReadRangeChecksum {
-		setConfig("enable_read_range_checksum", fmt.Sprint("true"), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+
+	fileName = <-fileNameChannel
+	tlogln("Testing valid cases.")
+	// Validate entire object checksum is being returned
+	if oldEnableReadRangeChecksum {
+		setConfig("enable_read_range_checksum", fmt.Sprint(false), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
 		if t.Failed() {
 			goto cleanup
 		}
 	}
+	testValidCases(fileSize, t, bucketName, fileName, true)
 
-	fileName = <-fileNameChannel
-	tlogln("Testing valid cases.")
-	// Read the entire file range by range
-	// Read in ranges of 500 to test covered, partially covered and completely
-	// uncovered ranges
-	byteRange = 500
-	iterations = int64(fileSize) / byteRange
-	for i := int64(0); i < iterations; i += byteRange {
-		verifyValidRanges(t, bucketName, fileName, int64(i), byteRange, byteRange, true)
+	// Validate only range checksum is being returned
+	if !oldEnableReadRangeChecksum {
+		setConfig("enable_read_range_checksum", fmt.Sprint(true), proxyurl+"/"+dfc.Rversion+"/"+dfc.Rcluster, httpclient, t)
+		if t.Failed() {
+			goto cleanup
+		}
 	}
-	verifyValidRanges(t, bucketName, fileName, byteRange*iterations, byteRange, int64(fileSize)%byteRange, true)
-	verifyValidRanges(t, bucketName, fileName, int64(fileSize)+100, byteRange, 0, true)
+	testValidCases(fileSize, t, bucketName, fileName, false)
 
 	tlogln("Testing invalid cases.")
 	verifyInvalidParams(t, bucketName, fileName, "", "1")
@@ -1294,21 +1264,21 @@ cleanup:
 	}
 }
 
+func testValidCases(fileSize uint64, t *testing.T, bucketName string, fileName string, checkEntireObjCkSum bool) {
+	// Read the entire file range by range
+	// Read in ranges of 500 to test covered, partially covered and completely
+	// uncovered ranges
+	byteRange := int64(500)
+	iterations := int64(fileSize) / byteRange
+	for i := int64(0); i < iterations; i += byteRange {
+		verifyValidRanges(t, bucketName, fileName, int64(i), byteRange, byteRange, checkEntireObjCkSum)
+	}
+	verifyValidRanges(t, bucketName, fileName, byteRange*iterations, byteRange, int64(fileSize)%byteRange, checkEntireObjCkSum)
+	verifyValidRanges(t, bucketName, fileName, int64(fileSize)+100, byteRange, 0, checkEntireObjCkSum)
+}
+
 func verifyValidRanges(t *testing.T, bucketName string, fileName string,
-	offset int64, length int64, expectedLength int64, validateChecksum bool) {
-	q := url.Values{}
-	q.Add(dfc.URLParamOffset, strconv.FormatInt(offset, 10))
-	q.Add(dfc.URLParamLength, strconv.FormatInt(length, 10))
-	var b bytes.Buffer
-	w := bufio.NewWriter(&b)
-	_, _, err := client.GetFileWithQuery(proxyurl, bucketName, RangeGetStr+"/"+fileName, nil, nil, true, validateChecksum, w, q)
-	if err != nil {
-		t.Errorf("Failed to get object %s/%s! Error: %v", bucketName, fileName, err)
-	}
-	err = w.Flush()
-	if err != nil {
-		t.Errorf("Unable to flush read bytes to buffer. Error:  %v", err)
-	}
+	offset int64, length int64, expectedLength int64, checkEntireObjCksum bool) {
 	var fqn string
 	fsWalkFunc := func(path string, info os.FileInfo, err error) error {
 		if filepath.Base(path) == fileName && strings.Contains(path, bucketName) {
@@ -1317,11 +1287,45 @@ func verifyValidRanges(t *testing.T, bucketName string, fileName string,
 		return nil
 	}
 	filepath.Walk(rootDir, fsWalkFunc)
-	file, err := os.Open(fqn)
-	defer file.Close()
+
+	q := url.Values{}
+	q.Add(dfc.URLParamOffset, strconv.FormatInt(offset, 10))
+	q.Add(dfc.URLParamLength, strconv.FormatInt(length, 10))
+	var b bytes.Buffer
+	w := bufio.NewWriter(&b)
+	_, _, err := client.GetFileWithQuery(proxyurl, bucketName, RangeGetStr+"/"+fileName, nil, nil, true, true, w, q)
 	if err != nil {
-		t.Errorf("Unable to open file: %s. Error:  %v", fqn, err)
+		if !checkEntireObjCksum {
+			t.Errorf("Failed to get object %s/%s! Error: %v", bucketName, fileName, err)
+		} else {
+			if ckErr, ok := err.(client.InvalidCksumError); ok {
+				file, err := os.Open(fqn)
+				if err != nil {
+					t.Fatalf("Unable to open file: %s. Error:  %v", fqn, err)
+				}
+				defer file.Close()
+				hash, errstr := dfc.ComputeXXHash(file, nil)
+				if errstr != "" {
+					t.Errorf("Unable to compute cksum of file: %s. Error:  %s", fqn, errstr)
+				}
+				if hash != ckErr.ExpectedHash {
+					t.Errorf("Expected entire object checksum [%s], checksum returned in response [%s]", ckErr.ExpectedHash, hash)
+				}
+			} else {
+				t.Errorf("Unexpected error returned [%v].", err)
+			}
+		}
 	}
+	err = w.Flush()
+	if err != nil {
+		t.Errorf("Unable to flush read bytes to buffer. Error:  %v", err)
+	}
+
+	file, err := os.Open(fqn)
+	if err != nil {
+		t.Fatalf("Unable to open file: %s. Error:  %v", fqn, err)
+	}
+	defer file.Close()
 	outputBytes := b.Bytes()
 	sectionReader := io.NewSectionReader(file, offset, length)
 	expectedBytesBuffer := new(bytes.Buffer)
@@ -1365,7 +1369,6 @@ func Test_checksum(t *testing.T) {
 		bucket      = clibucket
 		start, curr time.Time
 		duration    time.Duration
-		htype       string
 		numPuts     = 5
 		filesize    = uint64(largefilesize * 1024 * 1024)
 		sgl         *dfc.SGLIO
@@ -1383,17 +1386,14 @@ func Test_checksum(t *testing.T) {
 	cksumconfig := config["cksum_config"].(map[string]interface{})
 	ocoldget := cksumconfig["validate_checksum_cold_get"].(bool)
 	ochksum := cksumconfig["checksum"].(string)
-	if ochksum == dfc.ChecksumXXHash {
-		htype = ochksum
-	}
 
 	if usingSG {
 		sgl = dfc.NewSGLIO(filesize)
 		defer sgl.Free()
 	}
 
-	putRandomFiles(0, 0, filesize, int(numPuts), bucket, t, nil, errch, filesput, ldir,
-		ChksumValidStr, htype, true, sgl)
+	putRandomFiles(0, filesize, int(numPuts), bucket, t, nil, errch, filesput, ldir,
+		ChksumValidStr, true, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput) // to exit for-range
 	for fname := range filesput {

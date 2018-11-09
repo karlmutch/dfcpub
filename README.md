@@ -1,75 +1,120 @@
-DFC: Distributed File Cache with Amazon and Google Cloud backends
+DFC: Distributed File Cache with Amazon and Google Cloud Backends
 -----------------------------------------------------------------
 
 ## Overview
 
-DFC is a simple distributed caching service written in Go. The service
-consists of arbitrary number of gateways (realized as http **proxy** servers),
-and any number of storage **targets** utilizing local disks:
+DFC is a simple distributed caching service written in Go. The service consists of an arbitrary numbers of gateways (realized as HTTP **proxy** servers) and storage **targets** utilizing local disks:
 
 <img src="images/dfc-overview-mp.png" alt="DFC overview" width="480">
 
-Users connect to the proxies and execute RESTful commands. Data then moves
-directly between storage targets that cache this data and the requesting http(s) clients.
+Users connect to the proxies and execute RESTful commands. Data then moves directly between storage targets that cache this data and the requesting HTTP(S) clients.
+
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Getting Started](#getting-started)
+  * [Quick trial start with Docker](#quick-trial-start-with-docker)
+  * [Quick trial start with DFC as an HTTP proxy](#quick-trial-start-with-dfc-as-an-http-proxy)
+  * [Regular installation](#regular-installation)
+  * [A few tips](#a-few-tips)
+- [Helpful Links: Go](#helpful-links-go)
+- [Helpful Links: AWS](#helpful-links-aws)
+- [Configuration](#configuration)
+  * [Disabling extended attributes](#disabling-extended-attributes)
+  * [Enabling HTTPS](#enabling-https)
+  * [Filesystem Health Checker](#filesystem-health-checker)
+- [REST Operations](#rest-operations)
+- [List Bucket](#list-bucket)
+- [Cache Rebalancing](#cache-rebalancing)
+- [List/Range Operations](#listrange-operations)
+- [Joining a Running Cluster](#joining-a-running-cluster)
+- [Highly Available Control Plane](#highly-available-control-plane)
+  * [Bootstrap](#bootstrap)
+  * [Election](#election)
+  * [Non-electable gateways](#non-electable-gateways)
+- [WebDAV](#webdav)
+- [Extended Actions](#extended-actions-xactions)
+- [Multi-tiering](#multi-tiering)
+- [Command-line Load Generator](#command-line-load-generator)
+- [Metrics with StatsD](#metrics-with-statsd)
+
 
 ## Prerequisites
 
-* Linux or Mac
-* Go 1.8 or later
+* Linux (with sysstat and attr packages)
+* [Go 1.9 or later](https://golang.org/dl/)
 * Optionally, extended attributes (xattrs)
 * Optionally, Amazon (AWS) or Google Cloud (GCP) account
 
-The capability called [extended attributes](https://en.wikipedia.org/wiki/Extended_file_attributes),
-or xattrs, is currently supported by all mainstream filesystems. Unfortunately, xattrs may not
-always be enabled in the OS kernel (configurations) - the fact that can be easily
-found out by running setfattr (Linux) or xattr (macOS) command as shown in this
-[single-host local deployment script](dfc/setup/deploy.sh).
-If this is the case - that is, if you happen not to have xattrs handy, you can configure DFC
-not to use them at all (section **Configuration** below).
+Some Linux distributions do not include sysstat and/or attr packages - to install, use 'apt-get' (Debian), 'yum' (RPM), or other applicable package management tool, e.g.:
 
-To get started, it is also optional (albeit desirable) to have access to an Amazon S3 or GCP bucket.
-If you don't have Amazon and/or Google Cloud accounts, you can use DFC local buckets as illustrated
-a) in the **API** section below and b) in the [test sources](dfc/tests/regression_test.go).
-Note that local and Cloud-based buckets support the same API with minor exceptions
-(only local buckets can be renamed, for instance).
+```shell
+$ apt-get install sysstat
+$ apt-get install attr
+```
+
+The capability called [extended attributes](https://en.wikipedia.org/wiki/Extended_file_attributes), or xattrs, is currently supported by all mainstream filesystems. Unfortunately, xattrs may not always be enabled in the OS kernel configurations - the fact that can be easily found out by running setfattr (Linux) or xattr (macOS) command as shown in this [single-host local deployment script](dfc/setup/deploy.sh).
+
+If this is the case - that is, if you happen not to have xattrs handy, you can configure DFC not to use them at all (section **Configuration** below).
+
+To get started, it is also optional (albeit desirable) to have access to an Amazon S3 or GCP bucket. If you don't have or don't want to use Amazon and/or Google Cloud accounts - or if you simply deploy DFC as a non-redundant object store - you can use so caled *local buckets* as illustrated:
+
+a) in the [REST Operations](#rest-operations) section below, and
+b) in the [test sources](dfc/tests/regression_test.go)
+
+Note that local and Cloud-based buckets support the same API with minor exceptions (only local buckets can be renamed, for instance).
 
 ## Getting Started
 
-### Quick start with Docker
+### Quick trial start with Docker
 
 To get started quickly with a containerized, one-proxy, one-target deployment of DFC, see [Getting started quickly with DFC using Docker](docker/quick_start/README.md).
 
+### Quick trial start with DFC as an HTTP proxy
+
+1. Set the field `use_as_proxy` to `true` in  [the configuration](dfc/setup/config.sh) prior to deployment.
+2. Set the environment variable `http_proxy` (supported by most UNIX systems) to the primary proxy URL of your DFC cluster.
+
+```shell
+$ export http_proxy=<PRIMARY-PROXY-URL>
+```
+
+When these two are set, DFC will act as a reverse proxy for your outgoing HTTP requests. _Note that this should only be used for a quick trial of DFC, and not for production systems_.
+
 ### Regular installation
 
-If you've already installed Go and [dep](https://github.com/golang/dep), getting started with DFC takes about 30 seconds:
+If you've already installed [Go](https://golang.org/dl/) and [dep](https://github.com/golang/dep), getting started with DFC takes about 30 seconds:
 
-```
+```shell
+$ cd $GOPATH/src
 $ go get -u -v github.com/NVIDIA/dfcpub/dfc
-$ cd $GOPATH/src/github.com/NVIDIA/dfcpub/dfc
+$ cd github.com/NVIDIA/dfcpub/dfc
 $ dep ensure
 $ make deploy
-$ go test ./tests -v -run=down -numfiles=2 -bucket=<your bucket name>
+$ BUCKET=<your bucket name> go test ./tests -v -run=down -numfiles=2
 ```
 
-The 1st and 3rd commands will install the DFC source code and all its versioned dependencies
-under your configured $GOPATH.
+The `go get` command will install the DFC source code and all its versioned dependencies under your configured [$GOPATH](https://golang.org/cmd/go/#hdr-GOPATH_environment_variable).
 
-The 4th - deploys DFC daemons locally (for details, please see [the script](dfc/setup/deploy.sh)). If you want to enable optional DFC authentication server(AuthN) execute instead:
+The `make deploy` command deploys DFC daemons locally (for details, please see [the script](dfc/setup/deploy.sh)). If you'd want to enable optional DFC authentication server, execute instead:
 
-```
+```shell
 $ CREDDIR=/tmp/creddir AUTHENABLED=true make deploy
 
 ```
-For more details about AuthN server please see [AuthN documetation](./authn/README.md)
+For information about AuthN server, please see [AuthN documentation](./authn/README.md)
 
-Finally, for the last 4th command to work, you'll need to have a name - the name of a bucket.
-The bucket could be an AWS or GCP based one, or a DFC-own so-called "local bucket".
+Finally, for the last command in the sequence above to work, you'll need to have a name - the bucket name.
+The bucket could be an Amazon or GCP based one, **or** a DFC-own *local bucket*.
 
-Assuming the bucket exists, the 'go test' command above will download 2 (two) objects. Similarly:
+Assuming the bucket exists, the `go test` command above will download two objects.
+
+Similarly, assuming there's a bucket called "myS3bucket", the following command:
 
 
-```
-$ go test ./tests -v -run=download -args -numfiles=100 -match='a\d+' -bucket=myS3bucket
+```shell
+$ BUCKET=myS3bucket go test ./tests -v -run=download -args -numfiles=100 -match='a\d+'
 ```
 
 downloads up to 100 objects from the bucket called myS3bucket, whereby names of those objects
@@ -79,6 +124,43 @@ For more testing commands and command line options, please refer to the correspo
 [README](dfc/tests/README.md) and/or the [test sources](dfc/tests/).
 
 For other useful commands, see the [Makefile](dfc/Makefile).
+
+### A few tips
+
+The following sequence downloads up to 100 objects from the bucket called "myS3bucket" and then finds the corresponding cached objects locally, in the local and Cloud bucket directories:
+
+```shell
+$ cd $GOPATH/src/github.com/NVIDIA/dfcpub/dfc/tests
+$ BUCKET=myS3bucket go test -v -run=down
+$ find /tmp/dfc -type f | grep local
+$ find /tmp/dfc -type f | grep cloud
+```
+
+This, of course, assumes that all DFC daemons are local and non-containerized (don't forget to run `make deploy` to make it happen) - and that the "test_fspaths" sections in their respective configurations point to the /tmp/dfc.
+
+To show all existing buckets, run:
+
+```shell
+$ cd $GOPATH/src/github.com/NVIDIA/dfcpub
+$ BUCKET=x go test ./dfc/tests -v -run=bucketnames
+```
+
+Note that the output will include both local and Cloud bucket names.
+
+Further, to locate DFC logs, run:
+
+```shell
+$ find $LOGDIR -type f | grep log
+```
+
+where $LOGDIR is the configured logging directory as per [DFC configuration](dfc/setup/config.sh).
+
+
+To terminate a running DFC service and cleanup local caches, run:
+```shell
+$ make kill
+$ make rmcache
+```
 
 ## Helpful Links: Go
 
@@ -110,59 +192,33 @@ and
 
 <img src="images/dfc-config-2-commented.png" alt="DFC configuration: local filesystems" width="548">
 
+As shown above, the "test_fspaths" section of the configuration corresponds to a single local filesystem being partitioned between both local and Cloud buckets. In production deployments, we use the (alternative) "fspaths" section that includes a number of local directories, whereby each directory is based on a different local filesystem. An example of 12 fspaths (and 12 local filesystems) follows below:
+
+<img src="images/example-12-fspaths-config.png" alt="Example: 12 fspaths" width="160">
+
 ### Disabling extended attributes
 
-To make sure that DFC does not utilize xattrs, configure "checksum"="none" and "versioning"="none" for all
-targets in a DFC cluster. This can be done via the [common configuration "part"](dfc/setup/config.sh)
-that'd be further used to deploy the cluster.
+To make sure that DFC does not utilize xattrs, configure "checksum"="none" and "versioning"="none" for all targets in a DFC cluster. This can be done via the [common configuration "part"](dfc/setup/config.sh) that'd be further used to deploy the cluster.
 
 ### Enabling HTTPS
 
-To switch from HTTP protocol to an encrypted HTTPS, configure "use_https"="true" and modify
-"server_certificate" and "server_key" values so they point to your OpenSSL cerificate and key
-files respectively.
+To switch from HTTP protocol to an encrypted HTTPS, configure "use_https"="true" and modify "server_certificate" and "server_key" values so they point to your OpenSSL cerificate and key files respectively (see [DFC configuration](dfc/setup/config.sh)).
 
-## Miscellaneous
+### Filesystem Health Checker
 
-The following sequence downloads 100 objects from the bucket called "myS3bucket":
+Default installation enables filesystem health checker component called FSHC. FSHC can be also disabled via section "fschecker" of the [configuration](dfc/setup/config.sh).
 
-```
-$ go test -v -run=down -bucket=myS3bucket
-```
+When enabled, FSHC gets notified on every I/O error upon which it performs extensive checks on the corresponding local filesystem. One possible outcome of this health-checking process is that FSHC disables the faulty filesystems leaving the target with one filesystem less to distribute incoming data.
 
-and then finds the corresponding cached objects in the local bucket and cloud buckets, respectively:
-
-```
-$ find /tmp/dfc -type f | grep local
-$ find /tmp/dfc -type f | grep cloud
-```
-
-This, of course, assumes that all DFC daemons are local and non-containerized
- - don't forget to run 'make deploy' to make it happen - and that the "test_fspaths"
-section in their respective configurations points to the /tmp/dfc directory
-(see section **Configuration** for details).
-
-Further, to locate all the logs, run:
-
-```
-$ find $LOGDIR -type f | grep log
-```
-
-where $LOGDIR is the configured logging directory as per [DFC configuration](dfc/setup/config.sh).
+Please see [FSHC readme](./fshc.md) for further details.
 
 
-To terminate a running DFC service and cleanup local caches, run:
-```
-$ make kill
-$ make rmcache
-```
-
-## REST operations
+## REST Operations
 
 
 DFC supports a growing number and variety of RESTful operations. To illustrate common conventions, let's take a look at the example:
 
-```
+```shell
 $ curl -X GET http://localhost:8080/v1/daemon?what=config
 ```
 
@@ -244,7 +300,7 @@ ___
 
 ### Example: querying runtime statistics
 
-```
+```shell
 $ curl -X GET http://localhost:8080/v1/cluster?what=stats
 ```
 
@@ -258,7 +314,7 @@ More usage examples can be found in the [the source](dfc/tests/regression_test.g
 
 The ListBucket API returns a page of object names (and, optionally, their properties including sizes, creation times, checksums, and more), in addition to a token allowing the next page to be retrieved.
 
-### properties-and-options
+#### properties-and-options
 The properties-and-options specifier must be a JSON-encoded structure, for instance '{"props": "size"}' (see examples). An empty structure '{}' results in getting just the names of the objects (from the specified bucket) with no other metadata.
 
 | Property/Option | Description | Value |
@@ -271,11 +327,11 @@ The properties-and-options specifier must be a JSON-encoded structure, for insta
 
  <a name="ft6">6</a>: The objects that exist in the Cloud but are not present in the DFC cache will have their atime property empty (""). The atime (access time) property is supported for the objects that are present in the DFC cache. [↩](#a6)
 
-### Example: listing local and Cloud buckets
+#### Example: listing local and Cloud buckets
 
 To list objects in the smoke/ subdirectory of a given bucket called 'myBucket', and to include in the listing their respective sizes and checksums, run:
 
-```
+```shell
 $ curl -X POST -L -H 'Content-Type: application/json' -d '{"action": "listobjects", "value":{"props": "size, checksum", "prefix": "smoke/"}}' http://localhost:8080/v1/buckets/myBucket
 ```
 
@@ -285,7 +341,7 @@ This request will produce an output that (in part) may look as follows:
 
 For many more examples, please refer to the [test sources](dfc/tests/) in the repository.
 
-### Example: Listing All Pages
+#### Example: Listing all pages
 
 The following Go code retrieves a list of all of object names from a named bucket (note: error handling omitted):
 
@@ -337,7 +393,7 @@ DFC provides two APIs to operate on groups of objects: List, and Range. Both of 
 | deadline | The amount of time before the request expires formatted as a [golang duration string](https://golang.org/pkg/time/#ParseDuration). A timeout of 0 means no timeout.| 0 |
 | wait | If true, a response will be sent only when the operation completes or the deadline passes. When false, a response will be sent once the operation is initiated. When setting wait=true, ensure your request has a timeout at least as long as the deadline. | false |
 
-### List
+#### List
 
 List APIs take a JSON array of object names, and initiate the operation on those objects.
 
@@ -345,7 +401,7 @@ List APIs take a JSON array of object names, and initiate the operation on those
 | --- | --- |
 | objnames | JSON array of object names |
 
-### Range
+#### Range
 
 Range APIs take an optional prefix, a regular expression, and a numeric range. A matching object name will begin with the prefix and contain a number that satisfies both the regex and the range as illustrated below.
 
@@ -357,36 +413,77 @@ Range APIs take an optional prefix, a regular expression, and a numeric range. A
 | range | Represented as "min:max", corresponding to the inclusive range from min to max. Either or both of min and max may be empty strings (""), in which case they will be ignored. If regex is an empty string, range will be ignored. |
 
 #### Examples
+
 | Prefix | Regex |  Escaped Regex | Range | Matches<br>(the match is highlighted) | Doesn't Match |
 | --- | --- | --- | --- | --- | --- |
 | "__tst/test-" | `"\d22\d"` | `"\\d22\\d"` | "1000:2000" | "__tst/test-`1223`"<br>"__tst/test-`1229`-4000.dat"<br>"__tst/test-1111-`1229`.dat"<br>"__tst/test-`1222`2-40000.dat" | "__prod/test-1223"<br>"__tst/test-1333"<br>"__tst/test-2222-4000.dat" |
 | "a/b/c" | `"^\d+1\d"` | `"^\\d+1\\d"` | ":100000" | "a/b/c/`110`"<br>"a/b/c/`99919`-200000.dat"<br>"a/b/c/`2314`video-big" | "a/b/110"<br>"a/b/c/d/110"<br>"a/b/c/video-99919-20000.dat"<br>"a/b/c/100012"<br>"a/b/c/30331" |
 
-## Multiple Proxies
+## Joining a Running Cluster
 
-DFC can be run with multiple proxies. When there are multiple proxies, one of them is the primary proxy, and any others are secondary proxies. The primary proxy is the only one allowed to be used for actions related to the Smap (Registration, Local Bucket actions). The URL of the current primary proxy must be specified in the config file at the time a proxy or target is run. On startup, a proxy will start as Primary if the environment variable DFCPRIMARYPROXY is set to any non-empty string. If it is unset, it will start as primary if its id matches the id of the current primary proxy in the configuration file, unless the command line variable -proxyurl is set.
+DFC clusters can be deployed with an arbitrary number of DFC proxies. Each proxy/gateway provides full access to the clustered objects and collaborates with all other proxies to perform majority-voted HA failovers (section [Highly Available Control Plane](#highly-available-control-plane) below).
 
-When any target or proxy discovers that the primary proxy is not working (because a keepalive fails), they intitiate a vote to determine the next primary proxy.
-The election process is as follows:
+Not all proxies are equal though. Two out of all proxies can be designated via [DFC configuration](dfc/setup/config.sh)) as an "original" and a "discovery." The "original" one (located at the configurable "original_url") is expected to point to the primary at the cluster initial deployment time.
 
-- A candidate is selected via Highest Random Weight
-- That candidate is notified that an election is beginning
-- After the candidate confirms that the current primary proxy is down, it sends vote requests to all other proxies/targets
-- Each recipient responds affirmatively if they have not recently communicated with the primary proxy, and the candidate proxy has the Highest Random Weight according to their local Smap.
-- If the candidate receives a majority of affirmative responses it sends a confirmation message to all other targets and proxies and becomes the primary proxy.
-- Upon reception of the confirmation message, a recipient removes the previous primary proxy from their local Smap, and updates the primary proxy to the winning candidate.
+Later on, when and if an HA event triggers automated failover, the role of the primary will be automatically assumed by a different proxy/gateway, with the corresponding cluster map (Smap) update getting synchronized across all running nodes.
 
-### Proxy Startup Process
+A new node, however, could potentially experience a problem when trying to join an already deployed and running cluster - simply because its configuration may still be referring to the old primary. The "discovery_url" (see [DFC configuration](dfc/setup/config.sh)) is precisely intended to address this scenario.
 
-While it is running, a proxy persists the cluster map when it changes, loading it as the discovery cluster map on startup. When a proxy starts up as primary, it performs the following process:
+Here's how a new node joins a running DFC cluster:
 
-- It requests the cluster map from each proxy and target in the union of the current cluster map and the discovery cluster map.
-- If any target or proxy signaled that a vote is in progress, it waits a short time, and restarts the process.
-- If not, it picks the cluster map with the maximum version to be the current cluster map.
-- If it is the primary proxy in that cluster map: It continues as primary.
-- If it is not the primary proxy in that cluster map: It registers to the primary proxy from that cluster map, becoming non-primary.
+- first, there's the primary proxy/gateway referenced by the current cluster map (Smap) and/or - during the cluster deployment time - by the configured "primary_url" (see [DFC configuration](dfc/setup/config.sh))
 
-This process allows a proxy to be rerun with the same command and environment variables, even if it should no longer be primary.
+- if joining via the "primary_url" fails, then the new node goes ahead and tries the alternatives:
+  - "discovery_url"
+  - "original_url"
+- but only if those are defined and different from the previously tried.
+
+## Highly Available Control Plane
+
+DFC cluster will survive a loss of any storage target and any gateway including the primary gateway (leader). New gateways and targets can join at any time – including the time of electing a new leader. Each new node joining a running cluster will get updated with the most current cluster-level metadata.
+Failover – that is, the election of a new leader – is carried out automatically on failure of the current/previous leader. Failback on the hand – that is, administrative selection of the leading (likely, an originally designated) gateway – is done manually via DFC REST API (section [REST Operations](#rest-operations)).
+
+It is, therefore, recommended that DFC cluster is deployed with multiple proxies aka gateways (the terms that are interchangeably used throughout the source code and this README).
+
+When there are multiple proxies, only one of them acts as the primary while all the rest are, respectively, non-primaries. The primary proxy's (primary) responsibility is serializing updates of the cluster-level metadata (which is also versioned and immutable).
+
+Further:
+
+- Each proxy/gateway stores a local copy of the cluster map (Smap)
+- Each Smap instance is immutable and versioned; the versioning is monotonic (increasing)
+- Only the current primary (leader) proxy distributes Smap updates to all other clustered nodes
+
+### Bootstrap
+
+The proxy's bootstrap sequence initiates by executing the following three main steps:
+
+- step 1: load a local copy of the cluster map and try to use it for the discovery of the current one;
+- step 2: use the local configuration and the local Smap to perform the discovery of the cluster-level metadata;
+- step 3: use all of the above _and_ the environment setting "DFCPRIMARYPROXY" to figure out whether this proxy must keep starting up as a primary (otherwise, join as a non-primary).
+
+Further, the (potentially) primary proxy executes more steps:
+
+- (i)    initialize empty Smap;
+- (ii)   wait a configured time for other nodes to join;
+- (iii)  merge the Smap containing newly joined nodes with the Smap that was previously discovered;
+- (iiii) and use the latter to rediscover cluster-wide metadata and resolve remaining conflicts, if any.
+
+If during any of these steps the proxy finds out that it must be joining as a non-primary then it simply does so.
+
+### Election
+
+The primary proxy election process is as follows:
+
+- A candidate to replace the current (failed) primary is selected;
+- The candidate is notified that an election is commencing;
+- After the candidate (proxy) confirms that the current primary proxy is down, it broadcasts vote requests to all other nodes;
+- Each recipient node confirms whether the current primary is down and whether the candidate proxy has the HRW (Highest Random Weight) according to the local Smap;
+- If confirmed, the node responds with Yes, otherwise it's a No;
+- If and when the candidate receives a majority of affirmative responses it performs the commit phase of this two-phase process by distributing an updated cluster map to all nodes.
+
+### Non-electable gateways
+
+DFC cluster can be *stretched* to collocate its redundant gateways with the compute nodes. Those non-electable local gateways ([DFC configuration](dfc/setup/config.sh)) will only serve as access points but will never take on the responsibility of leading the cluster.
 
 ## WebDAV
 
@@ -394,9 +491,11 @@ WebDAV aka "Web Distributed Authoring and Versioning" is the IETF standard that 
 
 For information on how to run it and details, please refer to the [WebDAV README](webdav/README.md).
 
-## Extended Action (xaction)
+## Extended Actions (xactions)
 
-Extended actions (xactions) are the operations that may take seconds, sometimes even minutes, to execute, that run asynchronously, have one of the enumerated kinds, start/stop times, and xaction-specific statistics.
+Extended actions (xactions) are the operations that may take seconds, sometimes minutes or even hours, to execute. Xactions run asynchronously, have one of the enumerated kinds, start/stop times, and xaction-specific statistics.
+
+Extended actions throttle themselves based on xaction-specific configurable watermarks and local system utilizations. Extended action that runs LRU-based evictions, for instance, will perform the "balancing act" (of running faster or slower) by taking into account remaining free local capacity as well as the current target's utilization.
 
 Examples of the supported extended actions include:
 
@@ -405,11 +504,16 @@ Examples of the supported extended actions include:
 * Prefetch
 * Consensus voting when electing a new leader
 
-At the time of this writing the corresponding RESTful API can query two xaction kinds: "rebalance" and "prefetch". The following command, for instance, will query the cluster for an active/pending rebalancing operation (if presently running), and report associated statistics:
+At the time of this writing the corresponding RESTful API (section [REST Operations](#rest-operations)) includes support for querying two xaction kinds: "rebalance" and "prefetch". The following command, for instance, will query the cluster for an active/pending rebalancing operation (if presently running), and report associated statistics:
 
-```
+```shell
 $ curl -X GET http://localhost:8080/v1/cluster?what=xaction&props=rebalance
 ```
+
+### Throttling of Xactions
+DFC supports throttling Xactions based on disk utilization. This is governed by two parameters in the [configuration file](dfc/setup/config.sh) - 'disk_util_low_wm' and 'disk_util_high_wm'. If the disk utilization is below the low watermark then the xaction is not throttled; if it is above the watermark, the xaction is throttled with a sleep duration which increases or decreases linearly with the disk utilization. The throttle duration maxes out at 1 second.
+
+At the time of this writing, only LRU supports throttling.
 
 ## Multi-tiering
 
@@ -419,7 +523,7 @@ DFC can be deployed with multiple consecutive DFC clusters aka "tiers" sitting b
 
 Tiering is configured at the bucket level by setting bucket properties, for example:
 
-```
+```shell
 $ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops", "value": {"next_tier_url": "http://localhost:8082", "read_policy": "cloud", "write_policy": "next_tier"}}' 'http://localhost:8080/v1/buckets/<bucket-name>'
 ```
 
@@ -438,9 +542,106 @@ Currently, the endpoints which support multi-tier policies are the following:
 * GET /v1/objects/bucket-name/object-name
 * PUT /v1/objects/bucket-name/object-name
 
-## DFC Limitations
+## Command-line Load Generator
 
-- The current primary proxy is determined at startup, through either the configuration file or the -proxyurl command line variable. This means that if the primary proxy changes, the configuration file of any new targets joining the cluster must change. This limitation does not apply to targets that are a part of the cluster when the primary proxy changes, fails, or rejoins.
-- DFC does not currently handle the case where the primary proxy and the next highest random weight proxy both fail at the same time, so this will result in no new primary proxy being chosen.
-- Currently, only the candidate primary proxy keeps track of the fact that a vote is happening. This means that if the candidate primary proxy is not in the discovery cluster map when a proxy starts up, a proxy may start as primary at the same time as an election completes, changing the primary proxy.
+`dfcloader` is a command-line tool that is included with DFC and that can be immediately used to generate load and evaluate cluster performance.
 
+For usage, run `$ dfcloader -help` or see [the source](cmd/dfcloader/main.go) for usage examples.
+
+## Metrics with StatsD
+
+In DFC, each target and proxy communicates with a single [StatsD](https://github.com/etsy/statsd) local daemon listening on a UDP port `8125` (which is currently fixed). If a target or proxy cannot connect to the StatsD daemon at startup, the target (or proxy) will run without StatsD.
+
+StatsD publishes local statistics to a compliant backend service (e.g., [graphite](https://graphite.readthedocs.io/en/latest/)) for easy but powerful stats aggregation and visualization.
+
+Please read more on StatsD [here](https://github.com/etsy/statsd/blob/master/docs/backend.md).
+
+All metric tags (or simply, metrics) are logged using the following pattern:
+
+`prefix.bucket.metric_name.metric_value|metric_type`,
+
+where `prefix` is one of: `dfcproxy.<daemon_id>`, `dfctarget.<daemon_id>`, or `dfcloader.<ip>.<loader_id>` and `metric_type` is `ms` for a timer, `c` for a counter, and `g` for a gauge.
+
+Metrics that DFC generates are named and grouped as follows:
+
+#### Proxy metrics:
+
+* `dfcproxy.<daemon_id>.get.count.1|c`
+* `dfcproxy.<daemon_id>.get.latency.<value>|ms`
+* `dfcproxy.<daemon_id>.put.count.1|c`
+* `dfcproxy.<daemon_id>.put.latency.<value>|ms`
+* `dfcproxy.<daemon_id>.delete.count.1|c`
+* `dfcproxy.<daemon_id>.list.count.1|c`
+* `dfcproxy.<daemon_id>.list.latency.<value>|ms`
+* `dfcproxy.<daemon_id>.rename.count.1|c`
+* `dfcproxy.<daemon_id>.cluster_post.count.1|c`
+
+#### Target Metrics
+
+* `dfctarget.<daemon_id>.get.count.1|c`
+* `dfctarget.<daemon_id>.get.latency.<value>|ms`
+* `dfctarget.<daemon_id>.get.cold.count.1|c`
+* `dfctarget.<daemon_id>.get.cold.bytesloaded.<value>|c`
+* `dfctarget.<daemon_id>.get.cold.vchanged.<value>|c`
+* `dfctarget.<daemon_id>.get.cold.bytesvchanged.<value>|c`
+* `dfctarget.<daemon_id>.put.count.1|c`
+* `dfctarget.<daemon_id>.put.latency.<value>|ms`
+* `dfctarget.<daemon_id>.delete.count.1|c`
+* `dfctarget.<daemon_id>.list.count.1|c`
+* `dfctarget.<daemon_id>.list.latency.<value>|ms`
+* `dfctarget.<daemon_id>.rename.count.1|c`
+* `dfctarget.<daemon_id>.evict.files.1|c`
+* `dfctarget.<daemon_id>.evict.bytes.<value>|c`
+* `dfctarget.<daemon_id>.rebalance.receive.files.1|c`
+* `dfctarget.<daemon_id>.rebalance.receive.bytes.<value>|c`
+* `dfctarget.<daemon_id>.rebalance.send.files.1|c`
+* `dfctarget.<daemon_id>.rebalance.send.bytes.<value>|c`
+* `dfctarget.<daemon_id>.error.badchecksum.xxhash.count.1|c`
+* `dfctarget.<daemon_id>.error.badchecksum.xxhash.bytes.<value>|c`
+* `dfctarget.<daemon_id>.error.badchecksum.md5.count.1|c`
+* `dfctarget.<daemon_id>.error.badchecksum.md5.bytes.<value>|c`
+
+Example of how these metrics show up in a grafana dashboard:
+
+<img src="images/target-statsd-grafana.png" alt="Target Metrics" width="256">
+
+
+#### Disk Metrics
+
+* `dfctarget.<daemon_id>.iostat_*.gauge.<value>|g`
+
+#### Keepalive Metrics
+
+* `<prefix>.keepalive.heartbeat.<id>.delta.<value>|g`
+* `<prefix>.keepalive.heartbeat.<id>.count.1|c`
+* `<prefix>.keepalive.average.<id>.delta.<value>|g`
+* `<prefix>.keepalive.average.<id>.count.1|c`
+* `<prefix>.keepalive.average.<id>.reset.1|c`
+
+#### dfcloader Metrics
+
+* `dfcloader.<ip>.<loader_id>.get.pending.<value>|g`
+* `dfcloader.<ip>.<loader_id>.get.count.1|c`
+* `dfcloader.<ip>.<loader_id>.get.latency.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.throughput.<value>|c`
+* `dfcloader.<ip>.<loader_id>.get.latency.proxyconn.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.proxy.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.targetconn.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.target.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.posthttp.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.proxyheader.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.proxyrequest.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.proxyresponse.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.targetheader.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.targetrequest.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.latency.targetresponse.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.get.error.1|c`
+* `dfcloader.<ip>.<loader_id>.put.pending.<value>|g`
+* `dfcloader.<ip>.<loader_id>.put.count.<value>|g`
+* `dfcloader.<ip>.<loader_id>.put.latency.<value>|,s`
+* `dfcloader.<ip>.<loader_id>.put.throughput.<value>|c`
+* `dfcloader.<ip>.<loader_id>.put.error.1|c`
+* `dfcloader.<ip>.<loader_id>.getconfig.count.1|c`
+* `dfcloader.<ip>.<loader_id>.getconfig.latency.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.getconfig.latency.proxyconn.<value>|ms`
+* `dfcloader.<ip>.<loader_id>.getconfig.latency.proxy.<value>|ms`

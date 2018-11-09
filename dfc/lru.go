@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/fs"
+
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 )
 
@@ -27,14 +29,28 @@ type fileInfo struct {
 type fileInfoMinHeap []*fileInfo
 
 type lructx struct {
-	cursize int64
-	totsize int64
-	newest  time.Time
-	xlru    *xactLRU
-	heap    *fileInfoMinHeap
-	oldwork []*fileInfo
-	t       *targetrunner
+	cursize  int64
+	totsize  int64
+	newest   time.Time
+	xlru     *xactLRU
+	heap     *fileInfoMinHeap
+	oldwork  []*fileInfo
+	t        *targetrunner
+	fs       string
+	throttle struct {
+		sleep         time.Duration
+		nextUtilCheck time.Time
+		nextCapCheck  time.Time
+		prevUtilPct   float32
+		prevFSUsedPct uint64
+	}
 }
+
+const (
+	initThrottleSleep  = time.Millisecond
+	maxThrottleSleep   = time.Second
+	fsCapCheckDuration = time.Second * 10
+)
 
 func (t *targetrunner) runLRU() {
 	// FIXME: if LRU config has changed we need to force new LRU transaction
@@ -45,14 +61,17 @@ func (t *targetrunner) runLRU() {
 	fschkwg := &sync.WaitGroup{}
 
 	glog.Infof("LRU: %s started: dont-evict-time %v", xlru.tostring(), ctx.config.LRU.DontEvictTime)
-	for mpath := range ctx.mountpaths.Available {
+
+	// copy available mountpaths
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	for _, mpathInfo := range availablePaths {
 		fschkwg.Add(1)
-		go t.oneLRU(makePathLocal(mpath), fschkwg, xlru)
+		go t.oneLRU(mpathInfo, makePathLocal(mpathInfo.Path), fschkwg, xlru)
 	}
 	fschkwg.Wait()
-	for mpath := range ctx.mountpaths.Available {
+	for _, mpathInfo := range availablePaths {
 		fschkwg.Add(1)
-		go t.oneLRU(makePathCloud(mpath), fschkwg, xlru)
+		go t.oneLRU(mpathInfo, makePathCloud(mpathInfo.Path), fschkwg, xlru)
 	}
 	fschkwg.Wait()
 
@@ -61,11 +80,11 @@ func (t *targetrunner) runLRU() {
 		rr := getstorstatsrunner()
 		rr.Lock()
 		rr.updateCapacity()
-		for mpath := range ctx.mountpaths.Available {
-			fscapacity := rr.Capacity[mpath]
+		for _, mpathInfo := range availablePaths {
+			fscapacity := rr.Capacity[mpathInfo.Path]
 			if fscapacity.Usedpct > ctx.config.LRU.LowWM+1 {
 				glog.Warningf("LRU mpath %s: failed to reach lwm %d%% (used %d%%)",
-					mpath, ctx.config.LRU.LowWM, fscapacity.Usedpct)
+					mpathInfo.Path, ctx.config.LRU.LowWM, fscapacity.Usedpct)
 			}
 		}
 		rr.Unlock()
@@ -77,7 +96,7 @@ func (t *targetrunner) runLRU() {
 }
 
 // TODO: local-buckets-first LRU policy
-func (t *targetrunner) oneLRU(bucketdir string, fschkwg *sync.WaitGroup, xlru *xactLRU) {
+func (t *targetrunner) oneLRU(mpathInfo *fs.MountpathInfo, bucketdir string, fschkwg *sync.WaitGroup, xlru *xactLRU) {
 	defer fschkwg.Done()
 	h := &fileInfoMinHeap{}
 	heap.Init(h)
@@ -86,13 +105,19 @@ func (t *targetrunner) oneLRU(bucketdir string, fschkwg *sync.WaitGroup, xlru *x
 	if err != nil {
 		return
 	}
-	glog.Infof("Initiating LRU for directory: %s. Need to evict: %.2f MB."+
-		" [It is possible that less data gets evicted because of `dont_evict_time` setting in the config.]",
-		bucketdir, float64(toevict)/MiB)
+	glog.Infof("%s: evicting %.2f MB", bucketdir, float64(toevict)/MiB)
 
 	// init LRU context
 	var oldwork []*fileInfo
-	lctx := &lructx{totsize: toevict, xlru: xlru, heap: h, oldwork: oldwork, t: t}
+
+	lctx := &lructx{
+		totsize: toevict,
+		xlru:    xlru,
+		heap:    h,
+		oldwork: oldwork,
+		t:       t,
+		fs:      mpathInfo.FileSystem,
+	}
 
 	if err = filepath.Walk(bucketdir, lctx.lruwalkfn); err != nil {
 		s := err.Error()
@@ -127,6 +152,14 @@ func (lctx *lructx) lruwalkfn(fqn string, osfi os.FileInfo, err error) error {
 			return nil
 		}
 	}
+
+	lctx.computeThrottle(fqn)
+	if lctx.throttle.sleep > 0 {
+		if glog.V(4) {
+			glog.Infof("%s: sleeping %v", fqn, lctx.throttle.sleep)
+		}
+		time.Sleep(lctx.throttle.sleep)
+	}
 	_, err = os.Stat(fqn)
 	if os.IsNotExist(err) {
 		glog.Infof("Warning (LRU race?): %s "+doesnotexist, fqn)
@@ -159,8 +192,12 @@ func (lctx *lructx) lruwalkfn(fqn string, osfi os.FileInfo, err error) error {
 
 	// object eviction: access time
 	usetime := atime
-	if cachedatime, ok := getatimerunner().atime(fqn); ok {
-		usetime = cachedatime
+
+	aTimeRunner := getatimerunner()
+	aTimeRunner.atime(fqn)
+	accessTimeResponse := <-aTimeRunner.chSendAtime
+	if accessTimeResponse.ok {
+		usetime = accessTimeResponse.accessTime
 	} else if mtime.After(atime) {
 		usetime = mtime
 	}
@@ -267,4 +304,58 @@ func (h *fileInfoMinHeap) Pop() interface{} {
 	fi := old[n-1]
 	*h = old[0 : n-1]
 	return fi
+}
+
+func (lctx *lructx) computeThrottle(fqn string) {
+	now := time.Now()
+	usedFSPercentage := lctx.throttle.prevFSUsedPct
+	var ok bool
+	if now.After(lctx.throttle.nextCapCheck) {
+		usedFSPercentage, ok = getFSUsedPercentage(fqn)
+		lctx.throttle.nextCapCheck = now.Add(fsCapCheckDuration)
+		if !ok {
+			glog.Errorf("Unable to retrieve used capacity for fs %s", lctx.fs)
+			lctx.throttle.sleep = 0
+			return
+		}
+		lctx.throttle.prevFSUsedPct = usedFSPercentage
+	}
+
+	if usedFSPercentage >= uint64(ctx.config.LRU.HighWM) {
+		lctx.throttle.sleep = 0
+		return
+	}
+
+	riostat := getiostatrunner()
+	// update disk utilization at the frequency of iostatrunner i.e. once in StatsTime
+	curUtilPct := lctx.throttle.prevUtilPct
+	if now.After(lctx.throttle.nextUtilCheck) {
+		curUtilPct, ok = riostat.maxUtilFS(lctx.fs)
+		lctx.throttle.nextUtilCheck = now.Add(ctx.config.Periodic.StatsTime)
+		if !ok {
+			curUtilPct = lctx.throttle.prevUtilPct
+			glog.Errorf("Unable to retrieve disk utilization for fs %s", lctx.fs)
+		}
+	}
+
+	if curUtilPct > float32(ctx.config.Xaction.DiskUtilHighWM) {
+		if lctx.throttle.sleep < initThrottleSleep {
+			lctx.throttle.sleep = initThrottleSleep
+		} else {
+			lctx.throttle.sleep *= 2
+		}
+	} else if curUtilPct < float32(ctx.config.Xaction.DiskUtilLowWM) {
+		lctx.throttle.sleep = 0
+	} else {
+		if lctx.throttle.sleep < initThrottleSleep {
+			lctx.throttle.sleep = initThrottleSleep
+		}
+		multiplier := (curUtilPct - float32(ctx.config.Xaction.DiskUtilLowWM)) /
+			float32(ctx.config.Xaction.DiskUtilHighWM-ctx.config.Xaction.DiskUtilLowWM)
+		lctx.throttle.sleep = lctx.throttle.sleep + time.Duration(float32(lctx.throttle.sleep)*multiplier)
+	}
+	if lctx.throttle.sleep > maxThrottleSleep {
+		lctx.throttle.sleep = maxThrottleSleep
+	}
+	lctx.throttle.prevUtilPct = curUtilPct
 }

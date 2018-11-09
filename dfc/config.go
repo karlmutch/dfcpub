@@ -59,16 +59,21 @@ type dfconfig struct {
 	Timeout          timeoutconfig     `json:"timeout"`
 	Proxy            proxyconfig       `json:"proxyconfig"`
 	LRU              lruconfig         `json:"lru_config"`
+	Xaction          xactionConfig     `json:"xaction_config"`
 	Rebalance        rebalanceconf     `json:"rebalance_conf"`
 	Cksum            cksumconfig       `json:"cksum_config"`
 	Ver              versionconfig     `json:"version_config"`
 	FSpaths          simplekvs         `json:"fspaths"`
 	TestFSP          testfspathconf    `json:"test_fspaths"`
 	Net              netconfig         `json:"netconfig"`
-	FSKeeper         fskeeperconf      `json:"fskeeper"`
+	FSChecker        fshcconf          `json:"fschecker"`
 	Auth             authconf          `json:"auth"`
 	KeepaliveTracker keepaliveTrackers `json:"keepalivetracker"`
-	CallStats        callStats         `json:"callstats"`
+}
+
+type xactionConfig struct {
+	DiskUtilLowWM  uint32 `json:"disk_util_low_wm"`  // Low watermark below which no throttling is required
+	DiskUtilHighWM uint32 `json:"disk_util_high_wm"` // High watermark above which throttling is required for longer duration
 }
 
 type logconfig struct {
@@ -149,7 +154,6 @@ type l4cnf struct {
 
 type httpcnf struct {
 	MaxNumTargets int    `json:"max_num_targets"`    // estimated max num targets (to count idle conns)
-	UseHTTP2      bool   `json:"use_http2"`          // use HTTP/2 instead of HTTP/1.1
 	UseHTTPS      bool   `json:"use_https"`          // use HTTPS instead of HTTP
 	UseAsProxy    bool   `json:"use_as_proxy"`       // use DFC as an HTTP proxy
 	Certificate   string `json:"server_certificate"` // HTTPS: openssl certificate
@@ -168,12 +172,10 @@ type versionconfig struct {
 	Versioning      string `json:"versioning"`                // types of objects versioning is enabled for: all, cloud, local, none
 }
 
-type fskeeperconf struct {
-	FSCheckTimeStr        string        `json:"fs_check_time"`
-	FSCheckTime           time.Duration `json:"-"` // omitempty
-	OfflineFSCheckTimeStr string        `json:"offline_fs_check_time"`
-	OfflineFSCheckTime    time.Duration `json:"-"` // omitempty
-	Enabled               bool          `json:"fskeeper_enabled"`
+type fshcconf struct {
+	Enabled       bool `json:"fschecker_enabled"`
+	TestFileCount int  `json:"fschecker_test_files"`  // the number of files to read and write during a test
+	ErrorLimit    int  `json:"fschecker_error_limit"` // thresholds of number of errors, exceeding any of them results in disabling a mountpath
 }
 
 type authconf struct {
@@ -187,20 +189,13 @@ type authconf struct {
 type keepaliveTrackerConf struct {
 	IntervalStr string        `json:"interval"` // keepalives are sent(target)/checked(promary proxy) every interval
 	Interval    time.Duration `json:"-"`
-	Name        string        `json:"name"` // "heartbeat", "average"
-	MaxStr      string        `json:"max"`  // "heartbeat" only
-	Max         time.Duration `json:"-"`
+	Name        string        `json:"name"`   // "heartbeat", "average"
 	Factor      int           `json:"factor"` // "average" only
 }
 
 type keepaliveTrackers struct {
 	Proxy  keepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
 	Target keepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
-}
-
-type callStats struct {
-	RequestIncluded []string `json:"request_included"`
-	Factor          float32  `json:"factor"`
 }
 
 //==============================
@@ -281,6 +276,9 @@ func validateconf() (err error) {
 	if ctx.config.Periodic.StatsTime, err = time.ParseDuration(ctx.config.Periodic.StatsTimeStr); err != nil {
 		return fmt.Errorf("Bad stats-time format %s, err: %v", ctx.config.Periodic.StatsTimeStr, err)
 	}
+	if int(ctx.config.Periodic.StatsTime/time.Second) <= 0 {
+		return fmt.Errorf("stats-time refresh period is too low (should be higher than 1 second")
+	}
 	if ctx.config.Periodic.RetrySyncTime, err = time.ParseDuration(ctx.config.Periodic.RetrySyncTimeStr); err != nil {
 		return fmt.Errorf("Bad retry_sync_time format %s, err: %v", ctx.config.Periodic.RetrySyncTimeStr, err)
 	}
@@ -307,17 +305,17 @@ func validateconf() (err error) {
 	if hwm <= 0 || lwm <= 0 || hwm < lwm || lwm > 100 || hwm > 100 {
 		return fmt.Errorf("Invalid LRU configuration %+v", ctx.config.LRU)
 	}
+
+	diskUtilHWM, diskUtilLWM := ctx.config.Xaction.DiskUtilHighWM, ctx.config.Xaction.DiskUtilLowWM
+	if diskUtilHWM <= 0 || diskUtilLWM <= 0 || diskUtilHWM <= diskUtilLWM || diskUtilLWM > 100 || diskUtilHWM > 100 {
+		return fmt.Errorf("Invalid Xaction configuration %+v", ctx.config.Xaction)
+	}
+
 	if ctx.config.Cksum.Checksum != ChecksumXXHash && ctx.config.Cksum.Checksum != ChecksumNone {
 		return fmt.Errorf("Invalid checksum: %s - expecting %s or %s", ctx.config.Cksum.Checksum, ChecksumXXHash, ChecksumNone)
 	}
 	if err := validateVersion(ctx.config.Ver.Versioning); err != nil {
 		return err
-	}
-	if ctx.config.FSKeeper.FSCheckTime, err = time.ParseDuration(ctx.config.FSKeeper.FSCheckTimeStr); err != nil {
-		return fmt.Errorf("Bad FSKeeper fs_check_time format %s, err %v", ctx.config.FSKeeper.FSCheckTimeStr, err)
-	}
-	if ctx.config.FSKeeper.OfflineFSCheckTime, err = time.ParseDuration(ctx.config.FSKeeper.OfflineFSCheckTimeStr); err != nil {
-		return fmt.Errorf("Bad FSKeeper offline_fs_check_time format %s, err %v", ctx.config.FSKeeper.OfflineFSCheckTimeStr, err)
 	}
 	if ctx.config.Timeout.MaxKeepalive, err = time.ParseDuration(ctx.config.Timeout.MaxKeepaliveStr); err != nil {
 		return fmt.Errorf("Bad Timeout max_keepalive format %s, err %v", ctx.config.Timeout.MaxKeepaliveStr, err)
@@ -340,26 +338,16 @@ func validateconf() (err error) {
 		return fmt.Errorf("bad proxy keep alive interval %s", ctx.config.KeepaliveTracker.Proxy.IntervalStr)
 	}
 
-	ctx.config.KeepaliveTracker.Proxy.Max, err = time.ParseDuration(ctx.config.KeepaliveTracker.Proxy.MaxStr)
-	if err != nil {
-		return fmt.Errorf("bad proxy keep alive max %s", ctx.config.KeepaliveTracker.Proxy.MaxStr)
-	}
-
 	ctx.config.KeepaliveTracker.Target.Interval, err = time.ParseDuration(ctx.config.KeepaliveTracker.Target.IntervalStr)
 	if err != nil {
 		return fmt.Errorf("bad target keep alive interval %s", ctx.config.KeepaliveTracker.Target.IntervalStr)
 	}
 
-	ctx.config.KeepaliveTracker.Target.Max, err = time.ParseDuration(ctx.config.KeepaliveTracker.Target.MaxStr)
-	if err != nil {
-		return fmt.Errorf("bad targetkeep alive max %s", ctx.config.KeepaliveTracker.Target.MaxStr)
-	}
-
-	if !IsKeepaliveTypeSupported(ctx.config.KeepaliveTracker.Proxy.Name) {
+	if !ValidKeepaliveType(ctx.config.KeepaliveTracker.Proxy.Name) {
 		return fmt.Errorf("bad proxy keepalive tracker type %s", ctx.config.KeepaliveTracker.Proxy.Name)
 	}
 
-	if !IsKeepaliveTypeSupported(ctx.config.KeepaliveTracker.Target.Name) {
+	if !ValidKeepaliveType(ctx.config.KeepaliveTracker.Target.Name) {
 		return fmt.Errorf("bad target keepalive tracker type %s", ctx.config.KeepaliveTracker.Target.Name)
 	}
 
@@ -393,4 +381,10 @@ func setGLogVModule(v string) error {
 	}
 
 	return err
+}
+
+// testingFSPpath returns true if DFC is running in dev environment, and
+// moreover, all the cluster is running on a single machine
+func testingFSPpaths() bool {
+	return ctx.config.TestFSP.Count > 0
 }

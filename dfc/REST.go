@@ -5,7 +5,10 @@
  */
 package dfc
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ActionMsg is a JSON-formatted control structures
 type ActionMsg struct {
@@ -118,6 +121,20 @@ type SmapVoteMsg struct {
 	BucketMD       *bucketMD `json:"bucketmd"`
 }
 
+// MountpathList contains two lists:
+// * Available - the list of mountpaths that can be utilized by DFC
+// * Disabled - the list of disabled mountpaths, mountpaths that triggered
+//	            IO errors and after extra tests are found faulty
+type MountpathList struct {
+	Available []string `json:"available"`
+	Disabled  []string `json:"disabled"`
+}
+
+// MountpathReq is used in requests to make disabled mountpath an available one
+type MountpathReq struct {
+	Mountpath string `json:"mountpath"`
+}
+
 //===================
 //
 // RESTful GET
@@ -126,12 +143,13 @@ type SmapVoteMsg struct {
 
 // URLParamWhat enum
 const (
-	GetWhatFile     = "file" // { "what": "file" } is implied by default and can be omitted
-	GetWhatConfig   = "config"
-	GetWhatSmap     = "smap"
-	GetWhatStats    = "stats"
-	GetWhatXaction  = "xaction"
-	GetWhatSmapVote = "smapvote"
+	GetWhatFile       = "file" // { "what": "file" } is implied by default and can be omitted
+	GetWhatConfig     = "config"
+	GetWhatSmap       = "smap"
+	GetWhatStats      = "stats"
+	GetWhatXaction    = "xaction"
+	GetWhatSmapVote   = "smapvote"
+	GetWhatMountpaths = "mountpaths"
 )
 
 // GetMsg.GetSort enum
@@ -198,22 +216,23 @@ type BucketNames struct {
 
 // RESTful URL path: /v1/....
 const (
-	Rversion   = "v1"
-	Rbuckets   = "buckets"
-	Robjects   = "objects"
-	Rcluster   = "cluster"
-	Rdaemon    = "daemon"
-	Rsyncsmap  = "syncsmap"
-	Rpush      = "push"
-	Rkeepalive = "keepalive"
-	Rregister  = "register"
-	Rhealth    = "health"
-	Rvote      = "vote"
-	Rproxy     = "proxy"
-	Rvoteres   = "result"
-	Rvoteinit  = "init"
-	Rtokens    = "tokens"
-	Rmetasync  = "metasync"
+	Rversion    = "v1"
+	Rbuckets    = "buckets"
+	Robjects    = "objects"
+	Rcluster    = "cluster"
+	Rdaemon     = "daemon"
+	Rsyncsmap   = "syncsmap"
+	Rpush       = "push"
+	Rkeepalive  = "keepalive"
+	Rregister   = "register"
+	Rhealth     = "health"
+	Rvote       = "vote"
+	Rproxy      = "proxy"
+	Rvoteres    = "result"
+	Rvoteinit   = "init"
+	Rtokens     = "tokens"
+	Rmetasync   = "metasync"
+	Rmountpaths = "mountpaths"
 )
 
 const (
@@ -225,3 +244,11 @@ const (
 	XactionStatusInProgress = "InProgress"
 	XactionStatusCompleted  = "Completed"
 )
+
+// query-able xactions
+func isXactionQueryable(kind string) (errstr string) {
+	if kind == XactionRebalance || kind == XactionPrefetch {
+		return
+	}
+	return fmt.Sprintf("Invalid xaction '%s', expecting one of [%s, %s]", kind, XactionRebalance, XactionPrefetch)
+}

@@ -27,6 +27,10 @@ import (
 
 const tokenStart = "Bearer"
 
+type ClusterMountpathsRaw struct {
+	Targets map[string]json.RawMessage `json:"targets"`
+}
+
 // Keeps a target response when doing parallel requests to all targets
 type bucketResp struct {
 	outjson []byte
@@ -58,28 +62,18 @@ func wrapHandler(h http.HandlerFunc, wraps ...func(http.HandlerFunc) http.Handle
 //===========================================================================
 type proxyrunner struct {
 	httprunner
-	starttime   time.Time
-	smapversion int64
-	xactinp     *xactInProgress
-	syncmapinp  int64
-	statsdC     statsd.Client
-	authn       *authManager
-	startedUp   int64
-	metasyncer  *metasyncer
+	starttime  time.Time
+	xactinp    *xactInProgress
+	statsdC    statsd.Client
+	authn      *authManager
+	startedUp  int64
+	metasyncer *metasyncer
 }
 
 // start proxy runner
 func (p *proxyrunner) run() error {
-	// note: call stats worker has to started before the first call()
-	p.callStatsServer = NewCallStatsServer(
-		ctx.config.CallStats.RequestIncluded,
-		ctx.config.CallStats.Factor,
-		&p.statsdC,
-	)
-	p.callStatsServer.Start()
-
 	p.httprunner.init(getproxystatsrunner(), true)
-	p.httprunner.kalive = getproxykalive()
+	p.httprunner.keepalive = getproxykeepalive()
 
 	p.xactinp = newxactinp()
 
@@ -97,6 +91,7 @@ func (p *proxyrunner) run() error {
 	p.metasyncer = getmetasyncer()
 
 	// startup sequence - see earlystart.go for the steps and commentary
+	assert(p.smapowner.get() == nil)
 	p.bootstrap()
 
 	p.authn = &authManager{
@@ -204,7 +199,6 @@ func (p *proxyrunner) stop(err error) {
 
 	p.statsdC.Close()
 	p.httprunner.stop(err)
-	p.callStatsServer.Stop()
 }
 
 //===========================================================================================
@@ -319,18 +313,8 @@ func (p *proxyrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 	//       on the names, and (not that importantly) the unit is different (ms vs us).
 	delta := time.Since(started)
 	p.statsdC.Send("get",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-		statsd.Metric{
-			Type:  statsd.Timer,
-			Name:  "latency",
-			Value: float64(delta / time.Millisecond),
-		},
-	)
-
+		metric{statsd.Counter, "count", 1},
+		metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 	p.statsif.addMany("numget", int64(1), "getlatency", int64(delta/1000))
 }
 
@@ -360,18 +344,8 @@ func (p *proxyrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
 
 	delta := time.Since(started)
 	p.statsdC.Send("put",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-		statsd.Metric{
-			Type:  statsd.Timer,
-			Name:  "latency",
-			Value: float64(delta / time.Millisecond),
-		},
-	)
-
+		metric{statsd.Counter, "count", 1},
+		metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 	p.statsif.addMany("numput", int64(1), "putlatency", int64(delta/1000))
 }
 
@@ -435,14 +409,7 @@ func (p *proxyrunner) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 		glog.Infof("%s %s/%s => %s", r.Method, bucket, objname, si.DaemonID)
 	}
 
-	p.statsdC.Send("delete",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-	)
-
+	p.statsdC.Send("delete", metric{statsd.Counter, "count", 1})
 	p.statsif.add("numdelete", 1)
 	http.Redirect(w, r, redirecturl, http.StatusTemporaryRedirect)
 }
@@ -541,18 +508,8 @@ func (p *proxyrunner) listBucketAndCollectStats(w http.ResponseWriter,
 	if ok {
 		delta := time.Since(started)
 		p.statsdC.Send("list",
-			statsd.Metric{
-				Type:  statsd.Counter,
-				Name:  "count",
-				Value: 1,
-			},
-			statsd.Metric{
-				Type:  statsd.Timer,
-				Name:  "latency",
-				Value: float64(delta / time.Millisecond),
-			},
-		)
-
+			metric{statsd.Counter, "count", 1},
+			metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 		lat := int64(delta / 1000)
 		p.statsif.addMany("numlist", int64(1), "listlatency", lat)
 
@@ -763,7 +720,7 @@ func (p *proxyrunner) getbucketnames(w http.ResponseWriter, r *http.Request, buc
 	res := p.call(r, si, u, r.Method, nil)
 	if res.err != nil {
 		p.invalmsghdlr(w, r, res.errstr)
-		p.kalive.onerr(res.err, res.status)
+		p.keepalive.onerr(res.err, res.status)
 	} else {
 		p.writeJSON(w, r, res.outjson, "getbucketnames")
 	}
@@ -786,7 +743,7 @@ func (p *proxyrunner) targetListBucket(r *http.Request, bucket string, dinfo *da
 
 	res := p.call(r, dinfo, url, http.MethodPost, actionMsgBytes, ctx.config.Timeout.Default)
 	if res.err != nil {
-		p.kalive.onerr(res.err, res.status)
+		p.keepalive.onerr(res.err, res.status)
 	}
 
 	return &bucketResp{
@@ -1138,14 +1095,7 @@ func (p *proxyrunner) filrename(w http.ResponseWriter, r *http.Request, msg *Act
 		glog.Infof("RENAME %s %s/%s => %s", r.Method, lbucket, objname, si.DaemonID)
 	}
 
-	p.statsdC.Send("rename",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-	)
-
+	p.statsdC.Send("rename", metric{statsd.Counter, "count", 1})
 	p.statsif.add("numrename", 1)
 
 	// NOTE:
@@ -1264,7 +1214,18 @@ func (p *proxyrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		p.writeJSON(w, r, jsbytes, "httpdaeget")
 
 	case GetWhatSmap:
-		jsbytes, err := json.Marshal(p.smapowner.get())
+		smap := p.smapowner.get()
+		for smap == nil || !smap.isValid() {
+			if p.startedup(0) != 0 { // must be starting up
+				smap = p.smapowner.get()
+				assert(smap.isValid())
+				break
+			}
+			glog.Errorf("%s is starting up: cannot execute GET %s yet...", p.si.DaemonID, GetWhatSmap)
+			time.Sleep(time.Second)
+			smap = p.smapowner.get()
+		}
+		jsbytes, err := json.Marshal(smap)
 		assert(err == nil, err)
 		p.writeJSON(w, r, jsbytes, "httpdaeget")
 
@@ -1592,6 +1553,10 @@ func (p *proxyrunner) httpcluget(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+	case GetWhatMountpaths:
+		if ok := p.invokeHttpGetClusterMountpaths(w, r); !ok {
+			return
+		}
 	default:
 		s := fmt.Sprintf("Unexpected GET request, invalid param 'what': [%s]", getWhat)
 		p.invalmsghdlr(w, r, s)
@@ -1599,17 +1564,11 @@ func (p *proxyrunner) httpcluget(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxyrunner) invokeHttpGetXaction(w http.ResponseWriter, r *http.Request) bool {
-	getProps := r.URL.Query().Get(URLParamProps)
-	kind, err := p.getXactionKindFromProperties(getProps)
-	if err != nil {
-		glog.Errorf(
-			"Unable to get kind from props: [%s]. Error: [%s]",
-			getProps,
-			err)
-		p.invalmsghdlr(w, r, err.Error())
+	kind := r.URL.Query().Get(URLParamProps)
+	if errstr := isXactionQueryable(kind); errstr != "" {
+		p.invalmsghdlr(w, r, errstr)
 		return false
 	}
-
 	outputXactionStats := &XactionStats{}
 	outputXactionStats.Kind = kind
 	targetStats, ok := p.invokeHttpGetMsgOnTargets(w, r)
@@ -1688,7 +1647,26 @@ func (p *proxyrunner) invokeHttpGetClusterStats(
 	return ok
 }
 
-// register|keepalive target
+func (p *proxyrunner) invokeHttpGetClusterMountpaths(
+	w http.ResponseWriter, r *http.Request) bool {
+	targetMountpaths, ok := p.invokeHttpGetMsgOnTargets(w, r)
+	if !ok {
+		errstr := fmt.Sprintf(
+			"Unable to invoke GetMsg on targets. Query: [%s]", r.URL.RawQuery)
+		glog.Errorf(errstr)
+		p.invalmsghdlr(w, r, errstr)
+		return false
+	}
+
+	out := &ClusterMountpathsRaw{}
+	out.Targets = targetMountpaths
+	jsbytes, err := json.Marshal(out)
+	assert(err == nil, err)
+	ok = p.writeJSON(w, r, jsbytes, "HttpGetClusterMountpaths")
+	return ok
+}
+
+// register|keepalive target|proxy
 func (p *proxyrunner) httpclupost(w http.ResponseWriter, r *http.Request) {
 	var (
 		nsi                   daemonInfo
@@ -1727,13 +1705,7 @@ func (p *proxyrunner) httpclupost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.statsdC.Send("post",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-	)
+	p.statsdC.Send("cluster_post", metric{statsd.Counter, "count", 1})
 	p.statsif.add("numpost", 1)
 
 	p.smapowner.Lock()
@@ -1831,7 +1803,7 @@ func (p *proxyrunner) addOrUpdateNode(nsi *daemonInfo, osi *daemonInfo, keepaliv
 			return true
 		}
 
-		p.kalive.heardFrom(nsi.DaemonID, !keepalive /* reset */)
+		p.keepalive.heardFrom(nsi.DaemonID, !keepalive /* reset */)
 		return false
 	}
 	if osi != nil {
@@ -1974,7 +1946,7 @@ func (p *proxyrunner) httpcluput(w http.ResponseWriter, r *http.Request) {
 						r,
 						fmt.Sprintf("%s (%s = %s) failed, err: %s", msg.Action, msg.Name, value, result.errstr),
 					)
-					p.kalive.onerr(err, result.status)
+					p.keepalive.onerr(err, result.status)
 				}
 			}
 		}
@@ -2015,6 +1987,16 @@ func (p *proxyrunner) httpcluput(w http.ResponseWriter, r *http.Request) {
 
 func (p *proxyrunner) checkPrimaryProxy(action string, w http.ResponseWriter, r *http.Request) bool {
 	smap := p.smapowner.get()
+	if smap == nil || !smap.isValid() {
+		if p.startedup(0) != 0 { // must be starting up
+			smap = p.smapowner.get()
+			assert(smap.isValid(), smap.pp())
+		} else {
+			s := fmt.Sprintf("%s is starting up: cannot execute '%v' yet...", p.si.DaemonID, action)
+			p.invalmsghdlr(w, r, s)
+			return false
+		}
+	}
 	if smap.isPrimary(p.si) {
 		return true
 	}

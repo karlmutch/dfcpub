@@ -51,12 +51,6 @@ type (
 		Result VoteResult `json:"voteresult"`
 	}
 
-	// ErrPair contains an Error and the Daemon which caused the error
-	ErrPair struct {
-		err      error
-		daemonID string
-	}
-
 	voteResult struct {
 		yes      bool
 		daemonID string
@@ -202,6 +196,9 @@ func (h *httprunner) httpsetprimaryproxy(w http.ResponseWriter, r *http.Request)
 
 	newprimary, oldprimary := vr.Candidate, vr.Primary
 
+	h.smapowner.Lock()
+	defer h.smapowner.Unlock()
+
 	smap := h.smapowner.get()
 	isproxy := smap.getProxy(h.si.DaemonID) != nil
 	psi := smap.getProxy(newprimary)
@@ -210,19 +207,16 @@ func (h *httprunner) httpsetprimaryproxy(w http.ResponseWriter, r *http.Request)
 		h.invalmsghdlr(w, r, s)
 		return
 	}
-	h.smapowner.Lock()
 	clone := smap.clone()
 	clone.ProxySI = psi
 	if oldprimary != "" {
 		clone.delProxy(oldprimary)
 	}
 	if s := h.smapowner.persist(clone, isproxy /*saveSmap*/); s != "" {
-		h.smapowner.Unlock()
 		h.invalmsghdlr(w, r, s)
 		return
 	}
 	h.smapowner.put(clone)
-	h.smapowner.Unlock()
 	glog.Infof("resulting %s", clone.pp())
 }
 
@@ -554,7 +548,7 @@ func (h *httprunner) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *d
 func (h *httprunner) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
 	// First: Check last keepalive timestamp. If the proxy was recently successfully reached,
 	// this will always vote no, as we believe the original proxy is still alive.
-	if !h.kalive.timedOut(currPrimaryID) {
+	if !h.keepalive.isTimeToPing(currPrimaryID) {
 		if glog.V(4) {
 			glog.Warningf("Primary %s is still alive", currPrimaryID)
 		}

@@ -18,25 +18,23 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/OneOfOne/xxhash"
 )
 
 const (
 	maxAttrSize = 1024
-	// use extra algorithms to choose a local IPv4 if there are more than 1 available
-	guessTheBestIPv4 = false
 )
 
 // Local unicast IP info
 type localIPv4Info struct {
-	ipv4  string
-	mtu   int
-	speed int
+	ipv4 string
+	mtu  int
 }
 
 func assert(cond bool, args ...interface{}) {
@@ -54,7 +52,16 @@ func assert(cond bool, args ...interface{}) {
 	glog.Fatalln(message)
 }
 
-func min64(a, b int64) int64 {
+// MinU64 returns min value of a and b for uint64 types
+func MinU64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// MinI64 returns min value of a and b for int64 types
+func MinI64(a, b int64) int64 {
 	if a < b {
 		return a
 	}
@@ -116,7 +123,6 @@ func getLocalIPv4List() (addrlist []*localIPv4Info, err error) {
 			for _, ifAddr := range ifAddrs {
 				if ipnet, ok := ifAddr.(*net.IPNet); ok && ipnet.IP.To4() != nil && ipnet.IP.String() == curr.ipv4 {
 					curr.mtu = intf.MTU
-					curr.speed = netifSpeed(intf.Name)
 					addrlist = append(addrlist, curr)
 					break
 				}
@@ -150,36 +156,10 @@ func selectConfiguredIPv4(addrlist []*localIPv4Info, configuredIPv4s string) (ip
 	return "", "Configured IPv4 does not match any local one"
 }
 
-func guessIPv4(addrlist []*localIPv4Info) (ipv4addr string, errstr string) {
-	glog.Warning("Looking for the fastest network interface")
-	// sort addresses in descendent order by interface speed
-	ifLess := func(i, j int) bool {
-		return addrlist[i].speed >= addrlist[j].speed
-	}
-	sort.Slice(addrlist, ifLess)
-
-	// Take the first IPv4 if it is faster than the others
-	if addrlist[0].speed != addrlist[1].speed {
-		glog.Warningf("Interface %s is the fastest - %dMbit\n",
-			addrlist[0].ipv4, addrlist[0].speed)
-		if addrlist[0].mtu <= 1500 {
-			glog.Warningf("IPv4 %s selected but MTU is low: %s\n", addrlist[0].mtu)
-		}
-		ipv4addr = addrlist[0].ipv4
-		return
-	}
-
-	errstr = fmt.Sprintf("Failed to select one IPv4 of %d available\n", len(addrlist))
-	return
-}
-
 // detectLocalIPv4 takes a list of local IPv4s and returns the best fit for a deamon to listen on it
 func detectLocalIPv4(addrlist []*localIPv4Info) (ipv4addr string, errstr string) {
 	if len(addrlist) == 1 {
 		msg := fmt.Sprintf("Found only one IPv4: %s, MTU %d", addrlist[0].ipv4, addrlist[0].mtu)
-		if addrlist[0].speed != 0 {
-			msg += fmt.Sprintf(", bandwidth %d", addrlist[0].speed)
-		}
 		glog.Info(msg)
 		if addrlist[0].mtu <= 1500 {
 			glog.Warningf("IPv4 %s MTU size is small: %d\n", addrlist[0].ipv4, addrlist[0].mtu)
@@ -195,12 +175,6 @@ func detectLocalIPv4(addrlist []*localIPv4Info) (ipv4addr string, errstr string)
 	// FIXME: temp hack - make sure to keep working on laptops with dockers
 	ipv4addr = addrlist[0].ipv4
 	return
-	/*
-		if guessTheBestIPv4 {
-			return guessIPv4(addrlist)
-		}
-		return "", "Failed to select network interface: more than one IPv4 available"
-	*/
 }
 
 // getipv4addr returns an IPv4 for proxy/target to listen on it.
@@ -238,11 +212,8 @@ func CreateDir(dirname string) (err error) {
 }
 
 func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
-	buf []byte, hashes ...hash.Hash) (written int64, errstr string) {
-	var (
-		writer io.Writer
-		err    error
-	)
+	buf []byte, hashes ...hash.Hash) (written int64, err error) {
+	var writer io.Writer
 	if len(hashes) == 0 {
 		writer = filewriter
 	} else {
@@ -259,7 +230,7 @@ func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
 		written, err = io.CopyBuffer(writer, rrbody, buf)
 	}
 	if err != nil {
-		return written, err.Error()
+		return written, err
 	}
 	return
 }
@@ -273,23 +244,9 @@ func CreateFile(fname string) (file *os.File, err error) {
 	return
 }
 
-func ComputeMD5(reader io.Reader, buf []byte, md5 hash.Hash) (csum string, errstr string) {
+func ComputeXXHash(reader io.Reader, buf []byte) (csum string, errstr string) {
 	var err error
-	if buf == nil {
-		_, err = io.Copy(md5.(io.Writer), reader)
-	} else {
-		_, err = io.CopyBuffer(md5.(io.Writer), reader, buf)
-	}
-	if err != nil {
-		return "", fmt.Sprintf("Failed to copy buffer, err: %v", err)
-	}
-	hashInBytes := md5.Sum(nil)[:16]
-	csum = hex.EncodeToString(hashInBytes)
-	return csum, ""
-}
-
-func ComputeXXHash(reader io.Reader, buf []byte, xx hash.Hash64) (csum string, errstr string) {
-	var err error
+	var xx hash.Hash64 = xxhash.New64()
 	if buf == nil {
 		_, err = io.Copy(xx.(io.Writer), reader)
 	} else {
@@ -385,14 +342,6 @@ func LocalLoad(pathname string, v interface{}) (err error) {
 	return
 }
 
-func osRemove(prefix, fqn string) error {
-	if err := os.Remove(fqn); err != nil {
-		return err
-	}
-	glog.Infof("%s: removed %q", prefix, fqn)
-	return nil
-}
-
 // as of 1.9 net/http does not appear to provide any better way..
 func IsErrConnectionRefused(err error) (yes bool) {
 	if uerr, ok := err.(*url.Error); ok {
@@ -423,10 +372,115 @@ func isSyscallWriteError(err error) bool {
 	}
 }
 
+// Checks if the error is generated by any IO operation and if the error
+// is severe enough to run the FSHC for mountpath testing
+//
+// for mountpath definition, see fs/mountfs.go
+func isIOError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.ErrShortWrite {
+		return true
+	}
+
+	isIO := func(e error) bool {
+		return e == syscall.EIO || // I/O error
+			e == syscall.ENOTDIR || // mountpath is missing
+			e == syscall.EBUSY || // device or resource is busy
+			e == syscall.ENXIO || // No such device
+			e == syscall.EBADF || // Bad file number
+			e == syscall.ENODEV || // No such device
+			e == syscall.EUCLEAN || // (mkdir)structure needs cleaning = broken filesystem
+			e == syscall.EROFS || // readonly filesystem
+			e == syscall.EDQUOT || // quota exceeded
+			e == syscall.ESTALE || // stale file handle
+			e == syscall.ENOSPC // no space left
+	}
+
+	switch e := err.(type) {
+	case *os.PathError:
+		return isIO(e.Err)
+	case *os.SyscallError:
+		return isIO(e.Err)
+	default:
+		return false
+	}
+}
+
 func parsebool(s string) (value bool, err error) {
 	if s == "" {
 		return
 	}
 	value, err = strconv.ParseBool(s)
+	return
+}
+
+func fqn2mpathInfo(fqn string) *fs.MountpathInfo {
+	var (
+		max    int
+		result *fs.MountpathInfo
+	)
+
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	for _, mpathInfo := range availablePaths {
+		rel, err := filepath.Rel(mpathInfo.Path, fqn)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		if len(mpathInfo.Path) > max {
+			max = len(mpathInfo.Path)
+			result = mpathInfo
+		}
+	}
+	return result
+}
+
+func fqn2fs(fqn string) (fs string) {
+	mpathInfo := fqn2mpathInfo(fqn)
+	if mpathInfo == nil {
+		return
+	}
+
+	fs = mpathInfo.FileSystem
+	return
+}
+
+func fqn2mountPath(fqn string) (mpath string) {
+	mpathInfo := fqn2mpathInfo(fqn)
+	if mpathInfo == nil {
+		return
+	}
+
+	mpath = mpathInfo.Path
+	return
+}
+
+func maxUtilDisks(disksMetricsMap map[string]simplekvs, disks StringSet) (maxutil float64) {
+	maxutil = -1
+	util := func(disk string) (u float64) {
+		if ioMetrics, ok := disksMetricsMap[disk]; ok {
+			if utilStr, ok := ioMetrics["%util"]; ok {
+				var err error
+				if u, err = strconv.ParseFloat(utilStr, 32); err == nil {
+					return
+				}
+			}
+		}
+		return
+	}
+	if len(disks) > 0 {
+		for disk := range disks {
+			if u := util(disk); u > maxutil {
+				maxutil = u
+			}
+		}
+		return
+	}
+	for disk := range disksMetricsMap {
+		if u := util(disk); u > maxutil {
+			maxutil = u
+		}
+	}
 	return
 }

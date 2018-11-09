@@ -28,6 +28,7 @@ import (
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/NVIDIA/dfcpub/dfc/statsd"
+	"github.com/NVIDIA/dfcpub/fs"
 	"github.com/OneOfOne/xxhash"
 )
 
@@ -37,12 +38,8 @@ const (
 	MaxPageSize      = 64 * 1024 // max number of objects in a page (warning logged if requested page size exceeds this limit)
 	workfileprefix   = ".~~~."
 	doesnotexist     = "does not exist"
+	maxBytesInMem    = 256 * KiB
 )
-
-type mountPath struct {
-	Path string       `json:"path"`
-	Fsid syscall.Fsid `json:"fsid"`
-}
 
 type allfinfos struct {
 	files        []*BucketEntry
@@ -97,16 +94,9 @@ type targetrunner struct {
 
 // start target runner
 func (t *targetrunner) run() error {
-	// note: call stats worker has to started before the first call()
-	t.callStatsServer = NewCallStatsServer(
-		ctx.config.CallStats.RequestIncluded,
-		ctx.config.CallStats.Factor,
-		&t.statsdC,
-	)
-	t.callStatsServer.Start()
-
+	var ereg error
 	t.httprunner.init(getstorstatsrunner(), false)
-	t.httprunner.kalive = gettargetkalive()
+	t.httprunner.keepalive = gettargetkeepalive()
 	t.xactinp = newxactinp()        // extended actions
 	t.rtnamemap = newrtnamemap(128) // lock/unlock name
 
@@ -116,24 +106,26 @@ func (t *targetrunner) run() error {
 	smap := newSmap()
 	smap.Tmap[t.si.DaemonID] = t.si
 	t.smapowner.put(smap)
-
-	if status, err := t.register(0); err != nil {
-		glog.Errorf("Target %s failed to register with proxy, err: %v", t.si.DaemonID, err)
-		if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
-			glog.Errorf("Target %s: retrying registration...", t.si.DaemonID)
-			time.Sleep(time.Second * 3)
-			if _, err = t.register(0); err != nil {
-				glog.Errorf("Target %s failed to register with proxy, err: %v", t.si.DaemonID, err)
-				glog.Errorf("Target %s is terminating", t.si.DaemonID)
-				return err
+	for i := 0; i < maxRetrySeconds; i++ {
+		var status int
+		if status, ereg = t.register(0); ereg != nil {
+			if IsErrConnectionRefused(ereg) || status == http.StatusRequestTimeout {
+				glog.Errorf("Target %s: retrying registration...", t.si.DaemonID)
+				time.Sleep(time.Second)
+				continue
 			}
-			glog.Errorf("Success: target %s joined the cluster", t.si.DaemonID)
-		} else {
-			return err
 		}
+		break
 	}
-	// fill-in, detect changes, persist
-	t.startupMpaths()
+	if ereg != nil {
+		glog.Errorf("Target %s failed to register, err: %v", t.si.DaemonID, ereg)
+		glog.Errorf("Target %s is terminating", t.si.DaemonID)
+		return ereg
+	}
+
+	t.createBucketDirs("local", ctx.config.LocalBuckets, makePathLocal)
+	t.createBucketDirs("cloud", ctx.config.CloudBuckets, makePathCloud)
+	t.detectMpathChanges()
 
 	// cloud provider
 	if ctx.config.CloudProvider == ProviderAmazon {
@@ -152,6 +144,7 @@ func (t *targetrunner) run() error {
 		tokens:        make(map[string]*authRec),
 		revokedTokens: make(map[string]bool),
 	}
+
 	//
 	// REST API: register storage target's handler(s) and start listening
 	//
@@ -188,7 +181,6 @@ func (t *targetrunner) stop(err error) {
 	}
 
 	t.httprunner.stop(err)
-	t.callStatsServer.Stop()
 	if sleep {
 		time.Sleep(time.Second)
 	}
@@ -424,7 +416,7 @@ existslocally:
 	if size == 0 {
 		glog.Warningf("Unexpected: object %s/%s size is 0 (zero)", bucket, objname)
 	}
-	returnRangeChecksum := readRange && cksumcfg.EnableReadRangeChecksum
+	returnRangeChecksum := cksumcfg.Checksum != ChecksumNone && readRange && cksumcfg.EnableReadRangeChecksum
 	if !coldget && !returnRangeChecksum && cksumcfg.Checksum != ChecksumNone {
 		hashbinary, errstr := Getxattr(fqn, XattrXXHashVal)
 		if errstr == "" && hashbinary != nil {
@@ -449,6 +441,7 @@ existslocally:
 			errstr = fmt.Sprintf("Failed to open local file %s, err: %v", fqn, err)
 			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 		}
+		t.fshc(err, fqn)
 		return
 	}
 
@@ -456,29 +449,34 @@ existslocally:
 	if readRange {
 		size = length
 	}
+
 	slab := selectslab(size)
 	buf := slab.alloc()
 	defer slab.free(buf)
 
-	if cksumcfg.Checksum != ChecksumNone && returnRangeChecksum {
-		slab := selectslab(length)
-		buf := slab.alloc()
-		reader := io.NewSectionReader(file, offset, length)
-		xxhashval, errstr := ComputeXXHash(reader, buf, xxhash.New64())
-		slab.free(buf)
+	var sgl *SGLIO
+	defer func() {
+		if sgl != nil {
+			sgl.Free()
+		}
+	}()
+	var rangeReader io.ReadSeeker = io.NewSectionReader(file, offset, length)
+	if returnRangeChecksum {
+		var cksum string
+		cksum, sgl, rangeReader, errstr = t.rangeCksum(file, fqn, length, offset, buf)
 		if errstr != "" {
-			s := fmt.Sprintf("Unable to compute checksum for byte range, offset:%d, length:%d from %s, err: %s", offset, length, fqn, errstr)
-			t.invalmsghdlr(w, r, s, http.StatusInternalServerError)
+			glog.Errorln(t.errHTTP(r, errstr, http.StatusInternalServerError))
+			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 			return
+
 		}
 		w.Header().Add(HeaderDfcChecksumType, cksumcfg.Checksum)
-		w.Header().Add(HeaderDfcChecksumVal, xxhashval)
+		w.Header().Add(HeaderDfcChecksumVal, cksum)
 	}
 
 	var written int64
 	if readRange {
-		reader := io.NewSectionReader(file, offset, length)
-		written, err = io.CopyBuffer(w, reader, buf)
+		written, err = io.CopyBuffer(w, rangeReader, buf)
 	} else {
 		// copy
 		written, err = io.CopyBuffer(w, file, buf)
@@ -486,6 +484,7 @@ existslocally:
 	if err != nil {
 		errstr = fmt.Sprintf("Failed to send file %s, err: %v", fqn, err)
 		glog.Errorln(t.errHTTP(r, errstr, http.StatusInternalServerError))
+		t.fshc(err, fqn)
 		t.statsif.add("numerr", 1)
 		return
 	}
@@ -502,20 +501,41 @@ existslocally:
 
 	delta := time.Since(started)
 	t.statsdC.Send("get",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "count",
-			Value: 1,
-		},
-		statsd.Metric{
-			Type:  statsd.Timer,
-			Name:  "latency",
-			Value: float64(delta / time.Millisecond),
-		},
-	)
-
+		metric{statsd.Counter, "count", 1},
+		metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 	t.statsif.addMany("numget", int64(1), "getlatency", int64(delta/1000))
 }
+
+func (t *targetrunner) rangeCksum(file *os.File, fqn string, length int64, offset int64, buf []byte) (
+	cksum string, sgl *SGLIO, rangeReader io.ReadSeeker, errstr string) {
+	rangeReader = io.NewSectionReader(file, offset, length)
+	xx := xxhash.New64()
+	if length <= maxBytesInMem {
+		sgl = NewSGLIO(uint64(length))
+		_, err := ReceiveAndChecksum(sgl, rangeReader, buf, xx)
+		if err != nil {
+			errstr = fmt.Sprintf("failed to read byte range, offset:%d, length:%d from %s, err: %v", offset, length, fqn, err)
+			t.fshc(err, fqn)
+			return
+		}
+		// overriding rangeReader here to read from the sgl
+		rangeReader = NewReader(sgl)
+	}
+
+	_, err := rangeReader.Seek(0, io.SeekStart)
+	if err != nil {
+		errstr = fmt.Sprintf("failed to seek file %s to beginning, err: %v", fqn, err)
+		t.fshc(err, fqn)
+		return
+	}
+
+	hashIn64 := xx.Sum64()
+	hashInBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(hashInBytes, hashIn64)
+	cksum = hex.EncodeToString(hashInBytes)
+	return
+}
+
 func (t *targetrunner) validateOffsetAndLength(r *http.Request) (
 	offset int64, length int64, readRange bool, errstr string) {
 	query := r.URL.Query()
@@ -745,18 +765,8 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			delta := time.Since(started)
 			t.statsdC.Send("list",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Timer,
-					Name:  "latency",
-					Value: float64(delta / time.Millisecond),
-				},
-			)
-
+				metric{statsd.Counter, "count", 1},
+				metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 			lat := int64(delta / 1000)
 			t.statsif.addMany("numlist", int64(1), "listlatency", lat)
 			if glog.V(3) {
@@ -916,10 +926,7 @@ func (t *targetrunner) httpHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	smap := t.smapowner.get()
-	if smap.ProxySI != nil && from == smap.ProxySI.DaemonID {
-		t.kalive.heardFrom(smap.ProxySI.DaemonID, false /* reset */)
-	}
+	t.keepalive.heardFrom(from, false)
 }
 
 //  /Rversion/Rpush/bucket-name
@@ -985,9 +992,11 @@ func (t *targetrunner) renamelocalbucket(bucketFrom, bucketTo string, p BucketPr
 	t.bmdowner.put(clone)
 
 	wg := &sync.WaitGroup{}
-	ch := make(chan string, len(ctx.mountpaths.Available))
-	for mpath := range ctx.mountpaths.Available {
-		fromdir := filepath.Join(makePathLocal(mpath), bucketFrom)
+
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	ch := make(chan string, len(availablePaths))
+	for _, mpathInfo := range availablePaths {
+		fromdir := filepath.Join(makePathLocal(mpathInfo.Path), bucketFrom)
 		wg.Add(1)
 		go func(fromdir string, wg *sync.WaitGroup) {
 			time.Sleep(time.Millisecond * 100) // FIXME: 2-phase for the targets to 1) prep (above) and 2) rebalance
@@ -1002,8 +1011,8 @@ func (t *targetrunner) renamelocalbucket(bucketFrom, bucketTo string, p BucketPr
 			return
 		}
 	}
-	for mpath := range ctx.mountpaths.Available {
-		fromdir := filepath.Join(makePathLocal(mpath), bucketFrom)
+	for _, mpathInfo := range availablePaths {
+		fromdir := filepath.Join(makePathLocal(mpathInfo.Path), bucketFrom)
 		if err := os.RemoveAll(fromdir); err != nil {
 			glog.Errorf("Failed to remove dir %s", fromdir)
 		}
@@ -1146,6 +1155,7 @@ func (t *targetrunner) coldget(ct context.Context, bucket, objname string, prefe
 		vchanged    bool
 		inNextTier  bool
 		bucketProps BucketProps
+		err         error
 	)
 	// one cold GET at a time
 	if prefetch {
@@ -1209,14 +1219,15 @@ func (t *targetrunner) coldget(ct context.Context, bucket, objname string, prefe
 	defer func() {
 		if errstr != "" {
 			t.rtnamemap.unlockname(uname, true)
-			if err := os.Remove(getfqn); err != nil {
-				glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, getfqn, err)
+			if errRemove := os.Remove(getfqn); errRemove != nil {
+				glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, getfqn, errRemove)
+				t.fshc(errRemove, getfqn)
 			}
-			t.runFSKeeper(fqn)
 		}
 	}()
-	if err := os.Rename(getfqn, fqn); err != nil {
+	if err = os.Rename(getfqn, fqn); err != nil {
 		errstr = fmt.Sprintf("Unexpected failure to rename %s => %s, err: %v", getfqn, fqn, err)
+		t.fshc(err, fqn)
 		return
 	}
 	if errstr = t.finalizeobj(fqn, props); errstr != "" {
@@ -1231,43 +1242,15 @@ ret:
 	} else {
 		if vchanged {
 			t.statsdC.Send("get.cold",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytesloaded",
-					Value: props.size,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "vchanged",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytesvchanged",
-					Value: props.size,
-				},
-			)
-
+				metric{statsd.Counter, "count", 1},
+				metric{statsd.Counter, "bytesloaded", props.size},
+				metric{statsd.Counter, "vchanged", 1},
+				metric{statsd.Counter, "bytesvchanged", props.size})
 			t.statsif.addMany("numcoldget", int64(1), "bytesloaded", props.size, "bytesvchanged", props.size, "numvchanged", int64(1))
 		} else {
-			t.statsdC.Send("coldget",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytesloaded",
-					Value: props.size,
-				},
-			)
-
+			t.statsdC.Send("get.cold",
+				metric{statsd.Counter, "count", 1},
+				metric{statsd.Counter, "bytesloaded", props.size})
 			t.statsif.addMany("numcoldget", int64(1), "bytesloaded", props.size)
 		}
 		t.rtnamemap.downgradelock(uname)
@@ -1287,15 +1270,13 @@ func (t *targetrunner) lookupLocally(bucket, objname, fqn string) (coldget bool,
 			errstr = fmt.Sprintf("Permission denied: access forbidden to %s", fqn)
 		default:
 			errstr = fmt.Sprintf("Failed to fstat %s, err: %v", fqn, err)
-			t.runFSKeeper(fqn)
+			t.fshc(err, fqn)
 		}
 		return
 	}
 	size = finfo.Size()
 	if bytes, errs := Getxattr(fqn, XattrObjVersion); errs == "" {
 		version = string(bytes)
-	} else {
-		t.runFSKeeper(fqn)
 	}
 	return
 }
@@ -1327,6 +1308,9 @@ func (t *targetrunner) listCachedObjects(bucket string, msg *GetMsg) (outbytes [
 	}
 
 	outbytes, err = json.Marshal(reslist)
+	if err != nil {
+		return nil, err.Error(), 0
+	}
 	return
 }
 
@@ -1334,17 +1318,20 @@ func (t *targetrunner) prepareLocalObjectList(bucket string, msg *GetMsg) (*Buck
 	type mresp struct {
 		infos      *allfinfos
 		failedPath string
+		err        error
 	}
 
-	ch := make(chan *mresp, len(ctx.mountpaths.Available))
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	ch := make(chan *mresp, len(availablePaths))
 	wg := &sync.WaitGroup{}
 
 	// function to traverse one mountpoint
 	walkMpath := func(dir string) {
-		r := &mresp{t.newFileWalk(bucket, msg), ""}
+		r := &mresp{t.newFileWalk(bucket, msg), "", nil}
 		if _, err := os.Stat(dir); err != nil {
 			if !os.IsNotExist(err) {
 				r.failedPath = dir
+				r.err = err
 			}
 			ch <- r // not an error, just skip the path
 			wg.Done()
@@ -1354,6 +1341,7 @@ func (t *targetrunner) prepareLocalObjectList(bucket string, msg *GetMsg) (*Buck
 		if err := filepath.Walk(dir, r.infos.listwalkf); err != nil {
 			glog.Errorf("Failed to traverse path %q, err: %v", dir, err)
 			r.failedPath = dir
+			r.err = err
 		}
 		ch <- r
 		wg.Done()
@@ -1364,29 +1352,28 @@ func (t *targetrunner) prepareLocalObjectList(bucket string, msg *GetMsg) (*Buck
 	// But in this case all collected data is thrown away because the partial result
 	// makes paging inconsistent
 	islocal := t.bmdowner.get().islocal(bucket)
-	for mpath := range ctx.mountpaths.Available {
+	for _, mpathInfo := range availablePaths {
 		wg.Add(1)
 		var localDir string
 		if islocal {
-			localDir = filepath.Join(makePathLocal(mpath), bucket)
+			localDir = filepath.Join(makePathLocal(mpathInfo.Path), bucket)
 		} else {
-			localDir = filepath.Join(makePathCloud(mpath), bucket)
+			localDir = filepath.Join(makePathCloud(mpathInfo.Path), bucket)
 		}
 
 		go walkMpath(localDir)
 	}
-
 	wg.Wait()
 	close(ch)
 
 	// combine results into one long list
 	// real size of page is set in newFileWalk, so read it from any of results inside loop
 	pageSize := DefaultPageSize
-	allfinfos := make([]*BucketEntry, 0, 0)
+	allfinfos := make([]*BucketEntry, 0)
 	fileCount := 0
 	for r := range ch {
-		if r.failedPath != "" {
-			t.runFSKeeper(r.failedPath)
+		if r.err != nil {
+			t.fshc(r.err, r.failedPath)
 			return nil, fmt.Errorf("Failed to read %s", r.failedPath)
 		}
 
@@ -1450,7 +1437,6 @@ func (t *targetrunner) getbucketnames(w http.ResponseWriter, r *http.Request) {
 	jsbytes, err := json.Marshal(bucketnames)
 	assert(err == nil, err)
 	t.writeJSON(w, r, jsbytes, "getbucketnames")
-	return
 }
 
 func (t *targetrunner) doLocalBucketList(w http.ResponseWriter, r *http.Request, bucket string, msg *GetMsg) (errstr string, ok bool) {
@@ -1666,7 +1652,7 @@ func (ci *allfinfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
 	return ci.processRegularFile(fqn, osfi)
 }
 
-// After putting a new version it updates xattr attrubutes for the object
+// After putting a new version it updates xattr attributes for the object
 // Local bucket:
 //  - if bucket versioning is enable("all" or "local") then the version is autoincremented
 // Cloud bucket:
@@ -1699,8 +1685,7 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 			slab := selectslab(0) // unknown size
 			buf := slab.alloc()
 			if htype == ChecksumXXHash {
-				xx := xxhash.New64()
-				xxhashval, errstr = ComputeXXHash(file, buf, xx)
+				xxhashval, errstr = ComputeXXHash(file, buf)
 			} else {
 				errstr = fmt.Sprintf("Unsupported checksum type %s", htype)
 			}
@@ -1738,18 +1723,8 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 		if errstr == "" {
 			delta := time.Since(started)
 			t.statsdC.Send("put",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Timer,
-					Name:  "latency",
-					Value: float64(delta / time.Millisecond),
-				},
-			)
-
+				metric{statsd.Counter, "count", 1},
+				metric{statsd.Timer, "latency", float64(delta / time.Millisecond)})
 			lat := int64(delta / 1000)
 			t.statsif.addMany("numput", int64(1), "putlatency", lat)
 			if glog.V(4) {
@@ -1773,19 +1748,19 @@ func (t *targetrunner) sglToCloudAsync(ct context.Context, sgl *SGLIO, bucket, o
 	// sgl => fqn sequence
 	file, err := CreateFile(putfqn)
 	if err != nil {
-		t.runFSKeeper(putfqn)
+		t.fshc(err, putfqn)
 		glog.Errorln("sglToCloudAsync: create", putfqn, err)
 		return
 	}
 	reader := NewReader(sgl)
 	written, err := io.CopyBuffer(file, reader, buf)
 	if err != nil {
-		t.runFSKeeper(putfqn)
+		t.fshc(err, putfqn)
 		glog.Errorln("sglToCloudAsync: CopyBuffer", err)
-		if err1 := file.Close(); err != nil {
+		if err1 := file.Close(); err1 != nil {
 			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err1)
 		}
-		if err2 := os.Remove(putfqn); err != nil {
+		if err2 := os.Remove(putfqn); err2 != nil {
 			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err2)
 		}
 		return
@@ -1794,7 +1769,7 @@ func (t *targetrunner) sglToCloudAsync(ct context.Context, sgl *SGLIO, bucket, o
 	err = file.Close()
 	if err != nil {
 		glog.Errorln("sglToCloudAsync: Close", err)
-		if err1 := os.Remove(putfqn); err != nil {
+		if err1 := os.Remove(putfqn); err1 != nil {
 			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err1)
 		}
 		return
@@ -1815,10 +1790,10 @@ func (t *targetrunner) putCommit(ct context.Context, bucket, objname, putfqn, fq
 	)
 	errstr, errcode, err, renamed = t.doPutCommit(ct, bucket, objname, putfqn, fqn, objprops, rebalance)
 	if errstr != "" && !os.IsNotExist(err) && !renamed {
+		t.fshc(err, putfqn)
 		if err = os.Remove(putfqn); err != nil {
 			glog.Errorf("Nested error: %s => (remove %s => err: %v)", errstr, putfqn, err)
 		}
-		t.runFSKeeper(putfqn)
 	}
 	return
 }
@@ -1962,18 +1937,8 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		errstr, _ = t.putCommit(t.contextWithAuth(r), bucket, objname, putfqn, fqn, props, true /*rebalance*/)
 		if errstr == "" {
 			t.statsdC.Send("rebalance.receive",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "files",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytes",
-					Value: size,
-				},
-			)
-
+				metric{statsd.Counter, "files", 1},
+				metric{statsd.Counter, "bytes", size})
 			t.statsif.addMany("numrecvfiles", int64(1), "numrecvbytes", size)
 		}
 	}
@@ -2000,14 +1965,7 @@ func (t *targetrunner) fildelete(ct context.Context, bucket, objname string, evi
 			return fmt.Errorf("%d: %s", errcode, errstr)
 		}
 
-		t.statsdC.Send("delete",
-			statsd.Metric{
-				Type:  statsd.Counter,
-				Name:  "count",
-				Value: 1,
-			},
-		)
-
+		t.statsdC.Send("delete", metric{statsd.Counter, "count", 1})
 		t.statsif.add("numdelete", 1)
 	}
 
@@ -2028,18 +1986,8 @@ func (t *targetrunner) fildelete(ct context.Context, bucket, objname string, evi
 			return err
 		} else if evict {
 			t.statsdC.Send("evict",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "files",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytes",
-					Value: finfo.Size(),
-				},
-			)
-
+				metric{statsd.Counter, "files", 1},
+				metric{statsd.Counter, "bytes", finfo.Size()})
 			t.statsif.addMany("filesevicted", int64(1), "bytesevicted", finfo.Size())
 		}
 	}
@@ -2092,13 +2040,7 @@ func (t *targetrunner) renameobject(bucketFrom, objnameFrom, bucketTo, objnameTo
 		} else if err := os.Rename(fqn, newfqn); err != nil {
 			errstr = fmt.Sprintf("Failed to rename %s => %s, err: %v", fqn, newfqn, err)
 		} else {
-			t.statsdC.Send("rename",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-			)
+			t.statsdC.Send("rename", metric{statsd.Counter, "count", 1})
 			t.statsif.add("numrename", 1)
 			if glog.V(3) {
 				glog.Infof("Renamed %s => %s", fqn, newfqn)
@@ -2205,8 +2147,7 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	if cksumcfg.Checksum != ChecksumNone {
 		assert(cksumcfg.Checksum == ChecksumXXHash)
 		buf := slab.alloc()
-		xx := xxhash.New64()
-		if xxhashval, errstr = ComputeXXHash(file, buf, xx); errstr != "" {
+		if xxhashval, errstr = ComputeXXHash(file, buf); errstr != "" {
 			slab.free(buf)
 			return errstr
 		}
@@ -2261,17 +2202,8 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	response.Body.Close()
 	// stats
 	t.statsdC.Send("rebalance.send",
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "files",
-			Value: 1,
-		},
-		statsd.Metric{
-			Type:  statsd.Counter,
-			Name:  "bytes",
-			Value: size,
-		},
-	)
+		metric{statsd.Counter, "files", 1},
+		metric{statsd.Counter, "bytes", size})
 	t.statsif.addMany("numsentfiles", int64(1), "numsentbytes", size)
 	return ""
 }
@@ -2346,6 +2278,9 @@ func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
 		case Rmetasync:
 			t.receiveMeta(w, r)
 			return
+		case Rmountpaths:
+			t.enableMountpath(w, r)
+			return
 		default:
 		}
 	}
@@ -2413,14 +2348,17 @@ func (t *targetrunner) httpdaesetprimaryproxy(w http.ResponseWriter, r *http.Req
 		return
 	}
 	t.smapowner.Lock()
-	clone := smap.clone()
-	clone.ProxySI = psi
-	if s := t.smapowner.persist(clone, false /*saveSmap*/); s != "" {
-		t.smapowner.Unlock()
-		t.invalmsghdlr(w, r, s)
-		return
+	smap = t.smapowner.get()
+	if smap.ProxySI.DaemonID != psi.DaemonID {
+		clone := smap.clone()
+		clone.ProxySI = psi
+		if s := t.smapowner.persist(clone, false /*saveSmap*/); s != "" {
+			t.smapowner.Unlock()
+			t.invalmsghdlr(w, r, s)
+			return
+		}
+		t.smapowner.put(clone)
 	}
-	t.smapowner.put(clone)
 	t.smapowner.Unlock()
 }
 
@@ -2442,48 +2380,42 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		jsbytes, err = json.Marshal(t.smapowner.get())
 		assert(err == nil, err)
 	case GetWhatSmapVote:
-		// FIXME:
-		// Tragets participate in voting, why not return VoteInProgress's true state here?
-		// Not that important in term of primary started up's use case because as long proxies
-		// are reporting vote in progress, but may be for other use cases and for correctness.
-		msg := SmapVoteMsg{
-			VoteInProgress: false,
-			Smap:           t.smapowner.get(),
-			BucketMD:       t.bmdowner.get(),
-		}
-		jsbytes, err := json.Marshal(msg)
+		_, xx := t.xactinp.findL(ActElection)
+		vote := xx != nil
+		msg := SmapVoteMsg{VoteInProgress: vote, Smap: t.smapowner.get(), BucketMD: t.bmdowner.get()}
+		jsbytes, err = json.Marshal(msg)
 		assert(err == nil, err)
-		t.writeJSON(w, r, jsbytes, "httpdaeget")
 	case GetWhatStats:
-		storageStatsRunner := getstorstatsrunner()
-		ioStatsRunner := getiostatrunner()
-		storageStatsRunner.Lock()
-		ioStatsRunner.Lock()
-		jsbytes, err = json.Marshal(storageStatsRunner)
-		ioStatsRunner.Unlock()
-		storageStatsRunner.Unlock()
+		rst := getstorstatsrunner()
+		rst.RLock()
+		jsbytes, err = json.Marshal(rst)
+		rst.RUnlock()
 		assert(err == nil, err)
 	case GetWhatXaction:
-		getProps := r.URL.Query().Get(URLParamProps)
-		kind, err := t.getXactionKindFromProperties(getProps)
-		if err != nil {
-			glog.Errorf(
-				"Unable to get kind from props: [%s]. Error: [%v]",
-				getProps,
-				err)
-			t.invalmsghdlr(w, r, err.Error())
+		kind := r.URL.Query().Get(URLParamProps)
+		if errstr := isXactionQueryable(kind); errstr != "" {
+			t.invalmsghdlr(w, r, errstr)
 			return
 		}
-
 		xactionStatsRetriever := t.getXactionStatsRetriever(kind)
 		allXactionDetails := t.getXactionsByType(kind)
-		jsbytes, err = xactionStatsRetriever.getStats(allXactionDetails)
+		jsbytes = xactionStatsRetriever.getStats(allXactionDetails)
+	case GetWhatMountpaths:
+		mpList := MountpathList{
+			Available: make([]string, 0),
+			Disabled:  make([]string, 0),
+		}
+
+		availablePaths, disabledPaths := ctx.mountpaths.Mountpaths()
+		for _, mp := range availablePaths {
+			mpList.Available = append(mpList.Available, mp.Path)
+		}
+		for _, mp := range disabledPaths {
+			mpList.Disabled = append(mpList.Disabled, mp.Path)
+		}
+		jsbytes, err = json.Marshal(&mpList)
 		if err != nil {
-			s := fmt.Sprintf(
-				"Unable to get stats. Kind: [%s]. Error: [%v]",
-				kind,
-				err)
-			glog.Error(s)
+			s := fmt.Sprintf("Failed to marshal mountpaths: %v", err)
 			t.invalmsghdlr(w, r, s)
 			return
 		}
@@ -2543,7 +2475,7 @@ func (t *targetrunner) httpdaepost(w http.ResponseWriter, r *http.Request) {
 		if glog.V(3) {
 			glog.Infoln("Sending register signal to target keepalive control channel")
 		}
-		gettargetkalive().kalive.controlCh <- controlSignal{msg: register}
+		gettargetkeepalive().keepalive.controlCh <- controlSignal{msg: register}
 		return
 	}
 	if status, err := t.register(0); err != nil {
@@ -2560,7 +2492,7 @@ func (t *targetrunner) httpdaedelete(w http.ResponseWriter, r *http.Request) {
 	if glog.V(3) {
 		glog.Infoln("Sending unregister signal to target keepalive control channel")
 	}
-	gettargetkalive().kalive.controlCh <- controlSignal{msg: unregister}
+	gettargetkeepalive().keepalive.controlCh <- controlSignal{msg: unregister}
 }
 
 //====================== common for both cold GET and PUT ======================================
@@ -2581,7 +2513,7 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 	)
 
 	if file, err = CreateFile(fqn); err != nil {
-		t.runFSKeeper(fqn)
+		t.fshc(err, fqn)
 		errstr = fmt.Sprintf("Failed to create %s, err: %s", fqn, err)
 		return
 	}
@@ -2593,7 +2525,6 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 		if errstr == "" {
 			return
 		}
-		t.runFSKeeper(fqn)
 		if err = file.Close(); err != nil {
 			glog.Errorf("Nested: failed to close received file %s, err: %v", fqn, err)
 		}
@@ -2605,7 +2536,9 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 	if cksumcfg.Checksum != ChecksumNone {
 		assert(cksumcfg.Checksum == ChecksumXXHash)
 		xx := xxhash.New64()
-		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf, xx); errstr != "" {
+		if written, err = ReceiveAndChecksum(filewriter, reader, buf, xx); err != nil {
+			errstr = err.Error()
+			t.fshc(err, fqn)
 			return
 		}
 		hashIn64 := xx.Sum64()
@@ -2621,25 +2554,17 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 					objname, cksumcfg.Checksum, ohval[:8], nhval[:8], fqn)
 
 				t.statsdC.Send("error.badchecksum.xxhash",
-					statsd.Metric{
-						Type:  statsd.Counter,
-						Name:  "count",
-						Value: 1,
-					},
-					statsd.Metric{
-						Type:  statsd.Counter,
-						Name:  "bytes",
-						Value: written,
-					},
-				)
-
+					metric{statsd.Counter, "count", 1},
+					metric{statsd.Counter, "bytes", written})
 				t.statsif.addMany("numbadchecksum", int64(1), "bytesbadchecksum", written)
 				return
 			}
 		}
 	} else if omd5 != "" && cksumcfg.ValidateColdGet {
 		md5 := md5.New()
-		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf, md5); errstr != "" {
+		if written, err = ReceiveAndChecksum(filewriter, reader, buf, md5); err != nil {
+			errstr = err.Error()
+			t.fshc(err, fqn)
 			return
 		}
 		hashInBytes := md5.Sum(nil)[:16]
@@ -2649,23 +2574,15 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 				objname, ohval[:8], nhval[:8], fqn)
 
 			t.statsdC.Send("error.badchecksum.md5",
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "count",
-					Value: 1,
-				},
-				statsd.Metric{
-					Type:  statsd.Counter,
-					Name:  "bytes",
-					Value: written,
-				},
-			)
-
+				metric{statsd.Counter, "count", 1},
+				metric{statsd.Counter, "bytes", written})
 			t.statsif.addMany("numbadchecksum", int64(1), "bytesbadchecksum", written)
 			return
 		}
 	} else {
-		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf); errstr != "" {
+		if written, err = ReceiveAndChecksum(filewriter, reader, buf); err != nil {
+			errstr = err.Error()
+			t.fshc(err, fqn)
 			return
 		}
 	}
@@ -2682,10 +2599,6 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 //==============================================================================
 func (t *targetrunner) starttime() time.Time {
 	return t.uxprocess.starttime
-}
-
-func (t *targetrunner) testingFSPpaths() bool {
-	return ctx.config.TestFSP.Count > 0
 }
 
 // (bucket, object) => (local hashed path, fully qualified name aka fqn)
@@ -2710,12 +2623,13 @@ func (t *targetrunner) fqn2bckobj(fqn string) (bucket, objname, errstr string) {
 	}
 	ok := true
 	bucketmd := t.bmdowner.get()
-	for mpath := range ctx.mountpaths.Available {
-		if fn(makePathCloud(mpath) + "/") {
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
+	for _, mpathInfo := range availablePaths {
+		if fn(makePathCloud(mpathInfo.Path) + "/") {
 			ok = len(objname) > 0 && t.fqn(bucket, objname, false) == fqn
 			break
 		}
-		if fn(makePathLocal(mpath) + "/") {
+		if fn(makePathLocal(mpathInfo.Path) + "/") {
 			islocal := bucketmd.islocal(bucket)
 			ok = islocal && len(objname) > 0 && t.fqn(bucket, objname, true) == fqn
 			break
@@ -2761,35 +2675,6 @@ func (t *targetrunner) isworkfile(workfqn string) (iswork, isold bool) {
 	return
 }
 
-func (t *targetrunner) fspath2mpath() {
-	if len(ctx.config.FSpaths) == 0 {
-		// (usability) do not clutter the log with backtraces when starting up and validating config
-		glog.Errorln("FATAL: no fspaths - see README => Configuration and/or fspaths section in the config.sh")
-		os.Exit(1)
-	}
-	for fp := range ctx.config.FSpaths {
-		if len(fp) > 1 {
-			fp = strings.TrimSuffix(fp, "/")
-		}
-		if _, err := os.Stat(fp); err != nil {
-			glog.Errorf("FATAL: fspath %q %s, err: %v", fp, doesnotexist, err)
-			os.Exit(1)
-		}
-		statfs := syscall.Statfs_t{}
-		if err := syscall.Statfs(fp, &statfs); err != nil {
-			glog.Errorf("FATAL: cannot statfs fspath %q, err: %v", fp, err)
-			os.Exit(1)
-		}
-		mp := &mountPath{Path: fp, Fsid: statfs.Fsid}
-		_, ok := ctx.mountpaths.Available[mp.Path]
-		if ok {
-			glog.Errorf("FATAL: invalid config: duplicated fspath %q", fp)
-			os.Exit(1)
-		}
-		ctx.mountpaths.Available[mp.Path] = mp
-	}
-}
-
 // create local directories to test multiple fspaths
 func (t *targetrunner) testCachepathMounts() {
 	var instpath string
@@ -2801,7 +2686,7 @@ func (t *targetrunner) testCachepathMounts() {
 	}
 	for i := 0; i < ctx.config.TestFSP.Count; i++ {
 		var mpath string
-		if t.testingFSPpaths() {
+		if testingFSPpaths() {
 			mpath = filepath.Join(instpath, strconv.Itoa(i+1))
 		} else {
 			mpath = instpath[0 : len(instpath)-1]
@@ -2810,57 +2695,42 @@ func (t *targetrunner) testCachepathMounts() {
 			glog.Errorf("FATAL: cannot create test cache dir %q, err: %v", mpath, err)
 			os.Exit(1)
 		}
-		statfs := syscall.Statfs_t{}
-		if err := syscall.Statfs(mpath, &statfs); err != nil {
-			glog.Errorf("FATAL: cannot statfs mpath %q, err: %v", mpath, err)
-			os.Exit(1)
-		}
-		mp := &mountPath{Path: mpath, Fsid: statfs.Fsid}
-		_, ok := ctx.mountpaths.Available[mp.Path]
-		assert(!ok)
-		ctx.mountpaths.Available[mp.Path] = mp
+
+		err := ctx.mountpaths.AddMountpath(mpath)
+		assert(err == nil, err)
 	}
 }
 
-func (t *targetrunner) mpath2Fsid() (fsmap map[syscall.Fsid]string) {
-	fsmap = make(map[syscall.Fsid]string, len(ctx.mountpaths.Available))
-	for _, mountpath := range ctx.mountpaths.Available {
-		mp2, ok := fsmap[mountpath.Fsid]
-		if ok {
-			if !t.testingFSPpaths() {
-				glog.Errorf("FATAL: duplicate FSID %v: mpath1 %q, mpath2 %q", mountpath.Fsid, mountpath.Path, mp2)
-				os.Exit(1)
-			}
-			continue
-		}
-		fsmap[mountpath.Fsid] = mountpath.Path
+func (t *targetrunner) createBucketDirs(s, basename string, f func(basePath string) string) {
+	if basename == "" {
+		glog.Errorf("FATAL: empty basename for the %s buckets directory", s)
+		os.Exit(1)
 	}
-	return
-}
-
-func (t *targetrunner) startupMpaths() {
 	for mpath := range ctx.mountpaths.Available {
-		cloudbctsfqn := makePathCloud(mpath)
-		if err := CreateDir(cloudbctsfqn); err != nil {
-			glog.Errorf("FATAL: cannot create cloud buckets dir %q, err: %v", cloudbctsfqn, err)
+		dir := f(mpath)
+		if _, ok := ctx.mountpaths.Available[dir]; ok {
+			glog.Errorf("FATAL: local namespace partitioning conflict: %s vs %s", mpath, dir)
 			os.Exit(1)
 		}
-		localbctsfqn := makePathLocal(mpath)
-		if err := CreateDir(localbctsfqn); err != nil {
-			glog.Errorf("FATAL: cannot create local buckets dir %q, err: %v", localbctsfqn, err)
+		if err := CreateDir(dir); err != nil {
+			glog.Errorf("FATAL: cannot create %s buckets dir %q, err: %v", s, dir, err)
 			os.Exit(1)
 		}
 	}
+}
 
+func (t *targetrunner) detectMpathChanges() {
 	// mpath config dir
 	mpathconfigfqn := filepath.Join(ctx.config.Confdir, mpname)
 
 	// load old/prev and compare
 	var (
 		changed bool
-		old     = &mountedFS{}
+		old     = &fs.MountedFS{
+			Available: make(map[string]*fs.MountpathInfo),
+			Disabled:  make(map[string]*fs.MountpathInfo),
+		}
 	)
-	old.Available, old.Offline = make(map[string]*mountPath), make(map[string]*mountPath)
 	if err := LocalLoad(mpathconfigfqn, old); err != nil {
 		if !os.IsNotExist(err) && err != io.EOF {
 			glog.Errorf("Failed to load old mpath config %q, err: %v", mpathconfigfqn, err)
@@ -2875,15 +2745,11 @@ func (t *targetrunner) startupMpaths() {
 		}
 	}
 	if changed {
-		glog.Errorf("Detected change in the mpath configuration at %s", mpathconfigfqn)
-		if b, err := json.MarshalIndent(old, "", "\t"); err == nil {
-			glog.Errorln("OLD: ====================")
-			glog.Errorln(string(b))
-		}
-		if b, err := json.MarshalIndent(ctx.mountpaths, "", "\t"); err == nil {
-			glog.Errorln("NEW: ====================")
-			glog.Errorln(string(b))
-		}
+		glog.Errorf("%s: detected change in the mountpath configuration at %s", t.si.DaemonID, mpathconfigfqn)
+		glog.Errorln("OLD: ====================")
+		glog.Errorln(old.Pprint())
+		glog.Errorln("NEW: ====================")
+		glog.Errorln(ctx.mountpaths.Pprint())
 	}
 	// persist
 	if err := LocalSave(mpathconfigfqn, ctx.mountpaths); err != nil {
@@ -2951,11 +2817,21 @@ func (t *targetrunner) increaseObjectVersion(fqn string) (newVersion string, err
 	return
 }
 
-// runFSKeeper wakes up FSKeeper and makes it to run filesystem check
+// fshc wakes up FSHC and makes it to run filesystem check
 // immediately if err != nil
-func (t *targetrunner) runFSKeeper(filepath string) {
-	if ctx.config.FSKeeper.Enabled {
-		getFSKeeper().onerr(filepath)
+func (t *targetrunner) fshc(err error, filepath string) {
+	glog.Errorf("FSHealthChecker called with error: %#v, file: %s", err, filepath)
+
+	if !isIOError(err) {
+		return
+	}
+
+	keyName := fqn2mountPath(filepath)
+	if keyName != "" {
+		t.statsdC.Send(keyName+".io.errors", metric{statsd.Counter, "count", 1})
+	}
+	if ctx.config.FSChecker.Enabled {
+		getfshealthchecker().onerr(filepath)
 	}
 }
 
@@ -3021,6 +2897,30 @@ func makePathCloud(basePath string) string {
 	return filepath.Join(basePath, ctx.config.CloudBuckets)
 }
 
+func (t *targetrunner) enableMountpath(w http.ResponseWriter, r *http.Request) {
+	mp := MountpathReq{}
+	if t.readJSON(w, r, &mp) != nil {
+		return
+	}
+	if mp.Mountpath == "" {
+		t.invalmsghdlr(w, r, "Mountpath is not defined")
+		return
+	}
+
+	enabled, exists := ctx.mountpaths.EnableMountpath(mp.Mountpath)
+	if !enabled && exists {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if !enabled && !exists {
+		t.invalmsghdlr(w, r, fmt.Sprintf("Mountpath %s not found", mp.Mountpath), http.StatusNotFound)
+		return
+	}
+
+	glog.Infof("Reenabled mountpath %s", mp.Mountpath)
+}
+
 func (t *targetrunner) receiveMeta(w http.ResponseWriter, r *http.Request) {
 	var payload = make(simplekvs)
 	if t.readJSON(w, r, &payload) != nil {
@@ -3073,21 +2973,21 @@ func (t *targetrunner) receiveBucketMD(newbucketmd *bucketMD, msg *ActionMsg) (e
 	t.bmdowner.put(newbucketmd)
 	t.bmdowner.Unlock()
 
+	availablePaths, _ := ctx.mountpaths.Mountpaths()
 	for bucket := range bucketmd.LBmap {
-		_, ok := newbucketmd.LBmap[bucket]
-		if !ok {
+		if _, ok := newbucketmd.LBmap[bucket]; !ok {
 			glog.Infof("Destroy local bucket %s", bucket)
-			for mpath := range ctx.mountpaths.Available {
-				localbucketfqn := filepath.Join(makePathLocal(mpath), bucket)
+			for _, mpathInfo := range availablePaths {
+				localbucketfqn := filepath.Join(makePathLocal(mpathInfo.Path), bucket)
 				if err := os.RemoveAll(localbucketfqn); err != nil {
 					glog.Errorf("Failed to destroy local bucket dir %q, err: %v", localbucketfqn, err)
 				}
 			}
 		}
 	}
-	for mpath := range ctx.mountpaths.Available {
+	for _, mpathInfo := range availablePaths {
 		for bucket := range bucketmd.LBmap {
-			localbucketfqn := filepath.Join(makePathLocal(mpath), bucket)
+			localbucketfqn := filepath.Join(makePathLocal(mpathInfo.Path), bucket)
 			if err := CreateDir(localbucketfqn); err != nil {
 				glog.Errorf("Failed to create local bucket dir %q, err: %v", localbucketfqn, err)
 			}
@@ -3252,8 +3152,8 @@ func (t *targetrunner) validateObjectChecksum(fqn string, checksumAlgo string, s
 	}
 
 	slab := selectslab(slabSize)
-	buf, xx := slab.alloc(), xxhash.New64()
-	xxHashValue, errstr := ComputeXXHash(file, buf, xx)
+	buf := slab.alloc()
+	xxHashValue, errstr := ComputeXXHash(file, buf)
 	file.Close()
 	slab.free(buf)
 

@@ -17,8 +17,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/NVIDIA/dfcpub/dfc/statsd"
 )
 
 type (
@@ -86,11 +84,8 @@ func newPrimary() *proxyrunner {
 	p.httpclientLongTimeout = &http.Client{}
 	ctx.config.Periodic.RetrySyncTime = time.Millisecond * 100
 	ctx.config.KeepaliveTracker.Proxy.Name = "heartbeat"
-	ctx.config.KeepaliveTracker.Proxy.MaxStr = "20s"
 	ctx.config.KeepaliveTracker.Proxy.IntervalStr = "as"
-	p.kalive = newproxykalive(&p)
-	p.callStatsServer = NewCallStatsServer(nil, 1, &statsd.Client{})
-	p.callStatsServer.Start()
+	p.keepalive = newProxyKeepaliveRunner(&p)
 
 	p.bmdowner = &bmdowner{}
 	p.bmdowner.put(newBucketMD())
@@ -174,7 +169,6 @@ func TestMetaSyncTransport(t *testing.T) {
 
 	for _, tc := range tcs {
 		primary := newPrimary()
-		defer primary.callStatsServer.Stop()
 		syncer := newmetasyncer(primary)
 
 		var wg sync.WaitGroup
@@ -184,7 +178,7 @@ func TestMetaSyncTransport(t *testing.T) {
 			syncer.run()
 		}(&wg)
 
-		t.Run(fmt.Sprintf("%s", tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			exp, act := tc.testf(t, primary, syncer)
 			if !reflect.DeepEqual(exp, act) {
 				t.Fatalf("exp = %+v, act = %+v", exp, act)
@@ -506,8 +500,6 @@ func TestMetaSyncData(t *testing.T) {
 		emptyActionMsg string
 	)
 
-	defer primary.callStatsServer.Stop()
-
 	b, err := json.Marshal(ActionMsg{})
 	if err != nil {
 		t.Fatal("Failed to marshal empty ActionMsg, err =", err)
@@ -649,7 +641,6 @@ func TestMetaSyncMembership(t *testing.T) {
 	{
 		// pending server dropped without sync
 		primary := newPrimary()
-		defer primary.callStatsServer.Stop()
 		syncer := newmetasyncer(primary)
 
 		var wg sync.WaitGroup
@@ -699,7 +690,6 @@ func TestMetaSyncMembership(t *testing.T) {
 	{
 		// sync before smap sync (no previous sync saved in meta syncer)
 		primary := newPrimary()
-		defer primary.callStatsServer.Stop()
 		syncer := newmetasyncer(primary)
 
 		var wg sync.WaitGroup
@@ -837,7 +827,6 @@ func TestMetaSyncReceive(t *testing.T) {
 		}
 
 		primary := newPrimary()
-		defer primary.callStatsServer.Stop()
 		syncer := newmetasyncer(primary)
 
 		var wg sync.WaitGroup
@@ -1150,7 +1139,6 @@ func TestMetaSyncReceive(t *testing.T) {
 		// one of them will receive the sync data with the original action message,
 		// the failed one will not, it will only receives the lb but without the action message.
 		primary := newPrimary()
-		defer primary.callStatsServer.Stop()
 		syncer := newmetasyncer(primary)
 
 		var wg sync.WaitGroup

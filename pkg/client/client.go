@@ -11,7 +11,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,7 +31,8 @@ import (
 )
 
 const (
-	registerTimeout = time.Minute * 2
+	registerTimeout    = time.Minute * 2
+	maxBodyErrorLength = 256
 )
 
 type (
@@ -150,6 +150,11 @@ type ReqError struct {
 	message string
 }
 
+type InvalidCksumError struct {
+	ExpectedHash string
+	ActualHash   string
+}
+
 type BucketProps struct {
 	CloudProvider string
 	Versioning    string
@@ -172,22 +177,25 @@ type Reader interface {
 	Description() string
 }
 
-type bytesReaderCloser struct {
-	bytes.Reader
-}
-
-func (q *bytesReaderCloser) Close() error {
-	return nil
-}
-
 func (err ReqError) Error() string {
 	return err.message
+}
+
+func (e InvalidCksumError) Error() string {
+	return fmt.Sprintf("Expected Hash: [%s] Actual Hash: [%s]", e.ExpectedHash, e.ActualHash)
 }
 
 func newReqError(msg string, code int) ReqError {
 	return ReqError{
 		code:    code,
 		message: msg,
+	}
+}
+
+func newInvalidCksumError(eHash string, aHash string) InvalidCksumError {
+	return InvalidCksumError{
+		ActualHash:   aHash,
+		ExpectedHash: eHash,
 	}
 }
 
@@ -205,24 +213,30 @@ func Tcping(url string) (err error) {
 
 func readResponse(r *http.Response, w io.Writer, err error, src string, validate bool) (int64, string, error) {
 	var (
-		len  int64
-		hash string
+		length int64
+		hash   string
 	)
 
 	// Note: This code can use some cleanup.
 	if err == nil {
 		if r.StatusCode >= http.StatusBadRequest {
-			return 0, "", fmt.Errorf("Bad status code from %s: http status %d", src, r.StatusCode)
+			bytes, err := ioutil.ReadAll(r.Body)
+			if err != nil || len(bytes) == 0 || len(bytes) > maxBodyErrorLength {
+				// it seems the body is empty or it contains an object instead of error text
+				return 0, "", fmt.Errorf("Bad status code from %s: http status %d", src, r.StatusCode)
+			} else {
+				return 0, "", fmt.Errorf("Bad status code from %s: http status %d, error: %s", src, r.StatusCode, string(bytes))
+			}
 		}
 
 		bufreader := bufio.NewReader(r.Body)
 		if validate {
-			len, hash, err = ReadWriteWithHash(bufreader, w)
+			length, hash, err = ReadWriteWithHash(bufreader, w)
 			if err != nil {
 				return 0, "", fmt.Errorf("Failed to read http response, err: %v", err)
 			}
 		} else {
-			if len, err = io.Copy(w, bufreader); err != nil {
+			if length, err = io.Copy(w, bufreader); err != nil {
 				return 0, "", fmt.Errorf("Failed to read http response, err: %v", err)
 			}
 		}
@@ -230,7 +244,7 @@ func readResponse(r *http.Response, w io.Writer, err error, src string, validate
 		return 0, "", fmt.Errorf("%s failed, err: %v", src, err)
 	}
 
-	return len, hash, nil
+	return length, hash, nil
 }
 
 func discardResponse(r *http.Response, err error, src string) (int64, error) {
@@ -297,8 +311,7 @@ func get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 	len, hash, err := readResponse(resp, w, err, fmt.Sprintf("GET (object %s from bucket %s)", keyname, bucket), v)
 	if v {
 		if hdhash != hash {
-			s := fmt.Sprintf("Header's hash %s doesn't match the file's %s \n", hdhash, hash)
-			err = errors.New(s)
+			err = newInvalidCksumError(hdhash, hash)
 			if errch != nil {
 				errch <- err
 			}
@@ -703,22 +716,6 @@ func IsCached(proxyurl, bucket, objname string) (bool, error) {
 	return true, nil
 }
 
-func checkHTTPStatus(resp *http.Response, op string) error {
-	if resp.StatusCode >= http.StatusBadRequest {
-		return ReqError{
-			code:    resp.StatusCode,
-			message: fmt.Sprintf("Bad status code from %s", op),
-		}
-	}
-
-	return nil
-}
-
-func discardHTTPResp(resp *http.Response) {
-	bufreader := bufio.NewReader(resp.Body)
-	io.Copy(ioutil.Discard, bufreader)
-}
-
 // Put sends a PUT request to the given URL
 func Put(proxyURL string, reader Reader, bucket string, key string, silent bool) error {
 	url := proxyURL + "/" + dfc.Rversion + "/" + dfc.Robjects + "/" + bucket + "/" + key
@@ -1106,27 +1103,6 @@ func GetPrimaryProxy(url string) (string, error) {
 	return smap.ProxySI.DirectURL, nil
 }
 
-func UnregisterTarget(proxyURL, sid string) error {
-	smap, err := GetClusterMap(proxyURL)
-	if err != nil {
-		return fmt.Errorf("GetClusterMap() failed, err = %v", err)
-	}
-	err = HTTPRequest("DELETE", proxyURL+"/"+dfc.Rversion+"/"+dfc.Rcluster+"/"+"daemon"+"/"+sid, nil)
-	if err != nil {
-		return err
-	}
-	return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, []string{smap.Tmap[sid].DaemonID})
-}
-
-func RegisterTarget(sid string, smap dfc.Smap) error {
-	si := smap.Tmap[sid]
-	err := HTTPRequest("POST", si.DirectURL+"/"+dfc.Rversion+"/"+dfc.Rdaemon+"/"+dfc.Rregister, nil)
-	if err != nil {
-		return err
-	}
-	return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, []string{})
-}
-
 // HTTPRequest sends one HTTP request and checks result
 func HTTPRequest(method string, url string, msg io.Reader) error {
 	req, err := http.NewRequest(method, url, msg)
@@ -1215,6 +1191,111 @@ func DoesLocalBucketExist(serverURL string, bucket string) (bool, error) {
 	return false, nil
 }
 
+func getWhatRawQuery(getWhat string, getProps string) string {
+	q := url.Values{}
+	q.Add(dfc.URLParamWhat, getWhat)
+	if getProps != "" {
+		q.Add(dfc.URLParamProps, getProps)
+	}
+	return q.Encode()
+}
+
+func TargetMountpaths(targetUrl string) (*dfc.MountpathList, error) {
+	q := getWhatRawQuery(dfc.GetWhatMountpaths, "")
+	url := fmt.Sprintf("%s?%s", targetUrl+dfc.URLPath(dfc.Rversion, dfc.Rdaemon), q)
+
+	resp, err := client.Get(url)
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("Target mountpath list, HTTP error code = %d", resp.StatusCode)
+	}
+
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read response body, err = %v", err)
+	}
+
+	mp := &dfc.MountpathList{
+		Available: make([]string, 0),
+		Disabled:  make([]string, 0),
+	}
+
+	err = json.Unmarshal(b, mp)
+
+	return mp, err
+}
+
+func EnableTargetMountpath(daemonUrl, mpath string) error {
+	url := daemonUrl + dfc.URLPath(dfc.Rversion, dfc.Rdaemon, dfc.Rmountpaths)
+	reqBody := dfc.MountpathReq{mpath}
+	msg, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	req, _ := http.NewRequest("PUT", url, bytes.NewReader(msg))
+	resp, err := client.Do(req)
+
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	_, _, err = readResponse(resp, ioutil.Discard, err, daemonUrl, false /* validate */)
+	return err
+}
+
+func UnregisterTarget(proxyURL, sid string) error {
+	smap, err := GetClusterMap(proxyURL)
+	if err != nil {
+		return fmt.Errorf("GetClusterMap() failed, err = %v", err)
+	}
+
+	target, ok := smap.Tmap[sid]
+	var idsToIgnore []string
+	if ok {
+		idsToIgnore = []string{target.DaemonID}
+	}
+
+	err = HTTPRequest(http.MethodDelete, proxyURL+dfc.URLPath(dfc.Rversion, dfc.Rcluster, dfc.Rdaemon, sid), nil)
+	if err != nil {
+		return err
+	}
+
+	// If target does not exists in cluster we should not wait for map version
+	// sync because update will not be scheduled
+	if ok {
+		return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, idsToIgnore)
+	}
+
+	return nil
+}
+
+func RegisterTarget(sid, targetDirectURL string, smap dfc.Smap) error {
+	_, ok := smap.Tmap[sid]
+	err := HTTPRequest(http.MethodPost, targetDirectURL+dfc.URLPath(dfc.Rversion, dfc.Rdaemon, dfc.Rregister), nil)
+	if err != nil {
+		return err
+	}
+
+	// If target is already in cluster we should not wait for map version
+	// sync because update will not be scheduled
+	if !ok {
+		return WaitMapVersionSync(time.Now().Add(registerTimeout), smap, smap.Version, []string{})
+	}
+
+	return nil
+}
+
 func WaitMapVersionSync(timeout time.Time, smap dfc.Smap, prevVersion int64, idsToIgnore []string) error {
 	inList := func(s string, values []string) bool {
 		for _, v := range values {
@@ -1225,53 +1306,45 @@ func WaitMapVersionSync(timeout time.Time, smap dfc.Smap, prevVersion int64, ids
 
 		return false
 	}
-	urls := make(map[string]int64)
-	for _, d := range smap.Tmap {
-		if !inList(d.DaemonID, idsToIgnore) {
-			urls[d.DirectURL] = 0
+
+	checkAwaitingDaemon := func(smap dfc.Smap, idsToIgnore []string) (string, string, bool) {
+		for _, d := range smap.Pmap {
+			if !inList(d.DaemonID, idsToIgnore) {
+				return d.DaemonID, d.DirectURL, true
+			}
 		}
-	}
-	for _, d := range smap.Pmap {
-		if !inList(d.DaemonID, idsToIgnore) {
-			urls[d.DirectURL] = 0
+		for _, d := range smap.Tmap {
+			if !inList(d.DaemonID, idsToIgnore) {
+				return d.DaemonID, d.DirectURL, true
+			}
 		}
+
+		return "", "", false
 	}
 
-	for len(urls) > 0 {
-		var u string
-		for u = range urls {
+	for {
+		sid, url, exists := checkAwaitingDaemon(smap, idsToIgnore)
+		if !exists {
 			break
 		}
-		smap, err := GetClusterMap(u)
+
+		daemonSmap, err := GetClusterMap(url)
 		if err != nil && !dfc.IsErrConnectionRefused(err) {
 			return err
 		}
-		urls[u] = smap.Version
-		if err == nil && smap.Version > prevVersion {
-			delete(urls, u)
+
+		if err == nil && daemonSmap.Version > prevVersion {
+			idsToIgnore = append(idsToIgnore, sid)
+			smap = daemonSmap // update smap for newer version
 			continue
 		}
 
 		if time.Now().After(timeout) {
-			return fmt.Errorf("timed out waiting for sync-ed Smap version > %d from %s (v%d)", prevVersion, u, smap.Version)
+			return fmt.Errorf("timed out waiting for sync-ed Smap version > %d from %s (v%d)", prevVersion, url, smap.Version)
 		}
-		if len(urls) > 0 {
-			fmt.Printf("wait-for-Smap-synced (> v%d): ", prevVersion)
-			for k, smapV := range urls {
-				fmt.Printf("%s(v%d) ", k, smapV)
-			}
-			fmt.Printf("\n")
-			time.Sleep(time.Second)
-		}
+
+		fmt.Printf("wait for Smap to be synced (> v%d) with url: %s\n", prevVersion, url)
+		time.Sleep(time.Second)
 	}
 	return nil
-}
-
-func getWhatRawQuery(getWhat string, getProps string) string {
-	q := url.Values{}
-	q.Add(dfc.URLParamWhat, getWhat)
-	if getProps != "" {
-		q.Add(dfc.URLParamProps, getProps)
-	}
-	return q.Encode()
 }

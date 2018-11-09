@@ -45,7 +45,6 @@ type xactRebalance struct {
 	xactBase
 	curversion   int64
 	targetrunner *targetrunner
-	aborted      bool
 }
 
 type xactLRU struct {
@@ -59,7 +58,7 @@ type xactElection struct {
 	vr          *VoteRecord
 }
 
-//====================
+//===================
 //
 // xactBase
 //

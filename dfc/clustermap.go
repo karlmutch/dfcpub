@@ -72,12 +72,10 @@ func (r *smapowner) synchronize(newsmap *Smap, saveSmap, lesserVersionIsErr bool
 		myver := smap.version()
 		if newsmap.version() <= myver {
 			if lesserVersionIsErr && newsmap.version() < myver {
-				errstr = fmt.Sprintf("Attempt to downgrade local Smap v%d to %s", myver, newsmap.pp())
+				errstr = fmt.Sprintf("Attempt to downgrade local Smap v%d to v%d", myver, newsmap.version())
 			}
-			if newsmap.ProxySI == smap.ProxySI {
-				r.Unlock()
-				return
-			}
+			r.Unlock()
+			return
 		}
 	}
 	if errstr = r.persist(newsmap, saveSmap); errstr == "" {
@@ -169,11 +167,17 @@ func (m *Smap) addProxy(psi *daemonInfo) {
 }
 
 func (m *Smap) delTarget(sid string) {
+	if m.getTarget(sid) == nil {
+		assert(false, fmt.Sprintf("FATAL: target: %s is not in the smap: %s", sid, m.pp()))
+	}
 	delete(m.Tmap, sid)
 	m.Version++
 }
 
 func (m *Smap) delProxy(pid string) {
+	if m.getProxy(pid) == nil {
+		assert(false, fmt.Sprintf("FATAL: proxy: %s is not in the smap: %s", pid, m.pp()))
+	}
 	delete(m.Pmap, pid)
 	m.Version++
 }
@@ -216,6 +220,23 @@ func (m *Smap) deepcopy(dst *Smap) {
 	}
 	for id, v := range m.Pmap {
 		dst.Pmap[id] = v
+	}
+}
+
+func (m *Smap) merge(dst *Smap) {
+	for id, v := range m.Tmap {
+		if _, ok := dst.Tmap[id]; !ok {
+			if _, ok = dst.Pmap[id]; !ok {
+				dst.Tmap[id] = v
+			}
+		}
+	}
+	for id, v := range m.Pmap {
+		if _, ok := dst.Pmap[id]; !ok {
+			if _, ok = dst.Tmap[id]; !ok {
+				dst.Pmap[id] = v
+			}
+		}
 	}
 }
 

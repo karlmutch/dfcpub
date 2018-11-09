@@ -31,7 +31,8 @@ import (
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/OneOfOne/xxhash"
-	"github.com/hkwi/h2c"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 const ( // => Transport.MaxIdleConnsPerHost
@@ -116,17 +117,13 @@ type httprunner struct {
 	httpclient            *http.Client // http client for intra-cluster comm
 	httpclientLongTimeout *http.Client // http client for long-wait intra-cluster comm
 	statsif               statsif
-	kalive                kaliveif
+	keepalive             keepaliver
 	smapowner             *smapowner
 	bmdowner              *bmdowner
-	callStatsServer       *CallStatsServer
 	revProxy              *httputil.ReverseProxy
 }
 
 func (h *httprunner) registerhdlr(path string, handler func(http.ResponseWriter, *http.Request)) {
-	if h.mux == nil {
-		h.mux = http.NewServeMux()
-	}
 	h.mux.HandleFunc(path, handler)
 	if !strings.HasSuffix(path, "/") {
 		h.mux.HandleFunc(path+"/", handler)
@@ -163,6 +160,7 @@ func (h *httprunner) init(s statsif, isproxy bool) {
 		}
 	}
 
+	h.mux = http.NewServeMux()
 	h.smapowner = &smapowner{}
 	h.bmdowner = &bmdowner{}
 }
@@ -183,9 +181,11 @@ func (h *httprunner) initSI() {
 	if id != "" {
 		h.si.DaemonID = id
 	} else {
-		split := strings.Split(ipaddr, ".")
-		cs := xxhash.ChecksumString32S(split[len(split)-1], mLCG32)
-		h.si.DaemonID = strconv.Itoa(int(cs&0xffff)) + ":" + ctx.config.Net.L4.Port
+		cs := xxhash.ChecksumString32S(ipaddr+":"+ctx.config.Net.L4.Port, mLCG32)
+		h.si.DaemonID = strconv.Itoa(int(cs & 0xfffff))
+		if testingFSPpaths() {
+			h.si.DaemonID += ":" + ctx.config.Net.L4.Port
+		}
 	}
 
 	proto := "http"
@@ -224,18 +224,10 @@ func (h *httprunner) run() error {
 	// a wrapper to glog http.Server errors - otherwise
 	// os.Stderr would be used, as per golang.org/pkg/net/http/#Server
 	h.glogger = log.New(&glogwriter{}, "net/http err: ", 0)
-	var handler http.Handler = h.mux
 	addr := ":" + ctx.config.Net.L4.Port
 
-	if ctx.config.Net.HTTP.UseHTTP2 && !ctx.config.Net.HTTP.UseHTTPS {
-		handler = h2c.Server{Handler: handler}
-	}
 	if ctx.config.Net.HTTP.UseHTTPS {
-		h.h = &http.Server{Addr: addr, Handler: handler, ErrorLog: h.glogger}
-
-		if !ctx.config.Net.HTTP.UseHTTP2 {
-			h.h.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
-		}
+		h.h = &http.Server{Addr: addr, Handler: h.mux, ErrorLog: h.glogger}
 		if err := h.h.ListenAndServeTLS(ctx.config.Net.HTTP.Certificate, ctx.config.Net.HTTP.Key); err != nil {
 			if err != http.ErrServerClosed {
 				glog.Errorf("Terminated %s with err: %v", h.name, err)
@@ -243,7 +235,9 @@ func (h *httprunner) run() error {
 			}
 		}
 	} else {
-		h.h = &http.Server{Addr: addr, Handler: handler, ErrorLog: h.glogger}
+		// Support for h2c is transparent using h2c.NewHandler, which implements a lightweight
+		// wrapper around h.mux.ServeHTTP to check for an h2c connection.
+		h.h = &http.Server{Addr: addr, Handler: h2c.NewHandler(h.mux, &http2.Server{}), ErrorLog: h.glogger}
 		if err := h.h.ListenAndServe(); err != nil {
 			if err != http.ErrServerClosed {
 				glog.Errorf("Terminated %s with err: %v", h.name, err)
@@ -251,7 +245,6 @@ func (h *httprunner) run() error {
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -285,9 +278,6 @@ func (h *httprunner) call(rOrig *http.Request, si *daemonInfo, url, method strin
 		newPrimaryURL string
 		status        int
 	)
-
-	startedAt := time.Now()
-	defer h.callStatsServer.Call(url, time.Now().Sub(startedAt), err != nil)
 
 	if si != nil {
 		sid = si.DaemonID
@@ -366,7 +356,7 @@ func (h *httprunner) call(rOrig *http.Request, si *daemonInfo, url, method strin
 	}
 
 	if sid != "unknown" {
-		h.kalive.heardFrom(sid, false /* reset */)
+		h.keepalive.heardFrom(sid, false /* reset */)
 	}
 
 	return callResult{si, outjson, err, errstr, newPrimaryURL, status}
@@ -535,6 +525,18 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 		} else {
 			ctx.config.LRU.DontEvictTime, ctx.config.LRU.DontEvictTimeStr = v, value
 		}
+	case "disk_util_low_wm":
+		if v, err := atoi(value); err != nil {
+			errstr = fmt.Sprintf("Failed to convert disk_util_low_wm, err: %v", err)
+		} else {
+			ctx.config.Xaction.DiskUtilLowWM = v
+		}
+	case "disk_util_high_wm":
+		if v, err := atoi(value); err != nil {
+			errstr = fmt.Sprintf("Failed to convert disk_util_high_wm, err: %v", err)
+		} else {
+			ctx.config.Xaction.DiskUtilHighWM = v
+		}
 	case "capacity_upd_time":
 		if v, err := time.ParseDuration(value); err != nil {
 			errstr = fmt.Sprintf("Failed to parse capacity_upd_time, err: %v", err)
@@ -630,6 +632,12 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 			ctx.config.Ver.Versioning = value
 		} else {
 			return err.Error()
+		}
+	case "fschecker_enabled":
+		if v, err := strconv.ParseBool(value); err != nil {
+			errstr = fmt.Sprintf("Failed to parse fschecker_enabled, err: %v", err)
+		} else {
+			ctx.config.FSChecker.Enabled = v
 		}
 	default:
 		errstr = fmt.Sprintf("Cannot set config var %s - is readonly or unsupported", name)
@@ -817,28 +825,17 @@ func (h *httprunner) broadcast(path string, query url.Values, method string, bod
 	return ch
 }
 
-func (h *httprunner) getXactionKindFromProperties(props string) (
-	string, error) {
-	switch props {
-	case XactionRebalance, XactionPrefetch:
-		return props, nil
-	}
-
-	err := fmt.Errorf("Invalid xaction in properties: %s", props)
-	return "", err
-}
-
 // ================================== Background =========================================
 //
-// Generally, DFC clusters can be deployed with arbitrary numbers of DFC proxies.
+// Generally, DFC clusters can be deployed with an arbitrary numbers of DFC proxies.
 // Each proxy/gateway provides full access to the clustered objects and collaborates with
 // all other proxies to perform majority-voted HA failovers.
 //
 // Not all proxies are equal though.
 //
 // Two out of all proxies can be designated via configuration as "original" and
-// "discovery". The "original" (located at the configurable "original_url") is expected
-// to be the primary (i.e., the leader) at cluster deployment time.
+// "discovery." The "original" (located at the configurable "original_url") is expected
+// to be the primary at cluster (initial) deployment time.
 //
 // Later on, when and if some HA event triggers an automated failover, the role of the
 // primary may be (automatically) assumed by a different proxy/gateway, with the
