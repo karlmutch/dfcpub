@@ -55,17 +55,9 @@ const (
 	replicationActSend    = "send"
 	replicationActReceive = "receive"
 
-	replicationAddMountpath    = "addmpath"
-	replicationRemoveMountpath = "removempath"
-
 	replicationRequestBufferSize      = 1024
 	mpathReplicationRequestBufferSize = 1024
 )
-
-type mpathReq struct {
-	action string
-	mpath  string
-}
 
 type replRequest struct {
 	action          string
@@ -89,7 +81,7 @@ type replicationRunner struct {
 	cmn.Named
 	t                *targetrunner // FIXME: package out
 	replReqCh        chan *replRequest
-	mpathReqCh       chan mpathReq
+	mpathReqCh       chan fs.ChangeReq
 	mountpaths       *fs.MountedFS
 	mpathReplicators map[string]*mpathReplicator // mpath -> replicator
 	stopCh           chan struct{}
@@ -138,7 +130,7 @@ func newReplicationRunner(t *targetrunner, mountpaths *fs.MountedFS) *replicatio
 	return &replicationRunner{
 		t:                t,
 		replReqCh:        make(chan *replRequest, replicationRequestBufferSize),
-		mpathReqCh:       make(chan mpathReq),
+		mpathReqCh:       make(chan fs.ChangeReq), // FIXME: unbuffered
 		mountpaths:       mountpaths,
 		mpathReplicators: make(map[string]*mpathReplicator),
 		stopCh:           make(chan struct{}),
@@ -422,11 +414,11 @@ func (rr *replicationRunner) Run() error {
 		case req := <-rr.replReqCh:
 			rr.dispatchRequest(req)
 		case mpathRequest := <-rr.mpathReqCh:
-			switch mpathRequest.action {
-			case replicationAddMountpath:
-				rr.addMpath(mpathRequest.mpath)
-			case replicationRemoveMountpath:
-				rr.removeMpath(mpathRequest.mpath)
+			switch mpathRequest.A {
+			case fs.Add:
+				rr.addMpath(mpathRequest.P)
+			case fs.Remove:
+				rr.removeMpath(mpathRequest.P)
 			}
 		case <-rr.stopCh:
 			return nil
@@ -492,21 +484,10 @@ func (rr *replicationRunner) reqReceiveReplica(srcDirectURL, fqn string, r *http
  * fsprunner methods
  */
 
-func (rr *replicationRunner) reqAddMountpath(mpath string) {
-	rr.mpathReqCh <- mpathReq{action: replicationAddMountpath, mpath: mpath}
-}
-
-func (rr *replicationRunner) reqRemoveMountpath(mpath string) {
-	rr.mpathReqCh <- mpathReq{action: replicationRemoveMountpath, mpath: mpath}
-}
-
-func (rr *replicationRunner) reqEnableMountpath(mpath string) {
-	return
-}
-
-func (rr *replicationRunner) reqDisableMountpath(mpath string) {
-	return
-}
+func (rr *replicationRunner) reqAddMountpath(mpath string)     { rr.mpathReqCh <- fs.MountpathAdd(mpath) }
+func (rr *replicationRunner) reqRemoveMountpath(mpath string)  { rr.mpathReqCh <- fs.MountpathRem(mpath) }
+func (rr *replicationRunner) reqEnableMountpath(mpath string)  {}
+func (rr *replicationRunner) reqDisableMountpath(mpath string) {}
 
 func (rr *replicationRunner) addMpath(mpath string) {
 	replicator, ok := rr.mpathReplicators[mpath]

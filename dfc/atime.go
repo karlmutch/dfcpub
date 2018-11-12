@@ -95,7 +95,7 @@ type atimerunner struct {
 	cmn.Named
 	requestCh    chan *atimeRequest // Requests for file access times or set access times
 	stopCh       chan struct{}      // Control channel for stopping
-	mpathReqCh   chan mpathReq
+	mpathReqCh   chan fs.ChangeReq
 	mpathRunners map[string]*mpathAtimeRunner // mpath -> mpathAtimeRunner
 	mountpaths   *fs.MountedFS
 }
@@ -140,7 +140,7 @@ type atimeResponse struct {
 func newAtimeRunner(mountpaths *fs.MountedFS) (r *atimerunner) {
 	return &atimerunner{
 		stopCh:       make(chan struct{}, 4),
-		mpathReqCh:   make(chan mpathReq, 1),
+		mpathReqCh:   make(chan fs.ChangeReq, 1),
 		mpathRunners: make(map[string]*mpathAtimeRunner, mpathRunnersMapSize),
 		mountpaths:   mountpaths,
 		requestCh:    make(chan *atimeRequest),
@@ -169,11 +169,11 @@ func (r *atimerunner) Run() error {
 				runner.flush()
 			}
 		case mpathRequest := <-r.mpathReqCh:
-			switch mpathRequest.action {
-			case atimeAddMountpath:
-				r.addMpathAtimeRunner(mpathRequest.mpath)
-			case atimeRemoveMountpath:
-				r.removeMpathAtimeRunner(mpathRequest.mpath)
+			switch mpathRequest.A {
+			case fs.Add:
+				r.addMpathAtimeRunner(mpathRequest.P)
+			case fs.Remove:
+				r.removeMpathAtimeRunner(mpathRequest.P)
 			}
 		case request := <-r.requestCh:
 			mpathRunner, ok := r.mpathRunners[request.mpath]
@@ -290,21 +290,10 @@ func (r *atimerunner) removeMpathAtimeRunner(mpath string) {
  * fsprunner methods
  */
 
-func (r *atimerunner) reqAddMountpath(mpath string) {
-	r.mpathReqCh <- mpathReq{action: atimeAddMountpath, mpath: mpath}
-}
-
-func (r *atimerunner) reqRemoveMountpath(mpath string) {
-	r.mpathReqCh <- mpathReq{action: atimeRemoveMountpath, mpath: mpath}
-}
-
-func (r *atimerunner) reqEnableMountpath(mpath string) {
-	return
-}
-
-func (r *atimerunner) reqDisableMountpath(mpath string) {
-	return
-}
+func (r *atimerunner) reqAddMountpath(mpath string)     { r.mpathReqCh <- fs.MountpathAdd(mpath) }
+func (r *atimerunner) reqRemoveMountpath(mpath string)  { r.mpathReqCh <- fs.MountpathRem(mpath) }
+func (r *atimerunner) reqEnableMountpath(mpath string)  {}
+func (r *atimerunner) reqDisableMountpath(mpath string) {}
 
 //================================= mpathAtimeRunner ===========================================
 

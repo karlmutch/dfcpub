@@ -19,6 +19,14 @@ import (
 
 const MLCG32 = 1103515245
 
+// Mountpath Change enum
+const (
+	Add     = "add-mp"
+	Remove  = "remove-mp"
+	Enable  = "enable-mp"
+	Disable = "disable-mp"
+)
+
 // globals
 var (
 	Mountpaths *MountedFS
@@ -60,7 +68,16 @@ type (
 		localBuckets string
 		cloudBuckets string
 	}
+	ChangeReq struct {
+		A string // MountPath action enum (above)
+		P string // path
+	}
 )
+
+func MountpathAdd(p string) ChangeReq { return ChangeReq{A: Add, P: p} }
+func MountpathRem(p string) ChangeReq { return ChangeReq{A: Remove, P: p} }
+func MountpathEnb(p string) ChangeReq { return ChangeReq{A: Enable, P: p} }
+func MountpathDis(p string) ChangeReq { return ChangeReq{A: Disable, P: p} }
 
 func newMountpath(path string, fsid syscall.Fsid, fs string) *MountpathInfo {
 	cleanPath := filepath.Clean(path)

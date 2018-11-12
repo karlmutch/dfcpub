@@ -79,10 +79,10 @@ var pdummyrahfcache = &dummyrahfcache{}
 //===========================================
 
 // as an fsprunner
-func (r *readahead) reqEnableMountpath(mpath string)  { r.addmp(mpath, "enabled") }
-func (r *readahead) reqDisableMountpath(mpath string) { r.delmp(mpath, "disabled") }
-func (r *readahead) reqAddMountpath(mpath string)     { r.addmp(mpath, "added") }
-func (r *readahead) reqRemoveMountpath(mpath string)  { r.delmp(mpath, "removed") }
+func (r *readahead) reqAddMountpath(mpath string)     { r.addmp(mpath, fs.Add) }
+func (r *readahead) reqRemoveMountpath(mpath string)  { r.delmp(mpath, fs.Remove) }
+func (r *readahead) reqEnableMountpath(mpath string)  { r.addmp(mpath, fs.Enable) }
+func (r *readahead) reqDisableMountpath(mpath string) { r.delmp(mpath, fs.Disable) }
 
 func (r *readahead) addmp(mpath, tag string) {
 	r.Lock()
