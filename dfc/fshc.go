@@ -55,11 +55,13 @@ type (
 	}
 )
 
-// as an fsprunner
-func (f *fshc) reqAddMountpath(mpath string)     { f.reqCh <- fs.MountpathAdd(mpath) }
-func (f *fshc) reqRemoveMountpath(mpath string)  { f.reqCh <- fs.MountpathRem(mpath) }
-func (f *fshc) reqEnableMountpath(mpath string)  {}
-func (f *fshc) reqDisableMountpath(mpath string) {}
+// as an fs.PathRunner
+var _ fs.PathRunner = &fshc{}
+
+func (f *fshc) ReqAddMountpath(mpath string)     { f.reqCh <- fs.MountpathAdd(mpath) }
+func (f *fshc) ReqRemoveMountpath(mpath string)  { f.reqCh <- fs.MountpathRem(mpath) }
+func (f *fshc) ReqEnableMountpath(mpath string)  {}
+func (f *fshc) ReqDisableMountpath(mpath string) {}
 
 // as a runner
 func (f *fshc) Run() error {

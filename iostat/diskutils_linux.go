@@ -1,16 +1,16 @@
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
-package dfc
+package iostat
 
 import (
 	"bufio"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
@@ -25,13 +25,27 @@ const (
 	iostatMinVersion = 11
 )
 
-// newIostatRunner initalizes iostatrunner struct with default values
-func newIostatRunner(mountpaths *fs.MountedFS) *iostatrunner {
-	return &iostatrunner{
+type Runner struct {
+	sync.RWMutex
+	cmn.Named
+	mountpaths  *fs.MountedFS
+	stopCh      chan struct{}
+	CPUidle     string
+	metricnames []string
+	Disk        map[string]cmn.SimpleKVs
+	process     *os.Process // running iostat process. Required so it can be killed later
+	fsdisks     map[string]cmn.StringSet
+	period      *time.Duration
+}
+
+// initalizes iostat.Runner
+func NewRunner(mountpaths *fs.MountedFS, period *time.Duration) *Runner {
+	return &Runner{
 		mountpaths:  mountpaths,
 		stopCh:      make(chan struct{}, 1),
 		Disk:        make(map[string]cmn.SimpleKVs),
 		metricnames: make([]string, 0),
+		period:      period,
 	}
 }
 
@@ -45,15 +59,17 @@ type BlockDevice struct {
 }
 
 // as an fsprunner
-func (r *iostatrunner) reqEnableMountpath(mpath string)  { r.updateFSDisks() }
-func (r *iostatrunner) reqDisableMountpath(mpath string) { r.updateFSDisks() }
-func (r *iostatrunner) reqAddMountpath(mpath string)     { r.updateFSDisks() }
-func (r *iostatrunner) reqRemoveMountpath(mpath string)  { r.updateFSDisks() }
+var _ fs.PathRunner = &Runner{}
+
+func (r *Runner) ReqEnableMountpath(mpath string)  { r.updateFSDisks() }
+func (r *Runner) ReqDisableMountpath(mpath string) { r.updateFSDisks() }
+func (r *Runner) ReqAddMountpath(mpath string)     { r.updateFSDisks() }
+func (r *Runner) ReqRemoveMountpath(mpath string)  { r.updateFSDisks() }
 
 // iostat -cdxtm 10
-func (r *iostatrunner) Run() error {
+func (r *Runner) Run() error {
 	r.updateFSDisks()
-	refreshPeriod := int(ctx.config.Periodic.StatsTime / time.Second)
+	refreshPeriod := int(*r.period / time.Second)
 	cmd := exec.Command("iostat", "-cdxtm", strconv.Itoa(refreshPeriod))
 	stdout, err := cmd.StdoutPipe()
 	reader := bufio.NewReader(stdout)
@@ -112,7 +128,7 @@ func (r *iostatrunner) Run() error {
 	}
 }
 
-func (r *iostatrunner) Stop(err error) {
+func (r *Runner) Stop(err error) {
 	glog.Infof("Stopping %s, err: %v", r.Getname(), err)
 	r.stopCh <- struct{}{}
 	close(r.stopCh)
@@ -125,7 +141,7 @@ func (r *iostatrunner) Stop(err error) {
 	}
 }
 
-func (r *iostatrunner) isZeroUtil(dev string) bool {
+func (r *Runner) IsZeroUtil(dev string) bool {
 	iometrics := r.Disk[dev]
 	if utilstr, ok := iometrics["%util"]; ok {
 		if util, err := strconv.ParseFloat(utilstr, 32); err == nil {
@@ -137,7 +153,7 @@ func (r *iostatrunner) isZeroUtil(dev string) bool {
 	return false
 }
 
-func (r *iostatrunner) updateFSDisks() {
+func (r *Runner) updateFSDisks() {
 	availablePaths, _ := fs.Mountpaths.Get()
 	r.Lock()
 	r.fsdisks = make(map[string]cmn.StringSet, len(availablePaths))
@@ -152,15 +168,15 @@ func (r *iostatrunner) updateFSDisks() {
 	r.Unlock()
 }
 
-func (r *iostatrunner) diskUtilFromFQN(fqn string) (util float32, ok bool) {
+func (r *Runner) diskUtilFromFQN(fqn string) (util float32, ok bool) {
 	mpathInfo, _ := r.mountpaths.Path2MpathInfo(fqn)
 	if mpathInfo == nil {
 		return
 	}
-	return r.maxUtilFS(mpathInfo.FileSystem)
+	return r.MaxUtilFS(mpathInfo.FileSystem)
 }
 
-func (r *iostatrunner) maxUtilFS(fs string) (util float32, ok bool) {
+func (r *Runner) MaxUtilFS(fs string) (util float32, ok bool) {
 	r.RLock()
 	disks, isOk := r.fsdisks[fs]
 	if !isOk {
@@ -237,9 +253,9 @@ func lsblkOutput2disks(lsblkOutputBytes []byte, fs string) (disks cmn.StringSet)
 	return disks
 }
 
-// checkIostatVersion determines whether iostat command is present and
+// CheckIostatVersion determines whether iostat command is present and
 // is not too old (at least version `iostatMinVersion` is required).
-func checkIostatVersion() error {
+func CheckIostatVersion() error {
 	cmd := exec.Command("iostat", "-V")
 
 	vbytes, err := cmd.CombinedOutput()
@@ -267,4 +283,33 @@ func checkIostatVersion() error {
 	}
 
 	return nil
+}
+
+func maxUtilDisks(disksMetricsMap map[string]cmn.SimpleKVs, disks cmn.StringSet) (maxutil float64) {
+	maxutil = -1
+	util := func(disk string) (u float64) {
+		if ioMetrics, ok := disksMetricsMap[disk]; ok {
+			if utilStr, ok := ioMetrics["%util"]; ok {
+				var err error
+				if u, err = strconv.ParseFloat(utilStr, 32); err == nil {
+					return
+				}
+			}
+		}
+		return
+	}
+	if len(disks) > 0 {
+		for disk := range disks {
+			if u := util(disk); u > maxutil {
+				maxutil = u
+			}
+		}
+		return
+	}
+	for disk := range disksMetricsMap {
+		if u := util(disk); u > maxutil {
+			maxutil = u
+		}
+	}
+	return
 }

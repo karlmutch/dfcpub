@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/NVIDIA/dfcpub/iostat"
 	"github.com/NVIDIA/dfcpub/memsys"
 )
 
@@ -30,7 +31,7 @@ import (
 // The API exposed to the rest of the code includes the following operations:
 //   * reqSendReplica    - to send a replica of a specified object to a specified URL
 //   * reqReceiveReplica - to receive a replica of an object
-// As a fsprunner, replicationRunner implements methods described by the fsprunner interface.
+// As a fs.PathRunner, replicationRunner implements methods described by the fs.PathRunner interface.
 //
 // All other operations are private to the replication module and used only internally!
 //
@@ -243,14 +244,14 @@ func (r *mpathReplicator) send(req *replRequest) error {
 	okAccessTime := r.t.bucketLRUEnabled(bucket)
 	if okAccessTime {
 		// obtain the object's access time
-		atimeResponse := <-getatimerunner().atime(req.fqn)
-		accessTime, okAccessTime = atimeResponse.accessTime, atimeResponse.ok
+		atimeResponse := <-getatimerunner().Atime(req.fqn)
+		accessTime, okAccessTime = atimeResponse.AccessTime, atimeResponse.Ok
 	}
 
 	// Read from storage if it doesn't exist
 	if !okAccessTime {
 		if fileInfo, err := os.Stat(req.fqn); err == nil {
-			accessTime, _, _ = getAmTimes(fileInfo)
+			accessTime, _, _ = iostat.GetAmTimes(fileInfo)
 			okAccessTime = true
 		} else {
 			glog.Errorf("Failed to get %q access time upon replication", req.fqn)
@@ -481,13 +482,15 @@ func (rr *replicationRunner) reqReceiveReplica(srcDirectURL, fqn string, r *http
 }
 
 /*
- * fsprunner methods
+ * fs.PathRunner methods
  */
 
-func (rr *replicationRunner) reqAddMountpath(mpath string)     { rr.mpathReqCh <- fs.MountpathAdd(mpath) }
-func (rr *replicationRunner) reqRemoveMountpath(mpath string)  { rr.mpathReqCh <- fs.MountpathRem(mpath) }
-func (rr *replicationRunner) reqEnableMountpath(mpath string)  {}
-func (rr *replicationRunner) reqDisableMountpath(mpath string) {}
+var _ fs.PathRunner = &replicationRunner{}
+
+func (rr *replicationRunner) ReqAddMountpath(mpath string)     { rr.mpathReqCh <- fs.MountpathAdd(mpath) }
+func (rr *replicationRunner) ReqRemoveMountpath(mpath string)  { rr.mpathReqCh <- fs.MountpathRem(mpath) }
+func (rr *replicationRunner) ReqEnableMountpath(mpath string)  {}
+func (rr *replicationRunner) ReqDisableMountpath(mpath string) {}
 
 func (rr *replicationRunner) addMpath(mpath string) {
 	replicator, ok := rr.mpathReplicators[mpath]
