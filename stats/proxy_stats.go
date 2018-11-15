@@ -19,13 +19,13 @@ type (
 		statsdC *statsd.Client
 		logged  bool
 	}
-	proxystatsrunner struct {
+	ProxyRunner struct {
 		statsrunner
 		Core *proxyCoreStats `json:"core"`
 	}
 	ClusterStats struct {
 		Proxy  *proxyCoreStats             `json:"proxy"`
-		Target map[string]*storstatsrunner `json:"target"`
+		Target map[string]*TargetRunner `json:"target"`
 	}
 	ClusterStatsRaw struct {
 		Proxy  *proxyCoreStats                `json:"proxy"`
@@ -47,19 +47,19 @@ func (p *proxyCoreStats) UnmarshalJSON(b []byte) error {
 }
 
 //
-// proxystatsrunner
+// ProxyRunner
 //
-func (r *proxystatsrunner) Run() error {
+func (r *ProxyRunner) Run() error {
 	return r.runcommon(r)
 }
-func (r *proxystatsrunner) Init(statsPeriod *time.Duration) {
+func (r *ProxyRunner) Init(statsPeriod *time.Duration) {
 	r.statsPeriod = statsPeriod
 	r.Core = &proxyCoreStats{}
 	r.Core.initStatsTracker()
 }
 
 // statslogger interface impl
-func (r *proxystatsrunner) log() (runlru bool) {
+func (r *ProxyRunner) log() (runlru bool) {
 	r.Lock()
 	if r.Core.logged {
 		r.Unlock()
@@ -88,7 +88,7 @@ func (r *proxystatsrunner) log() (runlru bool) {
 	return
 }
 
-func (r *proxystatsrunner) doAdd(nv NamedVal64) {
+func (r *ProxyRunner) doAdd(nv NamedVal64) {
 	r.Lock()
 	s := r.Core
 	s.doAdd(nv.name, nv.val)

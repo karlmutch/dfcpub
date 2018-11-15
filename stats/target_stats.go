@@ -55,15 +55,8 @@ type (
 	targetCoreStats struct {
 		proxyCoreStats
 	}
-	storstatsrunner struct {
+	TargetRunner struct {
 		statsrunner
-		// init
-		capUpdPeriod *time.Duration
-		logMaxTotal  *uint64
-		logDir       string
-		lruHighWM    *int64
-		lruEnabled   *bool
-		// runtime
 		Core     *targetCoreStats       `json:"core"`
 		Capacity map[string]*fscapacity `json:"capacity"`
 		// iostat
@@ -158,7 +151,7 @@ func (s *targetCoreStats) doAdd(name string, val int64) {
 }
 
 //
-// storstatsrunner
+// TargetRunner
 //
 
 func newFSCapacity(statfs *syscall.Statfs_t) *fscapacity {
@@ -170,25 +163,19 @@ func newFSCapacity(statfs *syscall.Statfs_t) *fscapacity {
 	}
 }
 
-func (r *storstatsrunner) Run() error {
+func (r *TargetRunner) Run() error {
 	return r.runcommon(r)
 }
 
-func (r *storstatsrunner) Init(statsPeriod, capUpdPeriod *time.Duration,
-	logMaxTotal *uint64, logDir string, lruHighWM *int64, lruEnabled *bool) {
+func (r *TargetRunner) Init(statsPeriod *time.Duration) {
 	r.statsPeriod = statsPeriod
-	r.capUpdPeriod = capUpdPeriod
-	r.logMaxTotal = logMaxTotal
-	r.logDir = logDir
-	r.lruHighWM = lruHighWM
-	r.lruEnabled = lruEnabled
 	r.Disk = make(map[string]cmn.SimpleKVs, 8)
 	r.updateCapacity()
 	r.Core = &targetCoreStats{}
 	r.Core.initStatsTracker()
 }
 
-func (r *storstatsrunner) log() (runlru bool) {
+func (r *TargetRunner) log() (runlru bool) {
 	r.Lock()
 	if r.Core.logged {
 		r.Unlock()
@@ -216,7 +203,7 @@ func (r *storstatsrunner) log() (runlru bool) {
 		lines = append(lines, string(b))
 	}
 	// capacity
-	if time.Since(r.timeUpdatedCapacity) >= *r.capUpdPeriod {
+	if time.Since(r.timeUpdatedCapacity) >= ctx.config.LRU.CapacityUpdTime {
 		runlru = r.updateCapacity()
 		r.timeUpdatedCapacity = time.Now()
 		for mpath, fsCapacity := range r.Capacity {
@@ -263,10 +250,10 @@ func (r *storstatsrunner) log() (runlru bool) {
 	return
 }
 
-func (r *storstatsrunner) housekeep(runlru bool) {
+func (r *TargetRunner) housekeep(runlru bool) {
 	t := gettarget()
 
-	if runlru && *r.lruEnabled {
+	if runlru && ctx.config.LRU.LRUEnabled {
 		go t.runLRU()
 	}
 
@@ -277,15 +264,15 @@ func (r *storstatsrunner) housekeep(runlru bool) {
 
 	// keep total log size below the configured max
 	if time.Since(r.timeCheckedLogSizes) >= logsTotalSizeCheckTime {
-		go r.removeLogs(*r.logMaxTotal)
+		go r.removeLogs(ctx.config.Log.MaxTotal)
 		r.timeCheckedLogSizes = time.Now()
 	}
 }
 
-func (r *storstatsrunner) removeLogs(maxtotal uint64) {
-	logfinfos, err := ioutil.ReadDir(r.logDir)
+func (r *TargetRunner) removeLogs(maxtotal uint64) {
+	logfinfos, err := ioutil.ReadDir(ctx.config.Log.Dir)
 	if err != nil {
-		glog.Errorf("GC logs: cannot read log dir %s, err: %v", r.logDir, err)
+		glog.Errorf("GC logs: cannot read log dir %s, err: %v", ctx.config.Log.Dir, err)
 		return // ignore error
 	}
 	// sample name dfc.ip-10-0-2-19.root.log.INFO.20180404-031540.2249
@@ -309,7 +296,7 @@ func (r *storstatsrunner) removeLogs(maxtotal uint64) {
 		}
 		if tot > int64(maxtotal) {
 			if len(infos) <= 1 {
-				glog.Errorf("GC logs: %s, total %d for type %s, max %d", r.logDir, tot, logtype, maxtotal)
+				glog.Errorf("GC logs: %s, total %d for type %s, max %d", ctx.config.Log.Dir, tot, logtype, maxtotal)
 				continue
 			}
 			r.removeOlderLogs(tot, int64(maxtotal), infos)
@@ -317,7 +304,7 @@ func (r *storstatsrunner) removeLogs(maxtotal uint64) {
 	}
 }
 
-func (r *storstatsrunner) removeOlderLogs(tot, maxtotal int64, filteredInfos []os.FileInfo) {
+func (r *TargetRunner) removeOlderLogs(tot, maxtotal int64, filteredInfos []os.FileInfo) {
 	fiLess := func(i, j int) bool {
 		return filteredInfos[i].ModTime().Before(filteredInfos[j].ModTime())
 	}
@@ -326,7 +313,7 @@ func (r *storstatsrunner) removeOlderLogs(tot, maxtotal int64, filteredInfos []o
 	}
 	sort.Slice(filteredInfos, fiLess)
 	for _, logfi := range filteredInfos[:len(filteredInfos)-1] { // except last = current
-		logfqn := r.logDir + "/" + logfi.Name()
+		logfqn := ctx.config.Log.Dir + "/" + logfi.Name()
 		if err := os.Remove(logfqn); err == nil {
 			tot -= logfi.Size()
 			glog.Infof("GC logs: removed %s", logfqn)
@@ -342,7 +329,7 @@ func (r *storstatsrunner) removeOlderLogs(tot, maxtotal int64, filteredInfos []o
 	}
 }
 
-func (r *storstatsrunner) updateCapacity() (runlru bool) {
+func (r *TargetRunner) updateCapacity() (runlru bool) {
 	availableMountpaths, _ := fs.Mountpaths.Get()
 	capacities := make(map[string]*fscapacity, len(availableMountpaths))
 
@@ -354,7 +341,7 @@ func (r *storstatsrunner) updateCapacity() (runlru bool) {
 		}
 		fsCap := newFSCapacity(statfs)
 		capacities[mpath] = fsCap
-		if fsCap.Usedpct >= *r.lruHighWM {
+		if fsCap.Usedpct >= ctx.config.LRU.HighWM {
 			runlru = true
 		}
 	}
@@ -363,7 +350,7 @@ func (r *storstatsrunner) updateCapacity() (runlru bool) {
 	return
 }
 
-func (r *storstatsrunner) doAdd(nv NamedVal64) {
+func (r *TargetRunner) doAdd(nv NamedVal64) {
 	r.Lock()
 	s := r.Core
 	s.doAdd(nv.name, nv.val)

@@ -14,30 +14,13 @@ import (
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/NVIDIA/dfcpub/atime"
+	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
 	"github.com/NVIDIA/dfcpub/health"
 	"github.com/NVIDIA/dfcpub/ios"
 	"github.com/NVIDIA/dfcpub/memsys"
 	"github.com/json-iterator/go"
-)
-
-// runners
-const (
-	xproxy           = "proxy"
-	xtarget          = "target"
-	xmem             = "gmem2"
-	xsignal          = "signal"
-	xproxystats      = "proxystats"
-	xstorstats       = "storstats"
-	xproxykeepalive  = "proxykeepalive"
-	xtargetkeepalive = "targetkeepalive"
-	xiostat          = "iostat"
-	xatime           = "atime"
-	xmetasyncer      = "metasyncer"
-	xfshc            = "fshc"
-	xreadahead       = "readahead"
-	xreplication     = "replication"
 )
 
 type (
@@ -205,20 +188,20 @@ func dfcinit() {
 	if clivars.role == xproxy {
 		p := &proxyrunner{}
 		p.initSI()
-		ctx.rg.add(p, xproxy)
+		ctx.rg.add(p, cluster.Xproxy)
 		ps := &proxystatsrunner{}
 		ps.init()
-		ctx.rg.add(ps, xproxystats)
-		ctx.rg.add(newProxyKeepaliveRunner(p), xproxykeepalive)
-		ctx.rg.add(newmetasyncer(p), xmetasyncer)
+		ctx.rg.add(ps, cluster.Xproxystats)
+		ctx.rg.add(newProxyKeepaliveRunner(p), cluster.Xproxykeepalive)
+		ctx.rg.add(newmetasyncer(p), cluster.Xmetasyncer)
 	} else {
 		t := &targetrunner{}
 		t.initSI()
-		ctx.rg.add(t, xtarget)
+		ctx.rg.add(t, cluster.Xtarget)
 		ts := &storstatsrunner{}
 		ts.init()
-		ctx.rg.add(ts, xstorstats)
-		ctx.rg.add(newTargetKeepaliveRunner(t), xtargetkeepalive)
+		ctx.rg.add(ts, cluster.Xstorstats)
+		ctx.rg.add(newTargetKeepaliveRunner(t), cluster.Xtargetkeepalive)
 
 		// iostat is required: ensure that it is installed and its version is right
 		if err := ios.CheckIostatVersion(); err != nil {
@@ -230,7 +213,7 @@ func dfcinit() {
 		// system-wide gen-purpose memory manager and slab/SGL allocator
 		mem := &memsys.Mem2{MinPctTotal: 4, MinFree: cmn.GiB * 2} // free mem: try to maintain at least the min of these two
 		_ = mem.Init(false)                                       // don't ignore init-time errors
-		ctx.rg.add(mem, xmem)                                     // to periodically house-keep
+		ctx.rg.add(mem, cluster.Xmem)                             // to periodically house-keep
 		gmem2 = getmem2()                                         // making it global; getmem2() can still be used
 
 		// fs.Mountpaths must be inited prior to all runners that utilize all
@@ -251,16 +234,16 @@ func dfcinit() {
 		}
 
 		iostat := ios.NewIostatRunner(fs.Mountpaths, &ctx.config.Periodic.StatsTime)
-		ctx.rg.add(iostat, xiostat)
+		ctx.rg.add(iostat, cluster.Xiostat)
 		t.fsprg.add(iostat)
 
 		fshc := health.NewFSHC(fs.Mountpaths, &ctx.config.FSHC, gmem2)
-		ctx.rg.add(fshc, xfshc)
+		ctx.rg.add(fshc, cluster.Xfshc)
 		t.fsprg.add(fshc)
 
 		if ctx.config.Readahead.Enabled {
 			readaheader := newReadaheader()
-			ctx.rg.add(readaheader, xreadahead)
+			ctx.rg.add(readaheader, cluster.Xreadahead)
 			t.fsprg.add(readaheader)
 			t.readahead = readaheader
 		} else {
@@ -268,14 +251,23 @@ func dfcinit() {
 		}
 
 		replRunner := newReplicationRunner(t, fs.Mountpaths)
-		ctx.rg.add(replRunner, xreplication)
+		ctx.rg.add(replRunner, cluster.Xreplication)
 		t.fsprg.add(replRunner)
 
 		atime := atime.NewRunner(fs.Mountpaths, &ctx.config.LRU.AtimeCacheMax, iostat)
-		ctx.rg.add(atime, xatime)
+		ctx.rg.add(atime, cluster.Xatime)
 		t.fsprg.add(atime)
 	}
-	ctx.rg.add(&sigrunner{}, xsignal)
+	ctx.rg.add(&sigrunner{}, cluster.Xsignal)
+
+	// part of the configuration accessible by external modules and packages
+	cluster.Config.Log = &ctx.config.Log
+	cluster.Config.Periodic = &ctx.config.Periodic
+	cluster.Config.LRU = &ctx.config.LRUConfig
+	cluster.Config.Xaction = &ctx.config.XactionConfig
+
+	// runmap for external modules and packages to locate each other
+	cluster.RunMap = ctx.rg.runmap
 }
 
 // Run is the 'main' where everything gets started
@@ -305,84 +297,73 @@ m:
 //
 //==================
 func getproxystatsrunner() *proxystatsrunner {
-	r := ctx.rg.runmap[xproxystats]
+	r := cluster.GetProxyStatsRunner()
 	rr, ok := r.(*proxystatsrunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getproxykeepalive() *proxyKeepaliveRunner {
-	r := ctx.rg.runmap[xproxykeepalive]
+	r := cluster.GetProxyKeepalive()
 	rr, ok := r.(*proxyKeepaliveRunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func gettarget() *targetrunner {
-	r := ctx.rg.runmap[xtarget]
+	r := cluster.GetTarget()
 	rr, ok := r.(*targetrunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getmem2() *memsys.Mem2 {
-	r := ctx.rg.runmap[xmem]
+	r := cluster.GetMem2()
 	rr, ok := r.(*memsys.Mem2)
 	cmn.Assert(ok)
 	return rr
 }
-
 func gettargetkeepalive() *targetKeepaliveRunner {
-	r := ctx.rg.runmap[xtargetkeepalive]
+	r := cluster.GetTargetKeepalive()
 	rr, ok := r.(*targetKeepaliveRunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getreplicationrunner() *replicationRunner {
-	r := ctx.rg.runmap[xreplication]
+	r := cluster.GetReplicationRunner()
 	rr, ok := r.(*replicationRunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getstorstatsrunner() *storstatsrunner {
-	r := ctx.rg.runmap[xstorstats]
+	r := cluster.GetTargetStatsRunner()
 	rr, ok := r.(*storstatsrunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getiostatrunner() *ios.IostatRunner {
-	r := ctx.rg.runmap[xiostat]
+	r := cluster.GetIostatRunner()
 	rr, ok := r.(*ios.IostatRunner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getatimerunner() *atime.Runner {
-	r := ctx.rg.runmap[xatime]
+	r := cluster.GetAtimeRunner()
 	rr, ok := r.(*atime.Runner)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getcloudif() cloudif {
-	r := ctx.rg.runmap[xtarget]
+	r := cluster.GetCloudIf()
 	rr, ok := r.(*targetrunner)
 	cmn.Assert(ok)
 	return rr.cloudif
 }
-
 func getmetasyncer() *metasyncer {
-	r := ctx.rg.runmap[xmetasyncer]
+	r := cluster.GetMetasyncer()
 	rr, ok := r.(*metasyncer)
 	cmn.Assert(ok)
 	return rr
 }
-
 func getfshealthchecker() *health.FSHC {
-	r := ctx.rg.runmap[xfshc]
+	r := cluster.GetFSHC()
 	rr, ok := r.(*health.FSHC)
 	cmn.Assert(ok)
 	return rr
