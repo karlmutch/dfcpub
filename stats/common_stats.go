@@ -54,7 +54,7 @@ type (
 		doAdd(nv NamedVal64)
 	}
 	// is implemented by the *CoreStats types
-	statsif interface {
+	Tracker interface {
 		add(name string, val int64)
 		addErrorHTTP(method string, val int64)
 		addMany(NamedVal64 ...NamedVal64)
@@ -125,6 +125,9 @@ func (stat *statsInstance) UnmarshalJSON(b []byte) error {
 //
 // statsrunner
 //
+
+// implements Tracker interface
+var _ Tracker = &statsrunner{}
 
 func (r *statsrunner) runcommon(logger statslogger) error {
 	r.stopCh = make(chan struct{}, 4)

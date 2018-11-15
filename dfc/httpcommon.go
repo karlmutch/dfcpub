@@ -29,7 +29,8 @@ import (
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
-	"github.com/NVIDIA/dfcpub/dfc/statsd"
+	"github.com/NVIDIA/dfcpub/stats"
+	"github.com/NVIDIA/dfcpub/stats/statsd"
 	"github.com/OneOfOne/xxhash"
 	"github.com/json-iterator/go"
 	"golang.org/x/net/http2"
@@ -182,7 +183,7 @@ type httprunner struct {
 	smapowner             *smapowner
 	bmdowner              *bmdowner
 	xactinp               *xactInProgress
-	statsif               statsif
+	statsif               stats.Tracker
 	statsdC               statsd.Client
 }
 

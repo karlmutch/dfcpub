@@ -42,12 +42,12 @@ type dfconfig struct {
 	CloudBuckets     string            `json:"cloud_buckets"`
 	LocalBuckets     string            `json:"local_buckets"`
 	Readahead        rahconfig         `json:"readahead"`
-	Log              logconfig         `json:"log"`
-	Periodic         periodic          `json:"periodic"`
+	Log              cmn.LogConfig     `json:"log"`
+	Periodic         cmn.Periodic      `json:"periodic"`
 	Timeout          timeoutconfig     `json:"timeout"`
 	Proxy            proxyconfig       `json:"proxyconfig"`
 	LRU              cmn.LRUConfig     `json:"lru_config"`
-	Xaction          xactionConfig     `json:"xaction_config"`
+	Xaction          cmn.XactionConfig `json:"xaction_config"`
 	Rebalance        rebalanceconf     `json:"rebalance_conf"`
 	Replication      replicationconfig `json:"replication"`
 	Cksum            cmn.CksumConfig   `json:"cksum_config"`
@@ -60,32 +60,12 @@ type dfconfig struct {
 	KeepaliveTracker keepaliveTrackers `json:"keepalivetracker"`
 }
 
-type xactionConfig struct {
-	DiskUtilLowWM  int64 `json:"disk_util_low_wm"`  // Low watermark below which no throttling is required
-	DiskUtilHighWM int64 `json:"disk_util_high_wm"` // High watermark above which throttling is required for longer duration
-}
-
 type rahconfig struct {
 	ObjectMem int64 `json:"rahobjectmem"`
 	TotalMem  int64 `json:"rahtotalmem"`
 	ByProxy   bool  `json:"rahbyproxy"`
 	Discard   bool  `json:"rahdiscard"`
 	Enabled   bool  `json:"rahenabled"`
-}
-
-type logconfig struct {
-	Dir      string `json:"logdir"`      // log directory
-	Level    string `json:"loglevel"`    // log level aka verbosity
-	MaxSize  uint64 `json:"logmaxsize"`  // size that triggers log rotation
-	MaxTotal uint64 `json:"logmaxtotal"` // max total size of all the logs in the log directory
-}
-
-type periodic struct {
-	StatsTimeStr     string `json:"stats_time"`
-	RetrySyncTimeStr string `json:"retry_sync_time"`
-	// omitempty
-	StatsTime     time.Duration `json:"-"`
-	RetrySyncTime time.Duration `json:"-"`
 }
 
 // timeoutconfig contains timeouts used for intra-cluster communication

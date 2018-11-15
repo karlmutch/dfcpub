@@ -389,3 +389,23 @@ type ObjectProps struct {
 	Size    int
 	Version string
 }
+
+type LogConfig struct {
+	Dir      string `json:"logdir"`      // log directory
+	Level    string `json:"loglevel"`    // log level aka verbosity
+	MaxSize  uint64 `json:"logmaxsize"`  // size that triggers log rotation
+	MaxTotal uint64 `json:"logmaxtotal"` // max total size of all the logs in the log directory
+}
+
+type Periodic struct {
+	StatsTimeStr     string `json:"stats_time"`
+	RetrySyncTimeStr string `json:"retry_sync_time"`
+	// omitempty
+	StatsTime     time.Duration `json:"-"`
+	RetrySyncTime time.Duration `json:"-"`
+}
+
+type XactionConfig struct {
+	DiskUtilLowWM  int64 `json:"disk_util_low_wm"`  // Low watermark below which no throttling is required
+	DiskUtilHighWM int64 `json:"disk_util_high_wm"` // High watermark above which throttling is required for longer duration
+}
